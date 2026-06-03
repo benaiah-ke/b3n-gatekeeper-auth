@@ -227,6 +227,10 @@
       gap: 1.5rem;
     }
 
+    .auth-card {
+      order: -1;
+    }
+
     .auth-copy {
       min-height: auto;
       gap: 1.5rem;
