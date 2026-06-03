@@ -64,6 +64,8 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     )
     org = result.scalar_one_or_none()
     if org:
+        await ensure_default_clients(db, org)
+        await db.commit()
         return org
 
     org = Organization(name=settings.bootstrap_org_name, slug=settings.bootstrap_org_slug)
@@ -77,8 +79,28 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     ]
     db.add_all(roles)
     await audit(db, "org.bootstrap", org_id=org.id, target_type="organization", target_id=org.id)
+    await ensure_default_clients(db, org)
     await db.commit()
     return org
+
+
+async def ensure_default_clients(db: AsyncSession, org: Organization) -> None:
+    result = await db.execute(select(AuthClient).where(AuthClient.client_id == "gatekeeper-cli"))
+    if result.scalar_one_or_none():
+        return
+    db.add(
+        AuthClient(
+            org_id=org.id,
+            name="GateKeeper CLI",
+            client_id="gatekeeper-cli",
+            public=True,
+            redirect_uris=[],
+            allowed_origins=[],
+            audiences=["gatekeeper-api"],
+            scopes=["auth:read", "token:*", "mcp:*"],
+            require_org_membership=True,
+        )
+    )
 
 
 async def org_roles(db: AsyncSession, user_id: str) -> list[OrgRead]:
