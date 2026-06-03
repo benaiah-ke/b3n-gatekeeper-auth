@@ -50,6 +50,20 @@ Default local URLs:
 - UI: `http://localhost:5173`
 - OpenAPI: `http://localhost:8000/docs`
 
+## First Setup
+
+After the API and UI are running:
+
+1. Open `/signup` and create the first owner account.
+2. Register OAuth clients for the apps you want GateKeeper to protect.
+3. Create scoped API tokens for services, projects, CLIs, or MCP servers.
+4. Verify discovery and signing keys before cutover:
+
+```bash
+curl -sf http://localhost:8000/.well-known/openid-configuration
+curl -sf http://localhost:8000/oauth/jwks.json
+```
+
 ## Verification
 
 ```bash

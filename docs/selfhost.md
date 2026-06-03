@@ -72,6 +72,22 @@ curl -sf https://gatekeeper.b3n.in/health
 curl -sf https://gatekeeper.b3n.in/version
 ```
 
+## First Setup
+
+After `/version` returns 200:
+
+1. Open `https://gatekeeper.b3n.in/signup` and create the first owner account.
+2. Create clients for Sentinel, Knowhere, the GateKeeper CLI, and any local
+   development callback URLs.
+3. Create scoped service, project, CLI, or MCP tokens only for the audiences each
+   caller needs.
+4. Verify issuer metadata before pointing protected services at GateKeeper:
+
+```bash
+curl -sf https://gatekeeper.b3n.in/.well-known/openid-configuration
+curl -sf https://gatekeeper.b3n.in/oauth/jwks.json
+```
+
 ## Required DNS
 
 ```text

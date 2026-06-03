@@ -14,6 +14,104 @@ class GateKeeperApiError extends Error {
   }
 }
 
+function fallbackForStatus(status: number, statusText: string) {
+  if (status === 0) {
+    return 'GateKeeper API is unreachable. Check the API URL and container status.'
+  }
+  if (status === 400 || status === 422) {
+    return 'Please check the form fields and try again.'
+  }
+  if (status === 401) {
+    return 'Authentication failed. Sign in again and retry.'
+  }
+  if (status === 403) {
+    return 'You do not have permission to perform this action.'
+  }
+  if (status === 404) {
+    return 'The requested GateKeeper resource was not found.'
+  }
+  if (status === 409) {
+    return 'This value already exists.'
+  }
+  if (status === 429) {
+    return 'Too many attempts. Wait a moment and try again.'
+  }
+  if (status >= 500) {
+    return 'GateKeeper is unavailable. Try again shortly.'
+  }
+  return statusText || 'GateKeeper request failed.'
+}
+
+function labelFromLocation(location: unknown) {
+  if (!Array.isArray(location)) {
+    return ''
+  }
+
+  return location
+    .filter((part) => part !== 'body' && part !== 'query' && part !== 'path')
+    .map((part) => String(part).replace(/_/g, ' '))
+    .join(' ')
+}
+
+function messageFromErrorItem(item: unknown, fallback: string): string {
+  if (typeof item === 'string') {
+    return item
+  }
+  if (!item || typeof item !== 'object') {
+    return ''
+  }
+
+  const record = item as Record<string, unknown>
+  const message = [record.msg, record.message, record.detail, record.error].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0,
+  )
+  if (!message) {
+    return ''
+  }
+
+  const location = labelFromLocation(record.loc)
+  return location ? `${location}: ${message}` : message || fallback
+}
+
+function messageFromApiError(payload: unknown, fallback: string): string {
+  if (typeof payload === 'string') {
+    return payload
+  }
+
+  if (Array.isArray(payload)) {
+    const messages = payload
+      .map((item) => messageFromErrorItem(item, fallback))
+      .filter((message) => message.length > 0)
+
+    if (messages.length) {
+      return messages.slice(0, 3).join(' ')
+    }
+    return fallback
+  }
+
+  if (!payload || typeof payload !== 'object') {
+    return fallback
+  }
+
+  const record = payload as Record<string, unknown>
+  if (record.detail !== undefined) {
+    return messageFromApiError(record.detail, fallback)
+  }
+
+  const directMessage = [record.message, record.error, record.reason].find(
+    (value): value is string => typeof value === 'string' && value.trim().length > 0,
+  )
+  if (directMessage) {
+    return directMessage
+  }
+
+  const fieldMessages = Object.entries(record)
+    .filter(([, value]) => typeof value === 'string' && value.trim().length > 0)
+    .map(([field, value]) => `${field.replace(/_/g, ' ')}: ${value}`)
+
+  return fieldMessages.length ? fieldMessages.slice(0, 3).join(' ') : fallback
+}
+
 export function getAccessToken() {
   return localStorage.getItem(ACCESS_KEY)
 }
@@ -63,11 +161,16 @@ async function request<T>(path: string, options: RequestInit = {}, allowRefresh 
   if (token) {
     headers.set('Authorization', `Bearer ${token}`)
   }
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers,
-    credentials: 'include',
-  })
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      headers,
+      credentials: 'include',
+    })
+  } catch {
+    throw new GateKeeperApiError(fallbackForStatus(0, ''), 0)
+  }
   if (response.status === 401 && allowRefresh && path !== '/api/v1/auth/refresh') {
     const refreshed = await refreshAccessToken()
     if (refreshed) {
@@ -75,8 +178,9 @@ async function request<T>(path: string, options: RequestInit = {}, allowRefresh 
     }
   }
   if (!response.ok) {
+    const fallback = fallbackForStatus(response.status, response.statusText)
     const body = await response.json().catch(() => ({ detail: response.statusText }))
-    throw new GateKeeperApiError(body.detail || response.statusText, response.status)
+    throw new GateKeeperApiError(messageFromApiError(body, fallback), response.status)
   }
   if (response.status === 204) {
     return undefined as T
