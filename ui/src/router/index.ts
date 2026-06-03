@@ -13,6 +13,9 @@ import SessionsView from '@/views/SessionsView.vue'
 import SignupView from '@/views/SignupView.vue'
 import TokensView from '@/views/TokensView.vue'
 import VerifyView from '@/views/VerifyView.vue'
+import { getAccessToken, getRefreshToken } from '@/services/api'
+
+const publicRoutes = new Set(['/login', '/signup', '/verify', '/reset-password', '/device'])
 
 const router = createRouter({
   history: createWebHistory(),
@@ -34,5 +37,19 @@ const router = createRouter({
   ],
 })
 
-export default router
+router.beforeEach((to) => {
+  const hasLocalSession = Boolean(getAccessToken() || getRefreshToken())
+  const isPublic = publicRoutes.has(to.path)
 
+  if (!isPublic && !hasLocalSession) {
+    return { path: '/login', query: { redirect: to.fullPath } }
+  }
+
+  if (to.path === '/login' && hasLocalSession) {
+    return { path: '/account' }
+  }
+
+  return true
+})
+
+export default router

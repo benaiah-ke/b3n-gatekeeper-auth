@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
 import { api } from '@/services/api'
 
 const router = useRouter()
+const route = useRoute()
 const email = ref('')
 const displayName = ref('')
 const password = ref('')
@@ -16,7 +17,7 @@ async function submit() {
   loading.value = true
   try {
     await api.signup(email.value, password.value, displayName.value)
-    router.push('/account')
+    router.push(String(route.query.redirect || '/account'))
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Sign up failed'
   } finally {
@@ -42,4 +43,3 @@ async function submit() {
     </form>
   </section>
 </template>
-

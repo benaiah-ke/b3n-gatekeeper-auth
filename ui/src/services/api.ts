@@ -4,6 +4,16 @@ const API_BASE = import.meta.env.VITE_GATEKEEPER_API_URL || ''
 const ACCESS_KEY = 'gatekeeper.access_token'
 const REFRESH_KEY = 'gatekeeper.refresh_token'
 
+class GateKeeperApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'GateKeeperApiError'
+    this.status = status
+  }
+}
+
 export function getAccessToken() {
   return localStorage.getItem(ACCESS_KEY)
 }
@@ -24,7 +34,29 @@ export function clearTokens() {
   localStorage.removeItem(REFRESH_KEY)
 }
 
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function refreshAccessToken() {
+  const refreshToken = getRefreshToken()
+  if (!refreshToken) {
+    return false
+  }
+
+  const response = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ refresh_token: refreshToken }),
+  })
+
+  if (!response.ok) {
+    clearTokens()
+    return false
+  }
+
+  saveTokens((await response.json()) as TokenResponse)
+  return true
+}
+
+async function request<T>(path: string, options: RequestInit = {}, allowRefresh = true): Promise<T> {
   const headers = new Headers(options.headers)
   headers.set('Content-Type', 'application/json')
   const token = getAccessToken()
@@ -36,9 +68,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers,
     credentials: 'include',
   })
+  if (response.status === 401 && allowRefresh && path !== '/api/v1/auth/refresh') {
+    const refreshed = await refreshAccessToken()
+    if (refreshed) {
+      return request<T>(path, options, false)
+    }
+  }
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: response.statusText }))
-    throw new Error(body.detail || response.statusText)
+    throw new GateKeeperApiError(body.detail || response.statusText, response.status)
   }
   if (response.status === 204) {
     return undefined as T
@@ -65,8 +103,11 @@ export const api = {
     return result
   },
   async logout() {
-    await request('/api/v1/auth/logout', { method: 'POST' })
-    clearTokens()
+    try {
+      await request('/api/v1/auth/logout', { method: 'POST' }, false)
+    } finally {
+      clearTokens()
+    }
   },
   me() {
     return request<{ user: User | null; scopes: string[]; org_id?: string | null }>('/api/v1/auth/me')
