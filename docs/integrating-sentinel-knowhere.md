@@ -31,12 +31,12 @@ secrets in docs, chat, logs, or tests.
 
 | App | Client id | API audience | Redirect URI | Allowed origin | Initial scopes |
 | --- | --- | --- | --- | --- | --- |
-| Sentinel | `sentinel-control-plane` | `sentinel-api` | `https://sentinel.b3n.in/auth/callback` | `https://sentinel.b3n.in` | `openid profile email auth:read` |
-| Knowhere | `knowhere-control-plane` | `knowhere-api` | `https://knowhere.b3n.in/auth/callback` | `https://knowhere.b3n.in` | `openid profile email auth:read` |
+| Sentinel | `sentinel-control-plane` | `sentinel-api` | `https://sentinel.b3n.in/api/v1/auth/callback` | `https://sentinel.b3n.in` | `openid profile email auth:read` |
+| Knowhere | `knowhere-control-plane` | `knowhere-api` | `https://knowhere.b3n.in/api/v1/auth/callback` | `https://knowhere.b3n.in` | `openid profile email auth:read` |
 
 Protected-resource registration should expose `sentinel-api` and
 `knowhere-api` as audiences. Future app-specific scopes can be added after the
-first dual-provider smoke succeeds:
+first backend-owned GateKeeper smoke succeeds:
 
 - Sentinel: `sentinel:read`, `sentinel:write`, `sentinel:admin`.
 - Knowhere: `knowhere:read`, `knowhere:write`, `knowhere:admin`.

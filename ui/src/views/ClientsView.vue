@@ -11,7 +11,7 @@ const templates = [
     label: 'Sentinel',
     name: 'Sentinel',
     public: false,
-    redirects: 'https://sentinel.b3n.in/auth/callback',
+    redirects: 'https://sentinel.b3n.in/api/v1/auth/callback',
     audiences: 'sentinel-api',
     scopes: ['auth:read', 'token:*'],
   },
@@ -20,7 +20,7 @@ const templates = [
     label: 'Knowhere',
     name: 'Knowhere',
     public: false,
-    redirects: 'https://knowhere.b3n.in/auth/callback',
+    redirects: 'https://knowhere.b3n.in/api/v1/auth/callback',
     audiences: 'knowhere-api',
     scopes: ['auth:read'],
   },
@@ -60,7 +60,7 @@ const clients = ref<AuthClient[]>([])
 const selectedTemplate = ref('sentinel')
 const name = ref('Sentinel')
 const publicClient = ref(false)
-const redirects = ref('https://sentinel.b3n.in/auth/callback')
+const redirects = ref('https://sentinel.b3n.in/api/v1/auth/callback')
 const allowedOrigins = ref('')
 const audiences = ref('sentinel-api')
 const scopes = ref<string[]>(['auth:read', 'token:*'])
