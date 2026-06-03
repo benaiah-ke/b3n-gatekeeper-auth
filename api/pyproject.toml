@@ -29,7 +29,7 @@ dev = [
 
 [tool.ruff]
 target-version = "py312"
-line-length = 100
+line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
@@ -44,4 +44,3 @@ include = ["app*"]
 [build-system]
 requires = ["setuptools>=75.0"]
 build-backend = "setuptools.build_meta"
-
