@@ -5,6 +5,7 @@ import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlencode
 
+import httpx
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,7 @@ from app.models import (
     AuditEvent,
     AuthClient,
     DeviceGrant,
+    Identity,
     McpResource,
     OAuthAuthorizationCode,
     Organization,
@@ -72,10 +74,12 @@ from app.services import (
     create_one_time_code,
     create_session_tokens,
     create_user,
+    enforce_rate_limit,
     ensure_bootstrap,
     get_client_by_client_id,
     org_roles,
     rotate_refresh_token,
+    send_one_time_code,
     user_read,
     validate_audience,
     validate_redirect,
@@ -246,6 +250,12 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
 
 @app.post("/api/v1/auth/login", response_model=TokenResponse)
 async def login(body: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit(
+        db,
+        key=f"login:{str(body.email).lower()}:{request.client.host if request.client else 'unknown'}",
+        limit=10,
+        window_seconds=300,
+    )
     user = await authenticate_password(db, str(body.email), body.password)
     client = await get_client_by_client_id(db, body.client_id) if body.client_id else None
     scopes = client.scopes if client else ["auth:read"]
@@ -299,14 +309,21 @@ async def me(principal: Principal = Depends(current_principal), db: AsyncSession
 
 @app.post("/api/v1/auth/email-code/request")
 async def request_email_code(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit(
+        db,
+        key=f"email-code:{str(body.email).lower()}:{body.purpose}",
+        limit=5,
+        window_seconds=900,
+    )
     user_result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = user_result.scalar_one_or_none()
-    await create_one_time_code(
+    code = await create_one_time_code(
         db,
         email=str(body.email),
         purpose=body.purpose,
         user_id=user.id if user else None,
     )
+    send_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
     await db.commit()
     return {"status": "sent"}
 
@@ -341,15 +358,22 @@ async def verify_email_code(
 
 @app.post("/api/v1/auth/password/reset/request")
 async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit(
+        db,
+        key=f"password-reset:{str(body.email).lower()}",
+        limit=5,
+        window_seconds=900,
+    )
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = result.scalar_one_or_none()
     if user:
-        await create_one_time_code(
+        code = await create_one_time_code(
             db,
             email=str(body.email),
             purpose="reset_password",
             user_id=user.id,
         )
+        send_one_time_code(email=str(body.email), code=code, purpose="reset_password")
         await db.commit()
     return {"status": "sent"}
 
@@ -442,8 +466,67 @@ async def google_start():
 
 
 @app.get("/api/v1/auth/oauth/google/callback")
-async def google_callback():
-    return JSONResponse(status_code=501, content={"detail": "Google callback wiring requires provider credentials"})
+async def google_callback(
+    code: str,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    if not settings.google_client_id or not settings.google_client_secret:
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured")
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        token_response = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": settings.google_client_id,
+                "client_secret": settings.google_client_secret,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": settings.google_redirect_uri,
+            },
+        )
+        token_response.raise_for_status()
+        provider_token = token_response.json()
+        userinfo = await client.get(
+            "https://openidconnect.googleapis.com/v1/userinfo",
+            headers={"Authorization": f"Bearer {provider_token['access_token']}"},
+        )
+        userinfo.raise_for_status()
+    profile = userinfo.json()
+    subject = str(profile["sub"])
+    email = str(profile["email"]).lower()
+    identity_result = await db.execute(
+        select(Identity).where(Identity.provider == "google", Identity.provider_subject == subject)
+    )
+    identity = identity_result.scalar_one_or_none()
+    user = await db.get(User, identity.user_id) if identity else None
+    if not user:
+        user_result = await db.execute(select(User).where(User.email == email))
+        user = user_result.scalar_one_or_none()
+    if not user:
+        user = await create_user(
+            db,
+            email=email,
+            password=None,
+            display_name=profile.get("name"),
+            verified=bool(profile.get("email_verified")),
+        )
+    if not identity:
+        db.add(
+            Identity(
+                user_id=user.id,
+                provider="google",
+                provider_subject=subject,
+                email=email,
+            )
+        )
+    access, refresh, _session, _refresh_model = await create_session_tokens(db, user, request=request)
+    await audit(db, "auth.oauth.google", actor_user_id=user.id, request=request)
+    await db.commit()
+    response = RedirectResponse(f"{settings.ui_url.rstrip('/')}/account", status_code=302)
+    response.set_cookie(settings.cookie_name, access, httponly=True, secure=settings.cookie_secure, samesite="lax")
+    response.set_cookie("gk_refresh_hint", refresh[-8:], httponly=True, secure=settings.cookie_secure, samesite="lax")
+    return response
 
 
 @app.get("/oauth/authorize")

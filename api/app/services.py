@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import secrets
+import smtplib
+import ssl
+from email.message import EmailMessage
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -15,6 +18,7 @@ from app.models import (
     Membership,
     OneTimeCode,
     Organization,
+    RateLimitBucket,
     RefreshToken,
     Role,
     Session,
@@ -56,6 +60,53 @@ async def audit(
             details=details or {},
         )
     )
+
+
+async def enforce_rate_limit(
+    db: AsyncSession,
+    *,
+    key: str,
+    limit: int,
+    window_seconds: int,
+) -> None:
+    now = now_utc()
+    result = await db.execute(select(RateLimitBucket).where(RateLimitBucket.key == key))
+    bucket = result.scalar_one_or_none()
+    if not bucket:
+        db.add(RateLimitBucket(key=key, count=1, window_start=now))
+        return
+    age = (now - bucket.window_start).total_seconds()
+    if age > window_seconds:
+        bucket.count = 1
+        bucket.window_start = now
+        return
+    bucket.count += 1
+    if bucket.count > limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+
+def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
+    if not settings.smtp_host:
+        if settings.email_dev_mode:
+            return
+        raise HTTPException(status_code=503, detail="SMTP is not configured")
+
+    message = EmailMessage()
+    message["From"] = settings.smtp_from
+    message["To"] = email
+    message["Subject"] = f"GateKeeper {purpose.replace('_', ' ')}"
+    message.set_content(
+        "Use this GateKeeper code to continue. "
+        "The code expires soon and should not be shared.\n\n"
+        f"{code}\n"
+    )
+    context = ssl.create_default_context()
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+        if settings.smtp_use_tls:
+            smtp.starttls(context=context)
+        if settings.smtp_username:
+            smtp.login(settings.smtp_username, settings.smtp_password)
+        smtp.send_message(message)
 
 
 async def ensure_bootstrap(db: AsyncSession) -> Organization:
