@@ -51,6 +51,17 @@ export interface ApiToken {
   token?: string | null
 }
 
+export interface Session {
+  id: string
+  user_id: string
+  org_id?: string | null
+  ip_address?: string | null
+  user_agent?: string | null
+  expires_at: string
+  revoked_at?: string | null
+  created_at: string
+}
+
 export interface AuditEvent {
   id: string
   action: string
@@ -61,4 +72,3 @@ export interface AuditEvent {
   details: Record<string, unknown>
   created_at: string
 }
-

@@ -25,6 +25,7 @@ from app.models import (
     Organization,
     Project,
     Role,
+    Session,
     User,
     Workspace,
 )
@@ -41,9 +42,11 @@ from app.schemas import (
     OAuthAuthorizeRequest,
     OrgCreate,
     OrgRead,
+    PasswordResetConfirm,
     ProjectCreate,
     RefreshRequest,
     RoleCreate,
+    SessionRead,
     SignupRequest,
     TokenCreate,
     TokenRead,
@@ -52,6 +55,7 @@ from app.schemas import (
 )
 from app.security import (
     create_access_token,
+    hash_password,
     new_code,
     new_opaque_token,
     now_utc,
@@ -333,6 +337,92 @@ async def verify_email_code(
         user=user_read(user),
         orgs=await org_roles(db, user.id),
     )
+
+
+@app.post("/api/v1/auth/password/reset/request")
+async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.email == str(body.email).lower()))
+    user = result.scalar_one_or_none()
+    if user:
+        await create_one_time_code(
+            db,
+            email=str(body.email),
+            purpose="reset_password",
+            user_id=user.id,
+        )
+        await db.commit()
+    return {"status": "sent"}
+
+
+@app.post("/api/v1/auth/password/reset/confirm")
+async def confirm_password_reset(
+    body: PasswordResetConfirm,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    await verify_one_time_code(
+        db,
+        email=str(body.email),
+        purpose="reset_password",
+        code=body.code,
+    )
+    result = await db.execute(select(User).where(User.email == str(body.email).lower()))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.password_hash = hash_password(body.new_password)
+    await audit(db, "auth.password.reset", actor_user_id=user.id, request=request)
+    await db.commit()
+    return {"status": "updated"}
+
+
+def session_read(session: Session) -> SessionRead:
+    return SessionRead(
+        id=session.id,
+        user_id=session.user_id,
+        org_id=session.org_id,
+        ip_address=session.ip_address,
+        user_agent=session.user_agent,
+        expires_at=session.expires_at,
+        revoked_at=session.revoked_at,
+        created_at=session.created_at,
+    )
+
+
+@app.get("/api/v1/sessions", response_model=list[SessionRead])
+async def list_sessions(
+    principal: Principal = Depends(require_scopes(["auth:read"])),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(Session).order_by(Session.created_at.desc())
+    if "*" not in principal.scopes and principal.user_id:
+        query = query.where(Session.user_id == principal.user_id)
+    result = await db.execute(query)
+    return [session_read(session) for session in result.scalars()]
+
+
+@app.delete("/api/v1/sessions/{session_id}")
+async def revoke_session(
+    session_id: str,
+    principal: Principal = Depends(require_scopes(["auth:read"])),
+    db: AsyncSession = Depends(get_db),
+):
+    session = await db.get(Session, session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if "*" not in principal.scopes and principal.user_id != session.user_id:
+        raise HTTPException(status_code=403, detail="Session ownership required")
+    session.revoked_at = now_utc()
+    await audit(
+        db,
+        "session.revoke",
+        org_id=session.org_id,
+        actor_user_id=principal.user_id,
+        target_type="session",
+        target_id=session.id,
+    )
+    await db.commit()
+    return {"status": "revoked", "id": session.id}
 
 
 @app.get("/api/v1/auth/oauth/google/start")

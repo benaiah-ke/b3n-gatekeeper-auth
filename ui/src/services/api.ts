@@ -1,4 +1,4 @@
-import type { ApiToken, AuditEvent, AuthClient, Org, TokenResponse, User } from '@/types'
+import type { ApiToken, AuditEvent, AuthClient, Org, Session, TokenResponse, User } from '@/types'
 
 const API_BASE = import.meta.env.VITE_GATEKEEPER_API_URL || ''
 const ACCESS_KEY = 'gatekeeper.access_token'
@@ -122,8 +122,13 @@ export const api = {
   revokeToken(id: string) {
     return request(`/api/v1/tokens/${id}`, { method: 'DELETE' })
   },
+  sessions() {
+    return request<Session[]>('/api/v1/sessions')
+  },
+  revokeSession(id: string) {
+    return request(`/api/v1/sessions/${id}`, { method: 'DELETE' })
+  },
   audit() {
     return request<AuditEvent[]>('/api/v1/audit')
   },
 }
-

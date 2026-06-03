@@ -58,6 +58,23 @@ class EmailCodeVerify(BaseModel):
     purpose: Literal["login", "verify_email", "reset_password"] = "login"
 
 
+class PasswordResetConfirm(BaseModel):
+    email: EmailStr
+    code: str
+    new_password: str = Field(..., min_length=12)
+
+
+class SessionRead(BaseModel):
+    id: str
+    user_id: str
+    org_id: str | None
+    ip_address: str | None
+    user_agent: str | None
+    expires_at: datetime
+    revoked_at: datetime | None
+    created_at: datetime
+
+
 class ClientCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=160)
     org_id: str | None = None
@@ -174,4 +191,3 @@ class AuditRead(BaseModel):
     target_id: str | None
     details: dict[str, Any]
     created_at: datetime
-

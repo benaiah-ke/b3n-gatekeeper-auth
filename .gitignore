@@ -18,3 +18,4 @@ coverage/
 htmlcov/
 .uv-cache/
 data/
+*.db
