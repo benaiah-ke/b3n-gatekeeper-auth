@@ -56,9 +56,9 @@ Default local URLs:
 make test-api
 make build-ui
 B3N_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.selfhost.yml config -q
+B3N_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.existing-proxy.yml config -q
 ```
 
 No production DNS, B3n Sentinel, or B3n Knowhere cutover is performed by this
 repository. See [docs/integrating-sentinel-knowhere.md](docs/integrating-sentinel-knowhere.md)
 for the staged migration plan.
-

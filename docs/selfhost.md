@@ -40,6 +40,23 @@ B3N_ENV_FILE=.env.example.selfhost \
   docker compose -f deploy/docker-compose.selfhost.yml config -q
 ```
 
+## Existing Caddy Proxy
+
+On B3n hosts that already run a shared `caddy-proxy` on the external Docker
+network named `proxy`, do not start GateKeeper's `caddy-proxy` service. Copy
+`deploy/docker-compose.existing-proxy.yml` as `/apps/gatekeeper/docker-compose.yml`
+and append `deploy/Caddyfile.existing-proxy.gatekeeper` to the shared Caddyfile.
+
+Validate both pieces before applying:
+
+```bash
+B3N_ENV_FILE=.env.example.selfhost \
+  docker compose -f deploy/docker-compose.existing-proxy.yml config -q
+
+docker exec caddy-proxy caddy validate --config /etc/caddy/Caddyfile
+docker exec caddy-proxy caddy reload --config /etc/caddy/Caddyfile
+```
+
 ## Start
 
 ```bash
