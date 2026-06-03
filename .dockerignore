@@ -1,0 +1,16 @@
+.git
+.github
+.DS_Store
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+**/.venv
+**/.uv-cache
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+api/gatekeeper.db
+api/test_gatekeeper.db
+deploy/.env
+.env

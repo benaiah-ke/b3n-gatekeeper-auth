@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     secret_key: str = "change-me-in-production"
     jwt_private_key_pem: str = ""
     jwt_public_key_pem: str = ""
+    jwt_key_dir: str = ""
     jwt_key_id: str = "local-dev"
     access_token_ttl_seconds: int = 900
     refresh_token_ttl_days: int = 30
@@ -70,4 +71,3 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
-

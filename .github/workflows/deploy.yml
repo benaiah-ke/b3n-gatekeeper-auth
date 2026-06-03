@@ -61,7 +61,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=gatekeeper-api
       - uses: docker/build-push-action@v6
         with:
-          context: ./ui
+          context: .
+          file: ./ui/Dockerfile
           push: true
           tags: |
             ghcr.io/benaiah-ke/gatekeeper-ui:latest
@@ -100,4 +101,3 @@ jobs:
             "$SSH_USER@$SSH_HOST:/apps/gatekeeper/"
           ssh -i ~/.ssh/gatekeeper_selfhost -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
             "cd /apps/gatekeeper && docker compose --env-file .env pull && docker compose --env-file .env up -d"
-

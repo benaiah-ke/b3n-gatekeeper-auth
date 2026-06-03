@@ -8,8 +8,18 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from app import security
+from app.config import settings
 from app.database import Base, engine
 from app.main import app
+from app.security import create_access_token, decode_access_token, public_jwk
+
+
+@pytest.fixture(autouse=True)
+def reset_jwt_key_cache():
+    security._keypair_pem.cache_clear()
+    yield
+    security._keypair_pem.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +102,29 @@ async def test_mcp_metadata_defaults_and_registered_resource():
         root = await ac.get("/.well-known/oauth-protected-resource")
         assert root.status_code == 200
         assert root.json()["authorization_servers"] == ["http://localhost:8000"]
+
+
+def test_jwt_key_dir_persists_signing_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "jwt_private_key_pem", "")
+    monkeypatch.setattr(settings, "jwt_public_key_pem", "")
+    monkeypatch.setattr(settings, "jwt_key_dir", str(tmp_path))
+    security._keypair_pem.cache_clear()
+
+    token = create_access_token(
+        subject="user_123",
+        audience="gatekeeper-api",
+        scopes=["auth:read"],
+        token_type="user",
+    )
+    first_jwk = public_jwk()
+
+    security._keypair_pem.cache_clear()
+    claims = decode_access_token(token, audience="gatekeeper-api")
+
+    assert claims["sub"] == "user_123"
+    assert public_jwk()["n"] == first_jwk["n"]
+    assert (tmp_path / "jwt_private.pem").exists()
+    assert (tmp_path / "jwt_public.pem").exists()
 
 
 @pytest.mark.asyncio

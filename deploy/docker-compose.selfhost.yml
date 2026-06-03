@@ -19,6 +19,8 @@ services:
     container_name: gatekeeper-api
     restart: unless-stopped
     env_file: ${B3N_ENV_FILE:-.env}
+    volumes:
+      - gatekeeper-api-data:/data
     depends_on:
       gatekeeper-postgres:
         condition: service_healthy
@@ -56,6 +58,7 @@ services:
 
 volumes:
   gatekeeper-postgres-data:
+  gatekeeper-api-data:
   gatekeeper-caddy-data:
   gatekeeper-caddy-config:
 
@@ -64,4 +67,3 @@ networks:
     external: true
   gatekeeper-internal:
     driver: bridge
-

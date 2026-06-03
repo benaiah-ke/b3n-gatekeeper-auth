@@ -27,6 +27,12 @@ Copy these files to `/apps/gatekeeper`:
 
 Edit `.env` on the server. Do not print secrets in logs or chat.
 
+`SECRET_KEY` and `POSTGRES_PASSWORD` must be replaced before first boot. By
+default, `JWT_KEY_DIR=/data/keys` makes the API generate and persist an RSA
+signing keypair in the `gatekeeper-api-data` Docker volume. Operators who manage
+keys outside Docker can instead set `JWT_PRIVATE_KEY_PEM` and
+`JWT_PUBLIC_KEY_PEM`.
+
 For local validation from a checkout:
 
 ```bash
@@ -61,4 +67,3 @@ Back up before upgrades:
 - Caddy data and config volumes
 
 Prove restore on a non-production host before relying on a backup strategy.
-

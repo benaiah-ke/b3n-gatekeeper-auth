@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import os
 import secrets
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 from argon2 import PasswordHasher
@@ -70,23 +73,95 @@ def verify_pkce(verifier: str, challenge: str, method: str) -> bool:
     return secrets.compare_digest(expected, challenge)
 
 
-def _private_key_pem() -> str:
-    if settings.jwt_private_key_pem:
-        return settings.jwt_private_key_pem.replace("\\n", "\n")
-    return _ephemeral_key.private_bytes(
+def _normalise_pem(value: str) -> str:
+    return value.replace("\\n", "\n")
+
+
+def _private_key_to_pem(private_key: rsa.RSAPrivateKey) -> str:
+    return private_key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.PKCS8,
         serialization.NoEncryption(),
     ).decode("ascii")
 
 
-def _public_key_pem() -> str:
-    if settings.jwt_public_key_pem:
-        return settings.jwt_public_key_pem.replace("\\n", "\n")
-    return _ephemeral_key.public_key().public_bytes(
+def _public_key_to_pem(private_key: rsa.RSAPrivateKey) -> str:
+    return private_key.public_key().public_bytes(
         serialization.Encoding.PEM,
         serialization.PublicFormat.SubjectPublicKeyInfo,
     ).decode("ascii")
+
+
+def _derive_public_pem(private_pem: str) -> str:
+    private_key = serialization.load_pem_private_key(private_pem.encode("utf-8"), password=None)
+    if not isinstance(private_key, rsa.RSAPrivateKey):
+        raise RuntimeError("GateKeeper JWT private key must be an RSA private key")
+    return _public_key_to_pem(private_key)
+
+
+def _read_or_create_keypair(private_path: Path, public_path: Path) -> tuple[str, str]:
+    if private_path.exists():
+        private_pem = private_path.read_text(encoding="utf-8")
+        public_pem = (
+            public_path.read_text(encoding="utf-8")
+            if public_path.exists()
+            else _derive_public_pem(private_pem)
+        )
+        if not public_path.exists():
+            _write_key_file(public_path, public_pem, 0o644)
+        return private_pem, public_pem
+
+    if public_path.exists():
+        raise RuntimeError("GateKeeper JWT key directory contains a public key without a private key")
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = _private_key_to_pem(private_key)
+    public_pem = _public_key_to_pem(private_key)
+    private_path.parent.mkdir(parents=True, exist_ok=True)
+    if not _write_key_file(private_path, private_pem, 0o600):
+        return _read_or_create_keypair(private_path, public_path)
+    _write_key_file(public_path, public_pem, 0o644)
+    return private_pem, public_pem
+
+
+def _write_key_file(path: Path, content: str, mode: int) -> bool:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        fd = os.open(path, flags, mode)
+    except FileExistsError:
+        return False
+    with os.fdopen(fd, "w", encoding="utf-8") as file:
+        file.write(content)
+    return True
+
+
+@lru_cache(maxsize=1)
+def _keypair_pem() -> tuple[str, str]:
+    if settings.jwt_private_key_pem:
+        private_pem = _normalise_pem(settings.jwt_private_key_pem)
+        public_pem = (
+            _normalise_pem(settings.jwt_public_key_pem)
+            if settings.jwt_public_key_pem
+            else _derive_public_pem(private_pem)
+        )
+        return private_pem, public_pem
+
+    if settings.jwt_public_key_pem:
+        raise RuntimeError("GateKeeper JWT_PUBLIC_KEY_PEM requires JWT_PRIVATE_KEY_PEM")
+
+    if settings.jwt_key_dir:
+        key_dir = Path(settings.jwt_key_dir)
+        return _read_or_create_keypair(key_dir / "jwt_private.pem", key_dir / "jwt_public.pem")
+
+    return _private_key_to_pem(_ephemeral_key), _public_key_to_pem(_ephemeral_key)
+
+
+def _private_key_pem() -> str:
+    return _keypair_pem()[0]
+
+
+def _public_key_pem() -> str:
+    return _keypair_pem()[1]
 
 
 def public_jwk() -> dict[str, str]:
