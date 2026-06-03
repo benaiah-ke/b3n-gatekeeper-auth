@@ -13,7 +13,7 @@ import SessionsView from '@/views/SessionsView.vue'
 import SignupView from '@/views/SignupView.vue'
 import TokensView from '@/views/TokensView.vue'
 import VerifyView from '@/views/VerifyView.vue'
-import { getAccessToken, getRefreshToken } from '@/services/api'
+import { getAccessToken, getRefreshToken, hasAuthenticatedSession } from '@/services/api'
 
 const publicRoutes = new Set(['/login', '/signup', '/verify', '/reset-password', '/device'])
 
@@ -37,11 +37,11 @@ const router = createRouter({
   ],
 })
 
-router.beforeEach((to) => {
+router.beforeEach(async (to) => {
   const hasLocalSession = Boolean(getAccessToken() || getRefreshToken())
   const isPublic = publicRoutes.has(to.path)
 
-  if (!isPublic && !hasLocalSession) {
+  if (!isPublic && !hasLocalSession && !(await hasAuthenticatedSession())) {
     return { path: '/login', query: { redirect: to.fullPath } }
   }
 

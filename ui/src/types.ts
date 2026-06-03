@@ -13,6 +13,25 @@ export interface Org {
   permissions: string[]
 }
 
+export interface SetupStatus {
+  issuer: string
+  jwks_uri: string
+  user?: User | null
+  org?: Org | null
+  orgs: Org[]
+  auth_type: string
+  scopes: string[]
+  owner_exists: boolean
+  can_manage_clients: boolean
+  can_issue_tokens: boolean
+  can_manage_projects: boolean
+  can_manage_roles: boolean
+  access_expires_at?: string | null
+  smtp_configured: boolean
+  email_dev_mode: boolean
+  dynamic_client_registration_enabled: boolean
+}
+
 export interface TokenResponse {
   access_token: string
   refresh_token?: string | null
@@ -35,6 +54,29 @@ export interface AuthClient {
   require_org_membership: boolean
   mcp_resource_uri?: string | null
   client_secret?: string
+}
+
+export interface Workspace {
+  id: string
+  org_id: string
+  name: string
+  slug: string
+}
+
+export interface Project {
+  id: string
+  org_id: string
+  workspace_id?: string | null
+  name: string
+  slug: string
+  audience: string
+}
+
+export interface Role {
+  id: string
+  org_id?: string | null
+  name: string
+  permissions: string[]
 }
 
 export interface ApiToken {

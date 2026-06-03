@@ -76,17 +76,58 @@ curl -sf https://gatekeeper.b3n.in/version
 
 After `/version` returns 200:
 
-1. Open `https://gatekeeper.b3n.in/signup` and create the first owner account.
-2. Create clients for Sentinel, Knowhere, the GateKeeper CLI, and any local
-   development callback URLs.
-3. Create scoped service, project, CLI, or MCP tokens only for the audiences each
-   caller needs.
-4. Verify issuer metadata before pointing protected services at GateKeeper:
+1. Open `https://gatekeeper.b3n.in/signup` and create the first account. On a
+   fresh install, the first successful signup becomes owner because no active
+   owner exists yet.
+2. Sign in as the configured `BOOTSTRAP_ADMIN_EMAIL` as well if you want that
+   address to be an owner. Later non-admin signups join the bootstrap org as
+   viewers until an owner grants broader access.
+3. Open `https://gatekeeper.b3n.in/account` and use the setup console to confirm
+   the owner state, issuer, JWKS URL, SMTP mode, and next actions.
+4. Create clients for Sentinel, Knowhere, the GateKeeper CLI, and any local
+   development callback URLs. Confidential client secrets are displayed once;
+   store them outside chat, logs, and tests.
+5. Create scoped service, project, CLI, or MCP tokens only for the audiences each
+   caller needs. Token values are displayed once.
+6. Verify issuer metadata before pointing protected services at GateKeeper:
 
 ```bash
 curl -sf https://gatekeeper.b3n.in/.well-known/openid-configuration
 curl -sf https://gatekeeper.b3n.in/oauth/jwks.json
 ```
+
+## Setup Checklist
+
+- `/account` shows an owner role for the bootstrap org.
+- `/clients` contains enabled clients for Sentinel, Knowhere, and CLI/device
+  login.
+- `/projects` contains audiences such as `sentinel-api` and `knowhere-api`.
+- `/tokens` contains only scoped, time-bounded credentials needed for the next
+  integration step.
+- `/audit` shows client and token creation events.
+- SMTP is configured before relying on email verification, reset, or invitation
+  flows. If SMTP is not configured, keep the missing delivery surface explicit in
+  the operator handoff.
+
+If `/account` redirects to login, check whether the browser has the same session
+that completed signup. If `/account` loads but shows `viewer`, signup succeeded
+but the account cannot perform setup actions. Use an owner account or the
+configured bootstrap admin account; do not work around this by sharing tokens.
+
+## Sentinel And Knowhere Env Baseline
+
+Use dual-provider or preview-only settings until the protected apps verify
+GateKeeper sessions end to end:
+
+```env
+GATEKEEPER_ISSUER=https://gatekeeper.b3n.in
+GATEKEEPER_JWKS_URL=https://gatekeeper.b3n.in/oauth/jwks.json
+GATEKEEPER_AUDIENCE=sentinel-api
+GATEKEEPER_REQUIRED_SCOPES=auth:read
+```
+
+For Knowhere, change `GATEKEEPER_AUDIENCE` to `knowhere-api`. DNS changes and
+production auth cutovers require explicit approval.
 
 ## Required DNS
 

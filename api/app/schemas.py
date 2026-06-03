@@ -21,6 +21,48 @@ class OrgRead(BaseModel):
     permissions: list[str] = []
 
 
+class WorkspaceRead(BaseModel):
+    id: str
+    org_id: str
+    name: str
+    slug: str
+
+
+class ProjectRead(BaseModel):
+    id: str
+    org_id: str
+    workspace_id: str | None = None
+    name: str
+    slug: str
+    audience: str
+
+
+class RoleRead(BaseModel):
+    id: str
+    org_id: str | None = None
+    name: str
+    permissions: list[str] = []
+
+
+class SetupStatusRead(BaseModel):
+    issuer: str
+    jwks_uri: str
+    user: UserRead | None = None
+    org: OrgRead | None = None
+    orgs: list[OrgRead] = []
+    auth_type: str
+    scopes: list[str] = []
+    owner_exists: bool
+    can_manage_clients: bool
+    can_issue_tokens: bool
+    can_manage_projects: bool
+    can_manage_roles: bool
+    access_expires_at: datetime | None = None
+    smtp_configured: bool
+    email_dev_mode: bool
+    dynamic_client_registration_enabled: bool
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "Bearer"
@@ -84,6 +126,17 @@ class ClientCreate(BaseModel):
     audiences: list[str] = []
     scopes: list[str] = []
     require_org_membership: bool = True
+    mcp_resource_uri: str | None = None
+
+
+class ClientUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=2, max_length=160)
+    enabled: bool | None = None
+    redirect_uris: list[str] | None = None
+    allowed_origins: list[str] | None = None
+    audiences: list[str] | None = None
+    scopes: list[str] | None = None
+    require_org_membership: bool | None = None
     mcp_resource_uri: str | None = None
 
 

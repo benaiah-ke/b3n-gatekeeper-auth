@@ -3,10 +3,11 @@ from __future__ import annotations
 import logging
 import time
 from contextlib import asynccontextmanager
-from urllib.parse import urlencode
+from datetime import UTC, datetime
+from urllib.parse import urlencode, urlparse
 
 import httpx
-from fastapi import Depends, FastAPI, Form, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -26,6 +27,7 @@ from app.models import (
     OAuthAuthorizationCode,
     Organization,
     Project,
+    RefreshToken,
     Role,
     Session,
     User,
@@ -35,6 +37,7 @@ from app.schemas import (
     AuditRead,
     ClientCreate,
     ClientRead,
+    ClientUpdate,
     DeviceAuthorizationRequest,
     DeviceAuthorizeApprove,
     EmailCodeRequest,
@@ -46,14 +49,18 @@ from app.schemas import (
     OrgRead,
     PasswordResetConfirm,
     ProjectCreate,
+    ProjectRead,
     RefreshRequest,
     RoleCreate,
+    RoleRead,
     SessionRead,
+    SetupStatusRead,
     SignupRequest,
     TokenCreate,
     TokenRead,
     TokenResponse,
     WorkspaceCreate,
+    WorkspaceRead,
 )
 from app.security import (
     create_access_token,
@@ -77,6 +84,7 @@ from app.services import (
     enforce_rate_limit,
     ensure_bootstrap,
     get_client_by_client_id,
+    org_has_owner,
     org_roles,
     rotate_refresh_token,
     send_one_time_code,
@@ -123,6 +131,50 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def session_cookie_options() -> dict[str, object]:
+    options: dict[str, object] = {
+        "httponly": True,
+        "secure": settings.cookie_secure,
+        "samesite": "lax",
+    }
+    if settings.cookie_domain:
+        options["domain"] = settings.cookie_domain
+    return options
+
+
+def set_session_cookie(response: Response, access_token: str) -> None:
+    response.set_cookie(settings.cookie_name, access_token, **session_cookie_options())
+
+
+def delete_session_cookie(response: Response) -> None:
+    kwargs: dict[str, object] = {}
+    if settings.cookie_domain:
+        kwargs["domain"] = settings.cookie_domain
+    response.delete_cookie(settings.cookie_name, **kwargs)
+
+
+def has_capability(values: list[str], *accepted: str) -> bool:
+    value_set = set(values)
+    if "*" in value_set:
+        return True
+    return any(value in value_set for value in accepted)
+
+
+def validate_url_list(values: list[str], *, field_name: str, origin_only: bool = False) -> list[str]:
+    cleaned: list[str] = []
+    for raw in values:
+        value = raw.strip()
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(status_code=422, detail=f"{field_name} must be absolute http(s) URLs")
+        if origin_only and (parsed.path not in {"", "/"} or parsed.params or parsed.query or parsed.fragment):
+            raise HTTPException(status_code=422, detail=f"{field_name} must be origins without paths")
+        cleaned.append(value.rstrip("/") if origin_only else value)
+    return cleaned
 
 
 @app.middleware("http")
@@ -235,9 +287,9 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
         display_name=body.display_name,
         verified=False,
     )
-    access, refresh, session, _refresh_model = await create_session_tokens(db, user, request=request)
+    access, refresh, _session, _refresh_model = await create_session_tokens(db, user, request=request)
     await db.commit()
-    response.set_cookie(settings.cookie_name, access, httponly=True, secure=settings.cookie_secure, samesite="lax")
+    set_session_cookie(response, access)
     return TokenResponse(
         access_token=access,
         refresh_token=refresh,
@@ -265,7 +317,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
     )
     await audit(db, "auth.login", actor_user_id=user.id, request=request)
     await db.commit()
-    response.set_cookie(settings.cookie_name, access, httponly=True, secure=settings.cookie_secure, samesite="lax")
+    set_session_cookie(response, access)
     return TokenResponse(
         access_token=access,
         refresh_token=refresh,
@@ -277,21 +329,23 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
 
 
 @app.post("/api/v1/auth/refresh", response_model=TokenResponse)
-async def refresh(body: RefreshRequest, db: AsyncSession = Depends(get_db)):
-    access, refresh_token, user = await rotate_refresh_token(db, body.refresh_token)
+async def refresh(body: RefreshRequest, response: Response, db: AsyncSession = Depends(get_db)):
+    access, refresh_token, user, scopes = await rotate_refresh_token(db, body.refresh_token)
+    memberships = await org_roles(db, user.id)
+    set_session_cookie(response, access)
     return TokenResponse(
         access_token=access,
         refresh_token=refresh_token,
         expires_in=settings.access_token_ttl_seconds,
-        scope="auth:read",
+        scope=" ".join(scopes),
         user=user_read(user),
-        orgs=await org_roles(db, user.id),
+        orgs=memberships,
     )
 
 
 @app.post("/api/v1/auth/logout")
 async def logout(response: Response):
-    response.delete_cookie(settings.cookie_name)
+    delete_session_cookie(response)
     return {"status": "ok"}
 
 
@@ -305,6 +359,36 @@ async def me(principal: Principal = Depends(current_principal), db: AsyncSession
         "org_id": principal.org_id,
         "user": user_read(user) if user else None,
     }
+
+
+@app.get("/api/v1/setup/status", response_model=SetupStatusRead)
+async def setup_status(principal: Principal = Depends(current_principal), db: AsyncSession = Depends(get_db)):
+    user = await db.get(User, principal.user_id) if principal.user_id else None
+    memberships = await org_roles(db, user.id) if user else []
+    selected_org = next((org for org in memberships if org.id == principal.org_id), None)
+    selected_org = selected_org or (memberships[0] if memberships else None)
+    permissions = selected_org.permissions if selected_org else principal.scopes
+    exp = principal.claims.get("exp") if principal.claims else None
+    access_expires_at = datetime.fromtimestamp(int(exp), UTC) if exp else None
+    owner_exists = await org_has_owner(db, selected_org.id) if selected_org else False
+    return SetupStatusRead(
+        issuer=settings.issuer,
+        jwks_uri=f"{settings.issuer}/oauth/jwks.json",
+        user=user_read(user) if user else None,
+        org=selected_org,
+        orgs=memberships,
+        auth_type=principal.auth_type,
+        scopes=principal.scopes,
+        owner_exists=owner_exists,
+        can_manage_clients=has_capability(permissions, "admin:*"),
+        can_issue_tokens=has_capability(permissions, "admin:*", "token:*"),
+        can_manage_projects=has_capability(permissions, "admin:*"),
+        can_manage_roles=has_capability(permissions, "admin:*"),
+        access_expires_at=access_expires_at,
+        smtp_configured=bool(settings.smtp_host),
+        email_dev_mode=settings.email_dev_mode,
+        dynamic_client_registration_enabled=settings.enable_dynamic_client_registration,
+    )
 
 
 @app.post("/api/v1/auth/email-code/request")
@@ -345,7 +429,7 @@ async def verify_email_code(
     access, refresh, _session, _refresh_model = await create_session_tokens(db, user, request=request)
     await audit(db, f"auth.email_code.{body.purpose}", actor_user_id=user.id, request=request)
     await db.commit()
-    response.set_cookie(settings.cookie_name, access, httponly=True, secure=settings.cookie_secure, samesite="lax")
+    set_session_cookie(response, access)
     return TokenResponse(
         access_token=access,
         refresh_token=refresh,
@@ -524,8 +608,8 @@ async def google_callback(
     await audit(db, "auth.oauth.google", actor_user_id=user.id, request=request)
     await db.commit()
     response = RedirectResponse(f"{settings.ui_url.rstrip('/')}/account", status_code=302)
-    response.set_cookie(settings.cookie_name, access, httponly=True, secure=settings.cookie_secure, samesite="lax")
-    response.set_cookie("gk_refresh_hint", refresh[-8:], httponly=True, secure=settings.cookie_secure, samesite="lax")
+    set_session_cookie(response, access)
+    response.set_cookie("gk_refresh_hint", refresh[-8:], **session_cookie_options())
     return response
 
 
@@ -662,13 +746,13 @@ async def oauth_token(
     if grant_type == "refresh_token":
         if not refresh_token:
             raise HTTPException(status_code=400, detail="Missing refresh_token")
-        access, new_refresh, _user = await rotate_refresh_token(db, refresh_token)
+        access, new_refresh, _user, scopes = await rotate_refresh_token(db, refresh_token)
         return {
             "access_token": access,
             "refresh_token": new_refresh,
             "token_type": "Bearer",
             "expires_in": settings.access_token_ttl_seconds,
-            "scope": "auth:read",
+            "scope": " ".join(scopes),
         }
 
     if grant_type == "client_credentials":
@@ -870,6 +954,22 @@ async def create_workspace(body: WorkspaceCreate, db: AsyncSession = Depends(get
     return {"id": workspace.id, "org_id": workspace.org_id, "name": workspace.name, "slug": workspace.slug}
 
 
+@app.get(
+    "/api/v1/workspaces",
+    response_model=list[WorkspaceRead],
+    dependencies=[Depends(require_scopes(["auth:read"]))],
+)
+async def list_workspaces(org_id: str | None = None, db: AsyncSession = Depends(get_db)):
+    query = select(Workspace).order_by(Workspace.created_at.desc())
+    if org_id:
+        query = query.where(Workspace.org_id == org_id)
+    result = await db.execute(query)
+    return [
+        WorkspaceRead(id=item.id, org_id=item.org_id, name=item.name, slug=item.slug)
+        for item in result.scalars()
+    ]
+
+
 @app.post("/api/v1/projects", dependencies=[Depends(require_scopes(["admin:*"]))])
 async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)):
     project = Project(
@@ -890,12 +990,43 @@ async def create_project(body: ProjectCreate, db: AsyncSession = Depends(get_db)
     }
 
 
+@app.get("/api/v1/projects", response_model=list[ProjectRead], dependencies=[Depends(require_scopes(["auth:read"]))])
+async def list_projects(org_id: str | None = None, db: AsyncSession = Depends(get_db)):
+    query = select(Project).order_by(Project.created_at.desc())
+    if org_id:
+        query = query.where(Project.org_id == org_id)
+    result = await db.execute(query)
+    return [
+        ProjectRead(
+            id=item.id,
+            org_id=item.org_id,
+            workspace_id=item.workspace_id,
+            name=item.name,
+            slug=item.slug,
+            audience=item.audience,
+        )
+        for item in result.scalars()
+    ]
+
+
 @app.post("/api/v1/roles", dependencies=[Depends(require_scopes(["admin:*"]))])
 async def create_role(body: RoleCreate, db: AsyncSession = Depends(get_db)):
     role = Role(org_id=body.org_id, name=body.name, permissions=body.permissions)
     db.add(role)
     await db.commit()
     return {"id": role.id, "name": role.name, "permissions": role.permissions}
+
+
+@app.get("/api/v1/roles", response_model=list[RoleRead], dependencies=[Depends(require_scopes(["auth:read"]))])
+async def list_roles(org_id: str | None = None, db: AsyncSession = Depends(get_db)):
+    query = select(Role).order_by(Role.name)
+    if org_id:
+        query = query.where(Role.org_id == org_id)
+    result = await db.execute(query)
+    return [
+        RoleRead(id=item.id, org_id=item.org_id, name=item.name, permissions=item.permissions or [])
+        for item in result.scalars()
+    ]
 
 
 @app.get("/api/v1/clients", response_model=list[ClientRead], dependencies=[Depends(require_scopes(["auth:read"]))])
@@ -910,6 +1041,8 @@ async def create_client(
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
+    redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
+    allowed_origins = validate_url_list(body.allowed_origins, field_name="allowed_origins", origin_only=True)
     secret = None
     secret_hash = None
     if not body.public:
@@ -923,8 +1056,8 @@ async def create_client(
         client_id=f"gkc_{new_code(12).lower()}",
         client_secret_hash=secret_hash,
         public=body.public,
-        redirect_uris=body.redirect_uris,
-        allowed_origins=body.allowed_origins,
+        redirect_uris=redirect_uris,
+        allowed_origins=allowed_origins,
         audiences=body.audiences,
         scopes=body.scopes,
         require_org_membership=body.require_org_membership,
@@ -944,6 +1077,110 @@ async def create_client(
     if secret:
         payload["client_secret"] = secret
     return payload
+
+
+@app.patch("/api/v1/clients/{client_id}", response_model=ClientRead)
+async def update_client(
+    client_id: str,
+    body: ClientUpdate,
+    principal: Principal = Depends(require_scopes(["admin:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    client = await db.get(AuthClient, client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if body.name is not None:
+        client.name = body.name
+    if body.enabled is not None:
+        client.enabled = body.enabled
+    if body.redirect_uris is not None:
+        client.redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
+    if body.allowed_origins is not None:
+        client.allowed_origins = validate_url_list(
+            body.allowed_origins, field_name="allowed_origins", origin_only=True
+        )
+    if body.audiences is not None:
+        client.audiences = body.audiences
+    if body.scopes is not None:
+        client.scopes = body.scopes
+    if body.require_org_membership is not None:
+        client.require_org_membership = body.require_org_membership
+    if body.mcp_resource_uri is not None:
+        client.mcp_resource_uri = body.mcp_resource_uri
+    await audit(
+        db,
+        "client.update",
+        org_id=client.org_id,
+        actor_user_id=principal.user_id,
+        target_type="client",
+        target_id=client.id,
+    )
+    await db.commit()
+    await db.refresh(client)
+    return client_read(client)
+
+
+@app.post("/api/v1/clients/{client_id}/rotate-secret")
+async def rotate_client_secret(
+    client_id: str,
+    principal: Principal = Depends(require_scopes(["admin:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    client = await db.get(AuthClient, client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if client.public:
+        raise HTTPException(status_code=400, detail="Public clients do not have secrets")
+    secret = new_opaque_token("gkcs")
+    from app.security import hash_password
+
+    client.client_secret_hash = hash_password(secret)
+    await audit(
+        db,
+        "client.secret.rotate",
+        org_id=client.org_id,
+        actor_user_id=principal.user_id,
+        target_type="client",
+        target_id=client.id,
+    )
+    await db.commit()
+    payload = client_read(client).model_dump()
+    payload["client_secret"] = secret
+    return payload
+
+
+@app.delete("/api/v1/clients/{client_id}")
+async def delete_client(
+    client_id: str,
+    principal: Principal = Depends(require_scopes(["admin:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    client = await db.get(AuthClient, client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Client not found")
+    if client.client_id == "gatekeeper-cli":
+        raise HTTPException(status_code=400, detail="The default CLI client can be disabled but not deleted")
+    dependent_queries = [
+        select(ApiToken.id).where(ApiToken.client_id == client.id),
+        select(RefreshToken.id).where(RefreshToken.client_id == client.id),
+        select(DeviceGrant.id).where(DeviceGrant.client_id == client.id),
+        select(OAuthAuthorizationCode.id).where(OAuthAuthorizationCode.client_id == client.id),
+    ]
+    for query in dependent_queries:
+        dependency = await db.execute(query.limit(1))
+        if dependency.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Client has issued artifacts; disable it instead")
+    await audit(
+        db,
+        "client.delete",
+        org_id=client.org_id,
+        actor_user_id=principal.user_id,
+        target_type="client",
+        target_id=client.id,
+    )
+    await db.delete(client)
+    await db.commit()
+    return {"status": "deleted", "id": client_id}
 
 
 def token_read(token: ApiToken, raw: str | None = None) -> TokenRead:
@@ -1021,6 +1258,44 @@ async def revoke_api_token(
     return {"status": "revoked", "id": token_id}
 
 
+@app.post("/api/v1/tokens/{token_id}/rotate", response_model=TokenRead)
+async def rotate_api_token(
+    token_id: str,
+    principal: Principal = Depends(require_scopes(["token:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    existing = await db.get(ApiToken, token_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Token not found")
+    if existing.revoked_at:
+        raise HTTPException(status_code=400, detail="Token is already revoked")
+    existing.revoked_at = now_utc()
+    token, raw = await create_api_token(
+        db,
+        name=existing.name,
+        token_type_value=existing.token_type,
+        org_id=existing.org_id,
+        user_id=existing.user_id,
+        project_id=existing.project_id,
+        client_id=existing.client_id,
+        scopes=existing.scopes or [],
+        audiences=existing.audiences or [],
+        expires_at=existing.expires_at,
+    )
+    await audit(
+        db,
+        "token.rotate",
+        org_id=token.org_id,
+        actor_user_id=principal.user_id,
+        target_type="token",
+        target_id=token.id,
+        details={"replaces": existing.id, "previous_hint": existing.token_hint},
+    )
+    await db.commit()
+    await db.refresh(token)
+    return token_read(token, raw)
+
+
 @app.post("/api/v1/mcp/resources", dependencies=[Depends(require_scopes(["mcp:*"]))])
 async def create_mcp_resource(body: McpResourceCreate, db: AsyncSession = Depends(get_db)):
     resource = McpResource(
@@ -1044,8 +1319,27 @@ async def list_mcp_resources(db: AsyncSession = Depends(get_db)):
 
 
 @app.get("/api/v1/audit", response_model=list[AuditRead], dependencies=[Depends(require_scopes(["auth:read"]))])
-async def list_audit(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(200))
+async def list_audit(
+    actor_user_id: str | None = None,
+    action: str | None = None,
+    org_id: str | None = None,
+    target_type: str | None = None,
+    target_id: str | None = None,
+    limit: int = Query(200, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+):
+    query = select(AuditEvent).order_by(AuditEvent.created_at.desc()).limit(limit)
+    if actor_user_id:
+        query = query.where(AuditEvent.actor_user_id == actor_user_id)
+    if action:
+        query = query.where(AuditEvent.action == action)
+    if org_id:
+        query = query.where(AuditEvent.org_id == org_id)
+    if target_type:
+        query = query.where(AuditEvent.target_type == target_type)
+    if target_id:
+        query = query.where(AuditEvent.target_id == target_id)
+    result = await db.execute(query)
     return [
         AuditRead(
             id=item.id,

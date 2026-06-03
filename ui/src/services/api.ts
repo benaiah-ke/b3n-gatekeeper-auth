@@ -1,10 +1,22 @@
-import type { ApiToken, AuditEvent, AuthClient, Org, Session, TokenResponse, User } from '@/types'
+import type {
+  ApiToken,
+  AuditEvent,
+  AuthClient,
+  Org,
+  Project,
+  Role,
+  Session,
+  SetupStatus,
+  TokenResponse,
+  User,
+  Workspace,
+} from '@/types'
 
 const API_BASE = import.meta.env.VITE_GATEKEEPER_API_URL || ''
 const ACCESS_KEY = 'gatekeeper.access_token'
 const REFRESH_KEY = 'gatekeeper.refresh_token'
 
-class GateKeeperApiError extends Error {
+export class GateKeeperApiError extends Error {
   status: number
 
   constructor(message: string, status: number) {
@@ -125,12 +137,16 @@ export function saveTokens(response: TokenResponse) {
   if (response.refresh_token) {
     localStorage.setItem(REFRESH_KEY, response.refresh_token)
   }
+  cookieSessionVerified = true
 }
 
 export function clearTokens() {
   localStorage.removeItem(ACCESS_KEY)
   localStorage.removeItem(REFRESH_KEY)
+  cookieSessionVerified = false
 }
+
+let cookieSessionVerified = false
 
 async function refreshAccessToken() {
   const refreshToken = getRefreshToken()
@@ -188,6 +204,20 @@ async function request<T>(path: string, options: RequestInit = {}, allowRefresh 
   return response.json() as Promise<T>
 }
 
+export async function hasAuthenticatedSession() {
+  if (getAccessToken() || getRefreshToken() || cookieSessionVerified) {
+    return true
+  }
+
+  try {
+    await request('/api/v1/auth/me', {}, false)
+    cookieSessionVerified = true
+    return true
+  } catch {
+    return false
+  }
+}
+
 export const api = {
   async signup(email: string, password: string, displayName?: string) {
     const body = { email, password, display_name: displayName || null }
@@ -216,6 +246,9 @@ export const api = {
   me() {
     return request<{ user: User | null; scopes: string[]; org_id?: string | null }>('/api/v1/auth/me')
   },
+  setupStatus() {
+    return request<SetupStatus>('/api/v1/setup/status')
+  },
   orgs() {
     return request<Org[]>('/api/v1/orgs')
   },
@@ -243,8 +276,62 @@ export const api = {
   clients() {
     return request<AuthClient[]>('/api/v1/clients')
   },
-  createClient(payload: Partial<AuthClient> & { name: string }) {
+  createClient(
+    payload: Partial<AuthClient> & {
+      name: string
+      org_id?: string | null
+      mcp_resource_uri?: string | null
+    },
+  ) {
     return request<AuthClient>('/api/v1/clients', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  updateClient(id: string, payload: Partial<AuthClient>) {
+    return request<AuthClient>(`/api/v1/clients/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload),
+    })
+  },
+  rotateClientSecret(id: string) {
+    return request<AuthClient>(`/api/v1/clients/${id}/rotate-secret`, { method: 'POST' })
+  },
+  deleteClient(id: string) {
+    return request<{ status: string; id: string }>(`/api/v1/clients/${id}`, { method: 'DELETE' })
+  },
+  workspaces(orgId?: string) {
+    const query = orgId ? `?org_id=${encodeURIComponent(orgId)}` : ''
+    return request<Workspace[]>(`/api/v1/workspaces${query}`)
+  },
+  createWorkspace(payload: { org_id: string; name: string; slug: string }) {
+    return request<Workspace>('/api/v1/workspaces', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  projects(orgId?: string) {
+    const query = orgId ? `?org_id=${encodeURIComponent(orgId)}` : ''
+    return request<Project[]>(`/api/v1/projects${query}`)
+  },
+  createProject(payload: {
+    org_id: string
+    workspace_id?: string | null
+    name: string
+    slug: string
+    audience: string
+  }) {
+    return request<Project>('/api/v1/projects', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  roles(orgId?: string) {
+    const query = orgId ? `?org_id=${encodeURIComponent(orgId)}` : ''
+    return request<Role[]>(`/api/v1/roles${query}`)
+  },
+  createRole(payload: { org_id?: string | null; name: string; permissions: string[] }) {
+    return request<Role>('/api/v1/roles', {
       method: 'POST',
       body: JSON.stringify(payload),
     })
@@ -258,6 +345,9 @@ export const api = {
     scopes: string[]
     audiences: string[]
     org_id?: string | null
+    project_id?: string | null
+    client_id?: string | null
+    expires_at?: string | null
   }) {
     return request<ApiToken>('/api/v1/tokens', {
       method: 'POST',
@@ -267,13 +357,32 @@ export const api = {
   revokeToken(id: string) {
     return request(`/api/v1/tokens/${id}`, { method: 'DELETE' })
   },
+  rotateToken(id: string) {
+    return request<ApiToken>(`/api/v1/tokens/${id}/rotate`, { method: 'POST' })
+  },
   sessions() {
     return request<Session[]>('/api/v1/sessions')
   },
   revokeSession(id: string) {
     return request(`/api/v1/sessions/${id}`, { method: 'DELETE' })
   },
-  audit() {
-    return request<AuditEvent[]>('/api/v1/audit')
+  mcpResources() {
+    return request<Array<{ id: string; name: string; resource_uri: string; scopes: string[] }>>('/api/v1/mcp/resources')
+  },
+  createMcpResource(payload: { name: string; org_id?: string | null; resource_uri: string; scopes: string[] }) {
+    return request<{ id: string; resource_uri: string; scopes: string[] }>('/api/v1/mcp/resources', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
+  audit(filters: Record<string, string> = {}) {
+    const params = new URLSearchParams()
+    for (const [key, value] of Object.entries(filters)) {
+      if (value) {
+        params.set(key, value)
+      }
+    }
+    const query = params.toString() ? `?${params.toString()}` : ''
+    return request<AuditEvent[]>(`/api/v1/audit${query}`)
   },
 }

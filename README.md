@@ -54,15 +54,26 @@ Default local URLs:
 
 After the API and UI are running:
 
-1. Open `/signup` and create the first owner account.
-2. Register OAuth clients for the apps you want GateKeeper to protect.
-3. Create scoped API tokens for services, projects, CLIs, or MCP servers.
-4. Verify discovery and signing keys before cutover:
+1. Open `/signup` and create the first account. If no active owner exists in
+   the bootstrap org, this successful signup becomes owner. The
+   `BOOTSTRAP_ADMIN_EMAIL` account is also granted owner when it signs up.
+2. Open `/account` and follow the setup console. A viewer account can inspect
+   state, but an owner is required to create clients, projects, roles, and
+   tokens.
+3. Register OAuth clients for Sentinel, Knowhere, CLI/device login, MCP
+   resources, and any local development callback URLs.
+4. Create scoped API tokens for services, projects, CLIs, or MCP servers.
+5. Verify discovery and signing keys before cutover:
 
 ```bash
 curl -sf http://localhost:8000/.well-known/openid-configuration
 curl -sf http://localhost:8000/oauth/jwks.json
 ```
+
+If `/account` shows a viewer state on a self-hosted install, do not assume the
+signup failed. It means the current account can read the bootstrap org but does
+not have setup privileges; use an owner account or the configured bootstrap
+admin account.
 
 ## Verification
 

@@ -116,6 +116,7 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     org = result.scalar_one_or_none()
     if org:
         await ensure_default_clients(db, org)
+        await ensure_bootstrap_owner(db, org)
         await db.commit()
         return org
 
@@ -131,8 +132,70 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     db.add_all(roles)
     await audit(db, "org.bootstrap", org_id=org.id, target_type="organization", target_id=org.id)
     await ensure_default_clients(db, org)
+    await ensure_bootstrap_owner(db, org)
     await db.commit()
     return org
+
+
+async def org_has_owner(db: AsyncSession, org_id: str) -> bool:
+    result = await db.execute(
+        select(Membership.id)
+        .join(Role, Role.id == Membership.role_id)
+        .where(
+            Membership.org_id == org_id,
+            Membership.status == "active",
+            Role.name == "owner",
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def ensure_bootstrap_owner(db: AsyncSession, org: Organization) -> bool:
+    if await org_has_owner(db, org.id):
+        return False
+
+    role_result = await db.execute(select(Role).where(Role.org_id == org.id, Role.name == "owner"))
+    owner_role = role_result.scalar_one_or_none()
+    if not owner_role:
+        return False
+
+    bootstrap_email = str(settings.bootstrap_admin_email).lower()
+    candidate_result = await db.execute(
+        select(Membership)
+        .join(User, User.id == Membership.user_id)
+        .where(
+            Membership.org_id == org.id,
+            Membership.status == "active",
+            User.email == bootstrap_email,
+        )
+        .order_by(Membership.created_at.asc())
+        .limit(1)
+    )
+    candidate = candidate_result.scalar_one_or_none()
+    if not candidate:
+        candidate_result = await db.execute(
+            select(Membership)
+            .where(Membership.org_id == org.id, Membership.status == "active")
+            .order_by(Membership.created_at.asc())
+            .limit(1)
+        )
+        candidate = candidate_result.scalar_one_or_none()
+
+    if not candidate:
+        return False
+
+    candidate.role_id = owner_role.id
+    await audit(
+        db,
+        "org.owner.bootstrap",
+        org_id=org.id,
+        actor_user_id=candidate.user_id,
+        target_type="membership",
+        target_id=candidate.id,
+        details={"reason": "no_active_owner"},
+    )
+    return True
 
 
 async def ensure_default_clients(db: AsyncSession, org: Organization) -> None:
@@ -195,7 +258,8 @@ async def create_user(
     await db.flush()
 
     bootstrap_org = await ensure_bootstrap(db)
-    if normalized == str(settings.bootstrap_admin_email).lower():
+    needs_first_owner = not await org_has_owner(db, bootstrap_org.id)
+    if normalized == str(settings.bootstrap_admin_email).lower() or needs_first_owner:
         role_name = "owner"
     else:
         role_name = "viewer"
@@ -211,6 +275,7 @@ async def create_user(
         actor_user_id=user.id,
         target_type="user",
         target_id=user.id,
+        details={"role": role_name, "first_owner": needs_first_owner},
     )
     await db.commit()
     await db.refresh(user)
@@ -276,7 +341,7 @@ async def create_session_tokens(
     return access, refresh_secret, session, refresh
 
 
-async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[str, str, User]:
+async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[str, str, User, list[str]]:
     result = await db.execute(
         select(RefreshToken).where(RefreshToken.token_hash == token_hash(refresh_token))
     )
@@ -297,6 +362,17 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     user = await db.get(User, refresh.user_id)
     if not user or user.disabled:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    session = await db.get(Session, refresh.session_id)
+    client = await db.get(AuthClient, refresh.client_id) if refresh.client_id else None
+    memberships = await org_roles(db, user.id)
+    derived_scopes = {permission for org in memberships for permission in org.permissions}
+    scopes = client.scopes if client else sorted(derived_scopes or {"auth:read"})
+    org_id = session.org_id if session else (memberships[0].id if memberships else None)
+    audience = (
+        client.audiences[0]
+        if client and client.audiences
+        else settings.issuer
+    )
     refresh.used_at = now_utc()
     new_refresh_secret = new_opaque_token("gkr")
     new_refresh = RefreshToken(
@@ -310,14 +386,15 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     db.add(new_refresh)
     access = create_access_token(
         subject=user.id,
-        audience=settings.issuer,
-        scopes=["auth:read"],
+        audience=audience,
+        scopes=scopes,
         token_type="user",
-        client_id=None,
+        client_id=client.client_id if client else None,
+        org_id=org_id,
         extra={"email": user.email},
     )
     await db.commit()
-    return access, new_refresh_secret, user
+    return access, new_refresh_secret, user, scopes
 
 
 def user_read(user: User) -> UserRead:
