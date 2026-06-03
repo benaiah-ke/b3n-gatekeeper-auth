@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: gatekeeper-postgres-local
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gatekeeper
+      POSTGRES_USER: gatekeeper
+      POSTGRES_PASSWORD: gatekeeper
+    ports:
+      - "54329:5432"
+    volumes:
+      - gatekeeper-postgres-local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gatekeeper -d gatekeeper"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gatekeeper-postgres-local:
+

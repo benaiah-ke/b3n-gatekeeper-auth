@@ -1,0 +1,103 @@
+name: Build GateKeeper
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-extras
+      - run: uv run ruff check app tests
+      - run: uv run pytest
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm --filter @b3n/gatekeeper-ui build
+
+  images:
+    if: github.ref == 'refs/heads/main'
+    needs: [api, ui]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./api
+          push: true
+          tags: |
+            ghcr.io/benaiah-ke/gatekeeper-api:latest
+            ghcr.io/benaiah-ke/gatekeeper-api:${{ github.sha }}
+          cache-from: type=gha,scope=gatekeeper-api
+          cache-to: type=gha,mode=max,scope=gatekeeper-api
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./ui
+          push: true
+          tags: |
+            ghcr.io/benaiah-ke/gatekeeper-ui:latest
+            ghcr.io/benaiah-ke/gatekeeper-ui:${{ github.sha }}
+          cache-from: type=gha,scope=gatekeeper-ui
+          cache-to: type=gha,mode=max,scope=gatekeeper-ui
+
+  deploy-selfhost:
+    if: ${{ github.ref == 'refs/heads/main' && vars.GATEKEEPER_SELFHOST_AUTO_DEPLOY == 'true' }}
+    needs: images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate deploy secrets
+        env:
+          SSH_HOST: ${{ secrets.GATEKEEPER_SELFHOST_HOST }}
+          SSH_KEY: ${{ secrets.GATEKEEPER_SELFHOST_SSH_KEY }}
+        run: |
+          test -n "$SSH_HOST"
+          test -n "$SSH_KEY"
+      - name: Deploy self-host
+        env:
+          SSH_HOST: ${{ secrets.GATEKEEPER_SELFHOST_HOST }}
+          SSH_KEY: ${{ secrets.GATEKEEPER_SELFHOST_SSH_KEY }}
+          SSH_USER: ${{ secrets.GATEKEEPER_SELFHOST_USER }}
+          SSH_PORT: ${{ secrets.GATEKEEPER_SELFHOST_PORT }}
+        run: |
+          SSH_USER="${SSH_USER:-deploy}"
+          SSH_PORT="${SSH_PORT:-22}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/gatekeeper_selfhost
+          chmod 600 ~/.ssh/gatekeeper_selfhost
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" >> ~/.ssh/known_hosts
+          scp -i ~/.ssh/gatekeeper_selfhost -P "$SSH_PORT" \
+            deploy/docker-compose.selfhost.yml deploy/Caddyfile.bootstrap \
+            "$SSH_USER@$SSH_HOST:/apps/gatekeeper/"
+          ssh -i ~/.ssh/gatekeeper_selfhost -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+            "cd /apps/gatekeeper && docker compose --env-file .env pull && docker compose --env-file .env up -d"
+

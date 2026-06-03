@@ -1,0 +1,40 @@
+{
+  email {$TLS_EMAIL:admin@b3n.in}
+}
+
+{$DEFAULT_DOMAIN:gatekeeper.b3n.in} {
+  encode gzip zstd
+
+  handle /api/* {
+    reverse_proxy gatekeeper-api:8000
+  }
+
+  handle /oauth/* {
+    reverse_proxy gatekeeper-api:8000
+  }
+
+  handle /.well-known/* {
+    reverse_proxy gatekeeper-api:8000
+  }
+
+  handle /health {
+    reverse_proxy gatekeeper-api:8000
+  }
+
+  handle /version {
+    reverse_proxy gatekeeper-api:8000
+  }
+
+  handle {
+    reverse_proxy gatekeeper-ui:80
+  }
+
+  header {
+    X-Content-Type-Options nosniff
+    X-Frame-Options DENY
+    Referrer-Policy strict-origin-when-cross-origin
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    -Server
+  }
+}
+

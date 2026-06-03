@@ -1,0 +1,67 @@
+services:
+  gatekeeper-postgres:
+    image: postgres:16-alpine
+    container_name: gatekeeper-postgres
+    restart: unless-stopped
+    env_file: ${B3N_ENV_FILE:-.env}
+    volumes:
+      - gatekeeper-postgres-data:/var/lib/postgresql/data
+    networks:
+      - gatekeeper-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gatekeeper} -d ${POSTGRES_DB:-gatekeeper}"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+
+  gatekeeper-api:
+    image: ghcr.io/benaiah-ke/gatekeeper-api:${GATEKEEPER_IMAGE_TAG:-latest}
+    container_name: gatekeeper-api
+    restart: unless-stopped
+    env_file: ${B3N_ENV_FILE:-.env}
+    depends_on:
+      gatekeeper-postgres:
+        condition: service_healthy
+    networks:
+      - proxy
+      - gatekeeper-internal
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  gatekeeper-ui:
+    image: ghcr.io/benaiah-ke/gatekeeper-ui:${GATEKEEPER_IMAGE_TAG:-latest}
+    container_name: gatekeeper-ui
+    restart: unless-stopped
+    env_file: ${B3N_ENV_FILE:-.env}
+    networks:
+      - proxy
+
+  caddy-proxy:
+    image: caddy:2-alpine
+    container_name: caddy-proxy
+    restart: unless-stopped
+    env_file: ${B3N_ENV_FILE:-.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /apps/gatekeeper/Caddyfile:/etc/caddy/Caddyfile
+      - gatekeeper-caddy-data:/data
+      - gatekeeper-caddy-config:/config
+    networks:
+      - proxy
+
+volumes:
+  gatekeeper-postgres-data:
+  gatekeeper-caddy-data:
+  gatekeeper-caddy-config:
+
+networks:
+  proxy:
+    external: true
+  gatekeeper-internal:
+    driver: bridge
+
