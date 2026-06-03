@@ -47,6 +47,12 @@ network named `proxy`, do not start GateKeeper's `caddy-proxy` service. Copy
 `deploy/docker-compose.existing-proxy.yml` as `/apps/gatekeeper/docker-compose.yml`
 and append `deploy/Caddyfile.existing-proxy.gatekeeper` to the shared Caddyfile.
 
+If `gatekeeper.b3n.in` is not pointed at the host yet, append
+`deploy/Caddyfile.existing-proxy.http-bootstrap` instead for HTTP-only
+Host-header smoke checks. Replace it with
+`deploy/Caddyfile.existing-proxy.gatekeeper` after DNS resolves to the host so
+Caddy can issue the production TLS certificate.
+
 Validate both pieces before applying:
 
 ```bash
