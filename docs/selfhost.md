@@ -126,6 +126,11 @@ curl -sf https://auth.example.com/health
 curl -sf https://auth.example.com/version
 ```
 
+When `GATEKEEPER_IMAGE_TAG` or `GIT_SHA` is set for the API container, the
+`/version` response includes that non-secret release metadata. Keep one of those
+values populated in production so upgrade and rollback checks can prove which
+artifact is live.
+
 If you build images locally instead of pulling from a registry, tag them to
 match `GATEKEEPER_API_IMAGE:GATEKEEPER_IMAGE_TAG` and
 `GATEKEEPER_UI_IMAGE:GATEKEEPER_IMAGE_TAG` before starting Compose.

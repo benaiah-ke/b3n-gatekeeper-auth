@@ -40,6 +40,25 @@ async def client():
 
 
 @pytest.mark.asyncio
+async def test_version_reports_release_metadata_when_configured(monkeypatch):
+    monkeypatch.setattr(settings, "gatekeeper_image_tag", "abc123")
+    monkeypatch.setattr(settings, "git_sha", "abc123def456")
+
+    async with await client() as ac:
+        response = await ac.get("/version")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "service": "gatekeeper-api",
+        "version": settings.app_version,
+        "environment": settings.app_env,
+        "issuer": settings.issuer,
+        "image_tag": "abc123",
+        "git_sha": "abc123def456",
+    }
+
+
+@pytest.mark.asyncio
 async def test_signup_login_refresh_and_replay_detection():
     async with await client() as ac:
         signup = await ac.post(

@@ -736,12 +736,17 @@ async def health():
 
 @app.get("/version")
 async def version():
-    return {
+    payload = {
         "service": "gatekeeper-api",
         "version": settings.app_version,
         "environment": settings.app_env,
         "issuer": settings.issuer,
     }
+    if settings.gatekeeper_image_tag:
+        payload["image_tag"] = settings.gatekeeper_image_tag
+    if settings.git_sha:
+        payload["git_sha"] = settings.git_sha
+    return payload
 
 
 @app.get("/.well-known/openid-configuration")

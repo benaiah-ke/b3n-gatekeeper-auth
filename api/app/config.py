@@ -33,6 +33,8 @@ class OAuthProviderConfig(BaseModel):
 class Settings(BaseSettings):
     app_env: str = "development"
     app_version: str = "0.1.0"
+    gatekeeper_image_tag: str = ""
+    git_sha: str = ""
     debug: bool = False
     gatekeeper_url: str = "http://localhost:8000"
     ui_url: str = "http://localhost:5173"
