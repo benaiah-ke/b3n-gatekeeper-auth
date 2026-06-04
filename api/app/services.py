@@ -300,13 +300,15 @@ async def create_session_tokens(
     scopes: list[str] | None = None,
     audience: str | list[str] | None = None,
 ) -> tuple[str, str, Session, RefreshToken]:
+    memberships = await org_roles(db, user.id)
     if scopes is None:
-        memberships = await org_roles(db, user.id)
         derived_scopes = {permission for org in memberships for permission in org.permissions}
         scopes = sorted(derived_scopes or {"auth:read"})
     if org_id is None:
-        memberships = await org_roles(db, user.id)
         org_id = memberships[0].id if memberships else None
+    selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
+    if org_id and not selected_org:
+        raise HTTPException(status_code=403, detail="Organization membership required")
     session_secret = new_opaque_token("gks")
     refresh_secret = new_opaque_token("gkr")
     session = Session(
@@ -329,6 +331,20 @@ async def create_session_tokens(
     )
     db.add(refresh)
     await db.flush()
+    extra_claims: dict[str, Any] = {
+        "email": user.email,
+        "display_name": user.display_name,
+        "email_verified": user.email_verified,
+        "session_id": session.id,
+    }
+    if selected_org:
+        extra_claims.update(
+            {
+                "org_slug": selected_org.slug,
+                "org_role": selected_org.role,
+                "permissions": selected_org.permissions or [],
+            }
+        )
     access = create_access_token(
         subject=user.id,
         audience=audience or settings.issuer,
@@ -336,7 +352,7 @@ async def create_session_tokens(
         token_type="user",
         client_id=client.client_id if client else None,
         org_id=org_id,
-        extra={"email": user.email},
+        extra=extra_claims,
     )
     return access, refresh_secret, session, refresh
 
@@ -365,9 +381,21 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     session = await db.get(Session, refresh.session_id)
     client = await db.get(AuthClient, refresh.client_id) if refresh.client_id else None
     memberships = await org_roles(db, user.id)
-    derived_scopes = {permission for org in memberships for permission in org.permissions}
+    if not session or session.revoked_at or session.expires_at <= now_utc():
+        refresh.revoked_at = refresh.revoked_at or now_utc()
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Session revoked or expired")
+    org_id = session.org_id
+    selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
+    if org_id and not selected_org:
+        session.revoked_at = session.revoked_at or now_utc()
+        refresh.revoked_at = refresh.revoked_at or session.revoked_at
+        await db.commit()
+        raise HTTPException(status_code=401, detail="Organization membership required")
+    derived_scopes = set(selected_org.permissions if selected_org else [])
+    if not derived_scopes:
+        derived_scopes = {permission for org in memberships for permission in org.permissions}
     scopes = client.scopes if client else sorted(derived_scopes or {"auth:read"})
-    org_id = session.org_id if session else (memberships[0].id if memberships else None)
     audience = (
         client.audiences[0]
         if client and client.audiences
@@ -384,6 +412,20 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         expires_at=utc_after(days=settings.refresh_token_ttl_days),
     )
     db.add(new_refresh)
+    extra_claims: dict[str, Any] = {
+        "email": user.email,
+        "display_name": user.display_name,
+        "email_verified": user.email_verified,
+        "session_id": session.id,
+    }
+    if selected_org:
+        extra_claims.update(
+            {
+                "org_slug": selected_org.slug,
+                "org_role": selected_org.role,
+                "permissions": selected_org.permissions or [],
+            }
+        )
     access = create_access_token(
         subject=user.id,
         audience=audience,
@@ -391,7 +433,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         token_type="user",
         client_id=client.client_id if client else None,
         org_id=org_id,
-        extra={"email": user.email},
+        extra=extra_claims,
     )
     await db.commit()
     return access, new_refresh_secret, user, scopes

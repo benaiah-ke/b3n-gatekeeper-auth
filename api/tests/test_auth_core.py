@@ -342,6 +342,60 @@ async def test_device_flow_and_api_token_revocation():
 
 
 @pytest.mark.asyncio
+async def test_user_jwt_is_session_bound_and_revocation_updates_introspection():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "admin@b3n.in", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        access = signup.json()["access_token"]
+        claims = decode_access_token(access)
+        assert claims["session_id"]
+        assert claims["org_role"] == "owner"
+        assert "*" in claims["permissions"]
+
+        introspected = await ac.post("/oauth/introspect", data={"token": access})
+        assert introspected.status_code == 200
+        assert introspected.json()["active"] is True
+        assert introspected.json()["session_id"] == claims["session_id"]
+
+        revoked = await ac.delete(
+            f"/api/v1/sessions/{claims['session_id']}",
+            headers={"Authorization": f"Bearer {access}"},
+        )
+        assert revoked.status_code == 200
+
+        introspected_again = await ac.post("/oauth/introspect", data={"token": access})
+        assert introspected_again.status_code == 200
+        assert introspected_again.json()["active"] is False
+        assert introspected_again.json()["reason"] == "session_revoked"
+
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {access}"})
+        assert me.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_revokes_current_session_token():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "admin@b3n.in", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        access = signup.json()["access_token"]
+
+        logout = await ac.post("/api/v1/auth/logout", headers={"Authorization": f"Bearer {access}"})
+        assert logout.status_code == 200
+        assert logout.json()["session_revoked"] is True
+
+        introspected = await ac.post("/oauth/introspect", data={"token": access})
+        assert introspected.status_code == 200
+        assert introspected.json()["active"] is False
+        assert introspected.json()["reason"] == "session_revoked"
+
+
+@pytest.mark.asyncio
 async def test_client_token_management_and_audit_filters():
     async with await client() as ac:
         signup = await ac.post(
