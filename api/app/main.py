@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import Base, async_session_factory, engine, get_db
-from app.deps import Principal, current_principal, require_scopes
+from app.deps import Principal, current_principal, optional_principal, require_scopes
 from app.models import (
     ApiToken,
     AuditEvent,
@@ -24,6 +24,7 @@ from app.models import (
     DeviceGrant,
     Identity,
     McpResource,
+    Membership,
     OAuthAuthorizationCode,
     Organization,
     Project,
@@ -64,6 +65,7 @@ from app.schemas import (
 )
 from app.security import (
     create_access_token,
+    decode_access_token,
     hash_password,
     new_code,
     new_opaque_token,
@@ -344,9 +346,36 @@ async def refresh(body: RefreshRequest, response: Response, db: AsyncSession = D
 
 
 @app.post("/api/v1/auth/logout")
-async def logout(response: Response):
+async def logout(
+    response: Response,
+    principal: Principal | None = Depends(optional_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    session_revoked = False
+    if principal and principal.session_id:
+        session = await db.get(Session, principal.session_id)
+        if session and session.user_id == principal.user_id and not session.revoked_at:
+            session.revoked_at = now_utc()
+            result = await db.execute(
+                select(RefreshToken).where(
+                    RefreshToken.session_id == session.id,
+                    RefreshToken.revoked_at.is_(None),
+                )
+            )
+            for refresh in result.scalars():
+                refresh.revoked_at = refresh.revoked_at or session.revoked_at
+            await audit(
+                db,
+                "auth.logout",
+                org_id=session.org_id,
+                actor_user_id=principal.user_id,
+                target_type="session",
+                target_id=session.id,
+            )
+            await db.commit()
+            session_revoked = True
     delete_session_cookie(response)
-    return {"status": "ok"}
+    return {"status": "ok", "session_revoked": session_revoked}
 
 
 @app.get("/api/v1/auth/me")
@@ -521,6 +550,14 @@ async def revoke_session(
     if "*" not in principal.scopes and principal.user_id != session.user_id:
         raise HTTPException(status_code=403, detail="Session ownership required")
     session.revoked_at = now_utc()
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.session_id == session.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+    )
+    for refresh in result.scalars():
+        refresh.revoked_at = refresh.revoked_at or session.revoked_at
     await audit(
         db,
         "session.revoke",
@@ -881,6 +918,24 @@ async def revoke_token(token: str = Form(...), db: AsyncSession = Depends(get_db
     api_token = result.scalar_one_or_none()
     if api_token:
         api_token.revoked_at = now_utc()
+    else:
+        try:
+            claims = decode_access_token(token)
+        except ValueError:
+            claims = {}
+        session_id = claims.get("session_id") or claims.get("sid")
+        if claims.get("token_type") == "user" and isinstance(session_id, str) and session_id:
+            session = await db.get(Session, session_id)
+            if session and not session.revoked_at:
+                session.revoked_at = now_utc()
+                refresh_result = await db.execute(
+                    select(RefreshToken).where(
+                        RefreshToken.session_id == session.id,
+                        RefreshToken.revoked_at.is_(None),
+                    )
+                )
+                for refresh in refresh_result.scalars():
+                    refresh.revoked_at = refresh.revoked_at or session.revoked_at
     await db.commit()
     return Response(status_code=200)
 
@@ -903,7 +958,78 @@ async def introspect(token: str = Form(...), db: AsyncSession = Depends(get_db))
             "aud": api_token.audiences if api_token else [],
             "token_type": api_token.token_type if api_token else None,
         }
-    return {"active": True}
+    try:
+        claims = decode_access_token(token)
+    except ValueError:
+        return {"active": False, "reason": "invalid_token"}
+
+    token_type = str(claims.get("token_type") or "")
+    subject = str(claims.get("sub") or "")
+    if token_type == "user":
+        user = await db.get(User, subject) if subject else None
+        if not user:
+            return {"active": False, "reason": "user_not_found"}
+        if user.disabled:
+            return {"active": False, "reason": "user_disabled"}
+
+        session_id = claims.get("session_id") or claims.get("sid")
+        session = await db.get(Session, session_id) if isinstance(session_id, str) and session_id else None
+        if (
+            not session
+            or session.user_id != subject
+            or session.revoked_at
+            or session.expires_at <= now_utc()
+        ):
+            return {"active": False, "reason": "session_revoked"}
+        client_id = claims.get("azp")
+        if client_id:
+            client_result = await db.execute(select(AuthClient).where(AuthClient.client_id == str(client_id)))
+            client = client_result.scalar_one_or_none()
+            if not client or not client.enabled:
+                return {"active": False, "reason": "client_disabled"}
+        org_id = claims.get("org_id")
+        if org_id:
+            membership = await db.execute(
+                select(Membership.id).where(
+                    Membership.user_id == subject,
+                    Membership.org_id == str(org_id),
+                    Membership.status == "active",
+                )
+            )
+            if not membership.scalar_one_or_none():
+                return {"active": False, "reason": "org_membership_required"}
+
+    if token_type == "service":
+        client_id = str(claims.get("azp") or claims.get("sub") or "")
+        client_result = await db.execute(select(AuthClient).where(AuthClient.client_id == client_id))
+        client = client_result.scalar_one_or_none()
+        if not client:
+            return {"active": False, "reason": "client_not_found"}
+        if not client.enabled:
+            return {"active": False, "reason": "client_disabled"}
+        if claims.get("org_id") and str(claims.get("org_id")) != str(client.org_id):
+            return {"active": False, "reason": "org_mismatch"}
+
+    return {
+        "active": True,
+        "reason": None,
+        "scope": str(claims.get("scope", "")),
+        "client_id": claims.get("azp"),
+        "sub": claims.get("sub"),
+        "email": claims.get("email"),
+        "display_name": claims.get("display_name"),
+        "email_verified": claims.get("email_verified"),
+        "aud": claims.get("aud", []),
+        "iss": claims.get("iss"),
+        "exp": claims.get("exp"),
+        "iat": claims.get("iat"),
+        "token_type": claims.get("token_type"),
+        "session_id": claims.get("session_id") or claims.get("sid"),
+        "org_id": claims.get("org_id"),
+        "org_slug": claims.get("org_slug"),
+        "org_role": claims.get("org_role"),
+        "permissions": claims.get("permissions", []),
+    }
 
 
 @app.post("/oauth/register")

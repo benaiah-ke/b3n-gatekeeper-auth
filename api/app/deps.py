@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models import ApiToken, Membership, Role
+from app.models import ApiToken, AuthClient, Membership, Role, Session, User
 from app.security import decode_access_token, now_utc, token_hash
 
 bearer = HTTPBearer(auto_error=False)
@@ -21,6 +21,7 @@ class Principal:
     scopes: list[str]
     org_id: str | None = None
     user_id: str | None = None
+    session_id: str | None = None
     token_id: str | None = None
     claims: dict | None = None
 
@@ -63,14 +64,51 @@ async def current_principal(
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
     scope = str(claims.get("scope", "")).split()
+    token_type = str(claims.get("token_type", "access"))
+    subject = str(claims.get("sub", ""))
+    session_id = claims.get("session_id") or claims.get("sid")
+    if token_type == "user":
+        if not subject or not isinstance(session_id, str) or not session_id:
+            raise HTTPException(status_code=401, detail="Session-bound user token required")
+        user = await db.get(User, subject)
+        if not user or user.disabled:
+            raise HTTPException(status_code=401, detail="Invalid user")
+        session = await db.get(Session, session_id)
+        if (
+            not session
+            or session.user_id != subject
+            or session.revoked_at
+            or session.expires_at <= now_utc()
+        ):
+            raise HTTPException(status_code=401, detail="Session revoked or expired")
+        client_id = claims.get("azp")
+        if client_id:
+            result = await db.execute(select(AuthClient).where(AuthClient.client_id == str(client_id)))
+            client = result.scalar_one_or_none()
+            if not client or not client.enabled:
+                raise HTTPException(status_code=401, detail="Invalid client")
     return Principal(
-        subject=str(claims.get("sub", "")),
-        auth_type=str(claims.get("token_type", "access")),
+        subject=subject,
+        auth_type=token_type,
         scopes=scope,
         org_id=claims.get("org_id"),
-        user_id=str(claims.get("sub", "")) if claims.get("token_type") == "user" else None,
+        user_id=subject if token_type == "user" else None,
+        session_id=session_id if isinstance(session_id, str) else None,
         claims=claims,
     )
+
+
+async def optional_principal(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: AsyncSession = Depends(get_db),
+) -> Principal | None:
+    try:
+        return await current_principal(request, credentials, db)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            return None
+        raise
 
 
 def require_scopes(required: list[str]):
@@ -103,4 +141,3 @@ async def require_org_role(
     row = result.first()
     if not row or row[0].status != "active" or row[1].name not in allowed_roles:
         raise HTTPException(status_code=403, detail="Organization role required")
-
