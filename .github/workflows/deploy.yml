@@ -21,6 +21,21 @@ jobs:
       - run: uv run ruff check app tests
       - run: uv run pytest
 
+  cli:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync
+      - run: uv run python -m unittest discover tests -v
+      - run: uv run python -m compileall gatekeeper_cli tests
+
   ui:
     runs-on: ubuntu-latest
     steps:
@@ -37,7 +52,7 @@ jobs:
 
   images:
     if: github.ref == 'refs/heads/main'
-    needs: [api, ui]
+    needs: [api, cli, ui]
     runs-on: ubuntu-latest
     permissions:
       contents: read
