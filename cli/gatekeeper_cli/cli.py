@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -97,6 +99,18 @@ def expand_cli_values(values: list[str] | None, *, fallback: list[str] | None = 
     for value in values or []:
         expanded.extend(part for part in value.replace(",", " ").split() if part)
     return expanded or list(fallback or [])
+
+
+def write_copy_once_secret(path: Path, secret: str) -> None:
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        console.print(f"[red]Secret output file already exists:[/red] {path}")
+        raise typer.Exit(1) from None
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secret)
+        handle.write("\n")
+    path.chmod(0o600)
 
 
 def safe_count(client: AuthenticatedClient, path: str) -> int | None:
@@ -473,11 +487,19 @@ def client_create(
     allowed_origins: Optional[list[str]] = typer.Option(None, "--origin", help="Allowed browser origin; defaults to redirect URI origins"),
     audiences: Optional[list[str]] = typer.Option(None, "--audience", help="Allowed audience; repeat or use the positional audience"),
     scopes: Optional[list[str]] = typer.Option(None, "--scope", help="Scope or space-separated scopes; repeatable"),
+    secret_output: Optional[Path] = typer.Option(None, "--secret-output", help="Write a copy-once confidential client secret to this new 0600 file"),
     require_mfa: bool = typer.Option(False, "--require-mfa", help="Require MFA for user grants to this client"),
     require_org_membership: bool = typer.Option(True, "--require-org-membership/--no-require-org-membership"),
     trusted_device_mfa_bypass: bool = typer.Option(False, "--trusted-device-mfa-bypass/--no-trusted-device-mfa-bypass"),
     session_idle_timeout_minutes: Optional[int] = typer.Option(None, "--idle-timeout-minutes", min=1),
 ) -> None:
+    if not public and secret_output is None:
+        console.print(
+            "[red]Confidential client creation returns a copy-once secret.[/red] "
+            "Use --secret-output PATH or create the client in a trusted UI session."
+        )
+        raise typer.Exit(1)
+
     all_redirect_uris = [redirect_uri] if redirect_uri else []
     all_redirect_uris.extend(redirect_uris or [])
     all_audiences = [audience] if audience else []
@@ -502,7 +524,14 @@ def client_create(
             json=payload,
         )
         response.raise_for_status()
-        console.print_json(data=response.json())
+        response_payload = response.json()
+        client_secret = response_payload.get("client_secret")
+        if isinstance(client_secret, str) and client_secret:
+            if secret_output:
+                write_copy_once_secret(secret_output, client_secret)
+                response_payload["client_secret_output"] = str(secret_output)
+            response_payload["client_secret"] = "<redacted>"
+        console.print_json(data=response_payload)
 
 
 @mcp_app.command("register")

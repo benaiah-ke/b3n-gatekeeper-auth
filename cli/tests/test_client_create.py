@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
@@ -32,7 +34,10 @@ class FakeApi:
 
     def post(self, path: str, **kwargs: object) -> FakeResponse:
         self.posts.append({"path": path, **kwargs})
-        return FakeResponse({"client_id": kwargs["json"]["client_id"]})  # type: ignore[index]
+        response = {"client_id": kwargs["json"]["client_id"]}  # type: ignore[index]
+        if not kwargs["json"]["public"]:  # type: ignore[index]
+            response["client_secret"] = "gkcs_test-secret"
+        return FakeResponse(response)
 
 
 class ClientCreateTests(unittest.TestCase):
@@ -46,33 +51,43 @@ class ClientCreateTests(unittest.TestCase):
         return client
 
     def test_stable_confidential_client_payload_includes_policy_fields(self) -> None:
-        with patch("gatekeeper_cli.cli.api", self.fake_api):
-            result = self.runner.invoke(
-                app,
-                [
-                    "client",
-                    "create",
-                    "Sentinel control plane",
-                    "https://sentinel.b3n.in/api/v1/auth/callback",
-                    "sentinel-api",
-                    "--url",
-                    "https://gatekeeper.b3n.in/",
-                    "--client-id",
-                    "sentinel-control-plane",
-                    "--confidential",
-                    "--scope",
-                    "openid profile",
-                    "--scope",
-                    "email,auth:read",
-                    "--origin",
-                    "https://sentinel.b3n.in",
-                    "--require-mfa",
-                    "--idle-timeout-minutes",
-                    "30",
-                ],
-            )
+        with TemporaryDirectory() as tmpdir:
+            secret_output = Path(tmpdir) / "sentinel-control-plane.secret"
+            with patch("gatekeeper_cli.cli.api", self.fake_api):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "client",
+                        "create",
+                        "Sentinel control plane",
+                        "https://sentinel.b3n.in/api/v1/auth/callback",
+                        "sentinel-api",
+                        "--url",
+                        "https://gatekeeper.b3n.in/",
+                        "--client-id",
+                        "sentinel-control-plane",
+                        "--confidential",
+                        "--scope",
+                        "openid profile",
+                        "--scope",
+                        "email,auth:read",
+                        "--origin",
+                        "https://sentinel.b3n.in",
+                        "--secret-output",
+                        str(secret_output),
+                        "--require-mfa",
+                        "--idle-timeout-minutes",
+                        "30",
+                    ],
+                )
 
-        self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(secret_output.read_text(), "gkcs_test-secret\n")
+            self.assertEqual(secret_output.stat().st_mode & 0o777, 0o600)
+
+        self.assertNotIn("gkcs_test-secret", result.output)
+        self.assertIn('"client_secret": "<redacted>"', result.output)
+        self.assertIn("client_secret_output", result.output)
         self.assertEqual(self.calls[0].base_url, "https://gatekeeper.b3n.in")
         post = self.calls[0].posts[0]
         self.assertEqual(post["path"], "/api/v1/clients")
@@ -93,6 +108,29 @@ class ClientCreateTests(unittest.TestCase):
                 "session_idle_timeout_minutes": 30,
             },
         )
+
+    def test_confidential_client_requires_secret_output(self) -> None:
+        with patch("gatekeeper_cli.cli.api", self.fake_api):
+            result = self.runner.invoke(
+                app,
+                [
+                    "client",
+                    "create",
+                    "Sentinel control plane",
+                    "https://sentinel.b3n.in/api/v1/auth/callback",
+                    "sentinel-api",
+                    "--url",
+                    "https://gatekeeper.b3n.in",
+                    "--client-id",
+                    "sentinel-control-plane",
+                    "--confidential",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 1, result.output)
+        self.assertIn("--secret-output", result.output)
+        self.assertIn("PATH", result.output)
+        self.assertEqual(self.calls, [])
 
     def test_public_device_client_payload_uses_audience_and_no_secret(self) -> None:
         with patch("gatekeeper_cli.cli.api", self.fake_api):
