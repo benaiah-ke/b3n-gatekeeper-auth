@@ -10,9 +10,8 @@ from __future__ import annotations
 from typing import Sequence
 
 from alembic import op
-
-from app.database import Base
 from app import models  # noqa: F401
+from app.database import Base
 
 revision: str = "20260603_0001"
 down_revision: str | None = None

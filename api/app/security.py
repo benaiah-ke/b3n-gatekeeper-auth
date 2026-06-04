@@ -2,14 +2,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import os
 import secrets
+import struct
+import time
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from argon2 import PasswordHasher
+from cryptography.fernet import Fernet, InvalidToken
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from jose import JWTError, jwt
@@ -57,6 +61,77 @@ def new_opaque_token(prefix: str = "gk") -> str:
 def new_code(length: int = 8) -> str:
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def new_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode("ascii").rstrip("=")
+
+
+def new_recovery_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    left = "".join(secrets.choice(alphabet) for _ in range(5))
+    right = "".join(secrets.choice(alphabet) for _ in range(5))
+    return f"{left}-{right}"
+
+
+def normalize_recovery_code(code: str) -> str:
+    return "".join(character for character in code.upper() if character.isalnum())
+
+
+def _secret_fernet() -> Fernet:
+    key = base64.urlsafe_b64encode(hashlib.sha256(settings.secret_key.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def encrypt_secret(secret: str) -> str:
+    return _secret_fernet().encrypt(secret.encode("utf-8")).decode("ascii")
+
+
+def decrypt_secret(encrypted: str) -> str:
+    try:
+        return _secret_fernet().decrypt(encrypted.encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ValueError("Invalid encrypted secret") from exc
+
+
+def encrypt_mfa_secret(secret: str) -> str:
+    return encrypt_secret(secret)
+
+
+def decrypt_mfa_secret(encrypted: str) -> str:
+    try:
+        return decrypt_secret(encrypted)
+    except ValueError as exc:
+        raise ValueError("Invalid MFA secret") from exc
+
+
+def _totp_key(secret: str) -> bytes:
+    normalized = secret.replace(" ", "").upper()
+    padded = normalized + ("=" * ((8 - len(normalized) % 8) % 8))
+    return base64.b32decode(padded, casefold=True)
+
+
+def hotp_code(secret: str, counter: int, digits: int = 6) -> str:
+    digest = hmac.new(_totp_key(secret), struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return str(value % (10**digits)).zfill(digits)
+
+
+def totp_code(secret: str, *, at_time: int | None = None, period: int = 30, digits: int = 6) -> str:
+    timestamp = int(time.time()) if at_time is None else at_time
+    return hotp_code(secret, timestamp // period, digits=digits)
+
+
+def verify_totp_code(secret: str, code: str, *, window: int = 1, period: int = 30, digits: int = 6) -> bool:
+    sanitized = "".join(character for character in code if character.isdigit())
+    if len(sanitized) != digits:
+        return False
+    counter = int(time.time()) // period
+    return any(
+        secrets.compare_digest(hotp_code(secret, counter + offset, digits=digits), sanitized)
+        for offset in range(-window, window + 1)
+    )
 
 
 def b64url_digest(value: bytes) -> str:

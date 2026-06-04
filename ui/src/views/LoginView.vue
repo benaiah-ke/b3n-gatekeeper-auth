@@ -1,36 +1,93 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { api } from '@/services/api'
+import { api, gatekeeperApiUrl } from '@/services/api'
+import { safeInternalRedirect } from '@/services/redirects'
+import type { OAuthProvider } from '@/types'
 
 const router = useRouter()
 const route = useRoute()
 const email = ref('')
 const password = ref('')
+const totpCode = ref('')
+const recoveryCode = ref('')
+const providers = ref<OAuthProvider[]>([])
 const error = ref('')
 const loading = ref(false)
+const providerLoading = ref('')
+const mfaChallenge = ref(false)
 
 const redirectTarget = computed(() => {
-  const value = Array.isArray(route.query.redirect) ? route.query.redirect[0] : route.query.redirect
-  return typeof value === 'string' && value.startsWith('/') && !value.startsWith('//') ? value : ''
+  return safeInternalRedirect(route.query.redirect)
 })
+const isStepUp = computed(() => route.query.step_up === 'mfa')
+const oauthLoginContext = computed(() => {
+  if (!redirectTarget.value.startsWith('/oauth/authorize')) {
+    return {}
+  }
+  try {
+    const authorize = new URL(redirectTarget.value, window.location.origin)
+    return {
+      clientId: authorize.searchParams.get('client_id'),
+      scope: authorize.searchParams.get('scope'),
+      audience: authorize.searchParams.get('audience'),
+    }
+  } catch {
+    return {}
+  }
+})
+const showMfaFields = computed(() => isStepUp.value || mfaChallenge.value || Boolean(totpCode.value || recoveryCode.value))
 const signupRoute = computed(() =>
   redirectTarget.value ? { path: '/signup', query: { redirect: redirectTarget.value } } : '/signup',
 )
+const configuredProviders = computed(() => providers.value.filter((provider) => provider.configured))
+
+async function loadProviders() {
+  try {
+    providers.value = await api.oauthProviders()
+  } catch {
+    providers.value = []
+  }
+}
+
+async function startProvider(provider: OAuthProvider) {
+  error.value = ''
+  providerLoading.value = provider.id
+  try {
+    const started = await api.startOAuthProvider(provider.id, redirectTarget.value || undefined)
+    window.location.assign(started.authorization_url)
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : `Could not start ${provider.name} sign in`
+  } finally {
+    providerLoading.value = ''
+  }
+}
 
 async function submit() {
   error.value = ''
   loading.value = true
   try {
-    await api.login(email.value, password.value)
+    await api.login(email.value, password.value, totpCode.value, recoveryCode.value, oauthLoginContext.value)
+    if (redirectTarget.value.startsWith('/oauth/')) {
+      window.location.assign(gatekeeperApiUrl(redirectTarget.value))
+      return
+    }
     router.push(redirectTarget.value || '/account')
   } catch (err) {
-    error.value = err instanceof Error ? err.message : 'Sign in failed'
+    const message = err instanceof Error ? err.message : 'Sign in failed'
+    if (message.includes('TOTP code required') || message.includes('MFA required')) {
+      mfaChallenge.value = true
+      error.value = 'Enter an authenticator code or recovery code to finish this sign in.'
+    } else {
+      error.value = message
+    }
   } finally {
     loading.value = false
   }
 }
+
+onMounted(loadProviders)
 </script>
 
 <template>
@@ -38,9 +95,7 @@ async function submit() {
     <div class="auth-shell">
       <aside class="auth-copy">
         <div>
-          <div class="auth-wordmark" aria-label="B3n GateKeeper">
-            <span>b3n</span>
-            <span class="text-accent">/</span>
+          <div class="auth-wordmark" aria-label="GateKeeper">
             <span>GateKeeper</span>
           </div>
           <p class="mono-label mt-12">Control plane auth</p>
@@ -57,7 +112,7 @@ async function submit() {
           </li>
           <li class="setup-step">
             <span class="setup-step-number">02</span>
-            <span><span class="setup-step-title">Connect applications</span> Register redirect URIs for Sentinel, Knowhere, and local tools.</span>
+            <span><span class="setup-step-title">Connect applications</span> Register redirect URIs for web apps, APIs, and local tools.</span>
           </li>
           <li class="setup-step">
             <span class="setup-step-number">03</span>
@@ -68,8 +123,23 @@ async function submit() {
 
       <form class="auth-card" @submit.prevent="submit">
         <p class="mono-label">GateKeeper</p>
-        <h1 class="mt-3 font-serif text-4xl leading-none">Sign in</h1>
-        <p class="mt-3 text-sm leading-6 text-muted">Manage B3n auth from your self-hosted control plane.</p>
+        <h1 class="mt-3 font-serif text-4xl leading-none">{{ isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
+        <p class="mt-3 text-sm leading-6 text-muted">
+          {{ isStepUp ? 'This application requires a fresh MFA-backed GateKeeper session.' : 'Manage auth from your self-hosted control plane.' }}
+        </p>
+
+        <div v-if="configuredProviders.length" class="mt-7 grid gap-2">
+          <button
+            v-for="provider in configuredProviders"
+            :key="provider.id"
+            type="button"
+            class="btn-secondary w-full text-sm"
+            :disabled="loading || Boolean(providerLoading)"
+            @click="startProvider(provider)"
+          >
+            {{ providerLoading === provider.id ? 'Connecting' : `Continue with ${provider.name}` }}
+          </button>
+        </div>
 
         <div class="mt-7 grid gap-4">
           <label class="auth-field">
@@ -79,6 +149,34 @@ async function submit() {
           <label class="auth-field">
             Password
             <input v-model="password" class="input" type="password" autocomplete="current-password" required />
+          </label>
+          <div
+            v-if="showMfaFields"
+            class="rounded-md border border-border bg-surface p-3"
+          >
+            <p class="text-sm font-semibold text-fg">Additional verification</p>
+            <p class="mt-1 text-xs leading-5 text-muted">
+              Use a current authenticator code, or a recovery code if the authenticator is unavailable.
+            </p>
+          </div>
+          <label v-if="showMfaFields" class="auth-field">
+            Authenticator code
+            <input
+              v-model="totpCode"
+              class="input font-mono"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              placeholder="Optional unless 2FA is enabled"
+            />
+          </label>
+          <label v-if="showMfaFields" class="auth-field">
+            Recovery code
+            <input
+              v-model="recoveryCode"
+              class="input font-mono"
+              autocomplete="one-time-code"
+              placeholder="Optional backup code"
+            />
           </label>
           <p v-if="error" class="auth-alert" role="alert">{{ error }}</p>
           <button class="btn-primary w-full" :disabled="loading">{{ loading ? 'Signing in' : 'Sign in' }}</button>

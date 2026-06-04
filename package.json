@@ -1,5 +1,5 @@
 {
-  "name": "b3n-gatekeeper",
+  "name": "gatekeeper",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@10.28.1",
@@ -7,8 +7,8 @@
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
-    "dev:ui": "pnpm --filter @b3n/gatekeeper-ui dev",
-    "build:ui": "pnpm --filter @b3n/gatekeeper-ui build"
+    "dev:ui": "pnpm --filter gatekeeper-ui dev",
+    "build:ui": "pnpm --filter gatekeeper-ui build"
   },
   "devDependencies": {
     "typescript": "^5.9.3"

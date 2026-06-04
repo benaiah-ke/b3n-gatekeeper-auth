@@ -1,7 +1,7 @@
 [project]
 name = "gatekeeper-api"
 version = "0.1.0"
-description = "B3n GateKeeper FastAPI auth platform"
+description = "GateKeeper FastAPI auth platform"
 requires-python = ">=3.12"
 dependencies = [
     "aiosqlite>=0.20.0",

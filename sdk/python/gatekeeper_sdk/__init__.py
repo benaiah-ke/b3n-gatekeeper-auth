@@ -1,4 +1,3 @@
-from gatekeeper_sdk.fastapi import GateKeeperVerifier, Principal
+from gatekeeper_sdk.fastapi import ApiTokenValidation, GateKeeperVerifier, Principal, ProtectedResourceMetadata
 
-__all__ = ["GateKeeperVerifier", "Principal"]
-
+__all__ = ["ApiTokenValidation", "GateKeeperVerifier", "Principal", "ProtectedResourceMetadata"]

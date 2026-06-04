@@ -1,8 +1,8 @@
 {
-  "name": "@b3n/gatekeeper-vue",
+  "name": "gatekeeper-vue",
   "version": "0.1.0",
   "type": "module",
-  "description": "Vue provider and embeddable components for GateKeeper",
+  "description": "Vue provider, composables, and drop-in components for GateKeeper",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
@@ -10,7 +10,7 @@
     "typecheck": "vue-tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@b3n/gatekeeper-js": "workspace:*",
+    "gatekeeper-js": "workspace:*",
     "vue": "^3.5.25"
   },
   "devDependencies": {
@@ -21,4 +21,3 @@
     "vue-tsc": "^3.1.5"
   }
 }
-

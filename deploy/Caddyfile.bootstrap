@@ -1,8 +1,8 @@
 {
-  email {$TLS_EMAIL:admin@b3n.in}
+  email {$TLS_EMAIL:admin@example.com}
 }
 
-{$DEFAULT_DOMAIN:gatekeeper.b3n.in} {
+{$DEFAULT_DOMAIN:auth.example.com} {
   encode gzip zstd
 
   handle /api/* {
@@ -37,4 +37,3 @@
     -Server
   }
 }
-

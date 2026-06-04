@@ -5,10 +5,10 @@ build-backend = "hatchling.build"
 [project]
 name = "gatekeeper-cli"
 version = "0.1.0"
-description = "CLI for B3n GateKeeper auth and token management"
+description = "CLI for GateKeeper auth and token management"
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "B3n Inc", email = "admin@b3n.in" }]
+authors = [{ name = "GateKeeper Maintainers", email = "maintainers@example.com" }]
 dependencies = [
     "httpx>=0.28.0",
     "keyring>=25.0.0",
@@ -18,4 +18,3 @@ dependencies = [
 
 [project.scripts]
 gatekeeper = "gatekeeper_cli.cli:app"
-

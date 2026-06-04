@@ -1,4 +1,4 @@
-{$GATEKEEPER_DOMAIN:gatekeeper.b3n.in} {
+{$GATEKEEPER_DOMAIN:auth.example.com} {
   encode gzip zstd
 
   handle /api/* {

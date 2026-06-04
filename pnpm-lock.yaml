@@ -20,7 +20,7 @@ importers:
 
   packages/vue:
     dependencies:
-      '@b3n/gatekeeper-js':
+      gatekeeper-js:
         specifier: workspace:*
         version: link:../js
       vue:

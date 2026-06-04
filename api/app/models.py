@@ -37,8 +37,14 @@ class User(Base, TimestampMixin):
     password_hash: Mapped[str | None] = mapped_column(Text, nullable=True)
     email_verified: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     disabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mfa_totp_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mfa_totp_enabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
-    memberships: Mapped[list[Membership]] = relationship(back_populates="user")
+    memberships: Mapped[list[Membership]] = relationship(
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class Identity(Base, TimestampMixin):
@@ -52,12 +58,40 @@ class Identity(Base, TimestampMixin):
     email: Mapped[str | None] = mapped_column(String(320), nullable=True)
 
 
+class OAuthProvider(Base, TimestampMixin):
+    __tablename__ = "oauth_providers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    provider_id: Mapped[str] = mapped_column(String(40), unique=True, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    client_id: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    client_secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    authorization_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    token_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    userinfo_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    redirect_uri: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
+    subject_claim: Mapped[str] = mapped_column(String(120), default="sub", nullable=False)
+    email_claim: Mapped[str] = mapped_column(String(120), default="email", nullable=False)
+    name_claim: Mapped[str] = mapped_column(String(120), default="name", nullable=False)
+    email_verified_claim: Mapped[str] = mapped_column(String(120), default="email_verified", nullable=False)
+    allow_email_linking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    require_verified_email: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+
 class Organization(Base, TimestampMixin):
     __tablename__ = "organizations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     slug: Mapped[str] = mapped_column(String(120), unique=True, index=True, nullable=False)
+    require_mfa: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trusted_device_mfa_bypass: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    admin_step_up_mfa_required: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    session_idle_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    audit_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    allow_user_hard_delete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
 
 class Workspace(Base, TimestampMixin):
@@ -101,6 +135,10 @@ class Membership(Base, TimestampMixin):
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), index=True)
     status: Mapped[str] = mapped_column(String(40), default="active", nullable=False)
+    scim_external_id: Mapped[str | None] = mapped_column(String(240), nullable=True)
+    scim_enterprise_profile: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(json_type()), default=dict
+    )
 
     user: Mapped[User] = relationship(back_populates="memberships")
     role: Mapped[Role] = relationship()
@@ -112,6 +150,13 @@ class AuthClient(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     org_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    logo_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    homepage_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    privacy_policy_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    terms_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    publisher_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     client_id: Mapped[str] = mapped_column(String(160), unique=True, index=True, nullable=False)
     client_secret_hash: Mapped[str | None] = mapped_column(String(80), nullable=True)
     public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -121,6 +166,9 @@ class AuthClient(Base, TimestampMixin):
     audiences: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
     scopes: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
     require_org_membership: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    require_mfa: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    trusted_device_mfa_bypass: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    session_idle_timeout_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     mcp_resource_uri: Mapped[str | None] = mapped_column(String(300), nullable=True)
 
 
@@ -130,9 +178,16 @@ class Session(Base, TimestampMixin):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     org_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(ForeignKey("auth_clients.id"), nullable=True)
     token_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
+    device_id_hash: Mapped[str | None] = mapped_column(String(80), index=True, nullable=True)
     ip_address: Mapped[str | None] = mapped_column(String(80), nullable=True)
     user_agent: Mapped[str | None] = mapped_column(Text, nullable=True)
+    device_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    trusted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    trusted_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    amr: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -164,8 +219,52 @@ class OAuthAuthorizationCode(Base, TimestampMixin):
     audience: Mapped[str | None] = mapped_column(String(300), nullable=True)
     code_challenge: Mapped[str] = mapped_column(String(200), nullable=False)
     code_challenge_method: Mapped[str] = mapped_column(String(20), default="S256", nullable=False)
+    amr: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class OAuthGrant(Base, TimestampMixin):
+    __tablename__ = "oauth_grants"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    client_id: Mapped[str] = mapped_column(ForeignKey("auth_clients.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    org_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), nullable=True)
+    audience: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    scopes: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
+    last_authorized_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class MfaRecoveryCode(Base, TimestampMixin):
+    __tablename__ = "mfa_recovery_codes"
+    __table_args__ = (Index("ix_mfa_recovery_codes_user_used", "user_id", "used_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    code_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
+    code_hint: Mapped[str] = mapped_column(String(20), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class Invitation(Base, TimestampMixin):
+    __tablename__ = "invitations"
+    __table_args__ = (
+        Index("ix_invitations_org_email", "org_id", "email"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    org_id: Mapped[str] = mapped_column(ForeignKey("organizations.id", ondelete="CASCADE"), index=True)
+    email: Mapped[str] = mapped_column(String(320), index=True, nullable=False)
+    role_id: Mapped[str] = mapped_column(ForeignKey("roles.id"), index=True)
+    invited_by_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    accepted_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    token_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
+    token_hint: Mapped[str] = mapped_column(String(20), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class DeviceGrant(Base, TimestampMixin):
@@ -180,6 +279,7 @@ class DeviceGrant(Base, TimestampMixin):
     audience: Mapped[str | None] = mapped_column(String(300), nullable=True)
     user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     org_id: Mapped[str | None] = mapped_column(ForeignKey("organizations.id"), nullable=True)
+    amr: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     denied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -262,4 +362,6 @@ class RateLimitBucket(Base):
 
 
 Index("ix_api_tokens_org_type", ApiToken.org_id, ApiToken.token_type)
+Index("ix_oauth_grants_user_client", OAuthGrant.user_id, OAuthGrant.client_id)
 Index("ix_audit_events_org_action", AuditEvent.org_id, AuditEvent.action)
+Index("ix_sessions_client_id", Session.client_id)

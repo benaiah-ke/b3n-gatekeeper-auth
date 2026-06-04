@@ -1,6 +1,7 @@
-# Integrating Sentinel And Knowhere
+# Internal: Integrating Sentinel And Knowhere
 
 GateKeeper replaces Clerk in Sentinel and Knowhere through a staged migration.
+This is an internal B3n rollout note, not the generic self-host setup path.
 
 ## Current Source Truth
 
@@ -46,12 +47,12 @@ carry stable role claims. Sentinel and Knowhere therefore enforce issuer,
 audience, token type, scope, and optional org first; role claims are enforced
 defensively when present.
 
-The GateKeeper `/account` setup console now surfaces issuer, JWKS, SMTP mode,
-current role, and first-run next actions. Use `/clients` templates for Sentinel
-and Knowhere, then copy the generated confidential client secret exactly once
-into the target service's secret store. Use `/projects` to create the
-`sentinel-api` and `knowhere-api` audience records before issuing project or
-machine credentials.
+The GateKeeper `/account` setup console should surface issuer, JWKS, SMTP mode,
+current role, and first-run next actions. Use `/clients` templates only after
+they are generic enough to avoid making the public product B3n-specific. Copy
+confidential client secrets exactly once into the target service's secret store.
+Use `/projects` to create the `sentinel-api` and `knowhere-api` audience records
+before issuing project or machine credentials.
 
 ## Staged Provider Settings
 

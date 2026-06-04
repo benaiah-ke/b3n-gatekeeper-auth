@@ -5,8 +5,17 @@ import { computed, onMounted, ref } from 'vue'
 import { api } from '@/services/api'
 import type { ApiToken, AuthClient, Project, SetupStatus } from '@/types'
 
-const scopeOptions = ['auth:read', 'token:*', 'mcp:*', 'mcp:tools', 'mcp:resources', 'admin:*']
-const tokenTypes = ['personal', 'service', 'project', 'admin', 'machine']
+const scopeOptions = [
+  'auth:read',
+  'api:read',
+  'api:write',
+  'token:*',
+  'mcp:*',
+  'mcp:tools',
+  'mcp:resources',
+  'admin:*',
+]
+const allTokenTypes = ['personal', 'service', 'project', 'admin', 'machine']
 
 const setup = ref<SetupStatus | null>(null)
 const tokens = ref<ApiToken[]>([])
@@ -27,7 +36,16 @@ const saving = ref(false)
 const error = ref('')
 
 const canIssue = computed(() => Boolean(setup.value?.can_issue_tokens))
+const canCreatePersonal = computed(() => setup.value?.auth_type === 'user' && Boolean(setup.value?.user))
+const availableTokenTypes = computed(() => (canIssue.value ? allTokenTypes : ['personal']))
+const canCreateSelectedToken = computed(() => canIssue.value || (canCreatePersonal.value && tokenType.value === 'personal'))
 const activeOrgId = computed(() => setup.value?.org?.id || setup.value?.orgs[0]?.id || null)
+const allowedScopeOptions = computed(() => {
+  if (tokenType.value !== 'personal' || canIssue.value || setup.value?.scopes.includes('*')) {
+    return scopeOptions
+  }
+  return setup.value?.scopes.length ? setup.value.scopes : ['auth:read']
+})
 const audienceOptions = computed(() => {
   const values = new Set<string>(['gatekeeper-api'])
   for (const client of clients.value) {
@@ -43,6 +61,10 @@ const audienceOptions = computed(() => {
   }
   return Array.from(values).sort()
 })
+
+function canManageToken(token: ApiToken) {
+  return canIssue.value || (token.token_type === 'personal' && token.user_id === setup.value?.user?.id)
+}
 
 function checked(event: Event) {
   return Boolean((event.target as HTMLInputElement).checked)
@@ -60,6 +82,13 @@ async function load() {
   try {
     const setupStatus = await api.setupStatus()
     setup.value = setupStatus
+    if (!setupStatus.can_issue_tokens) {
+      tokenType.value = 'personal'
+      selectedScopes.value = setupStatus.scopes.includes('*') ? ['auth:read'] : setupStatus.scopes.slice(0, 1)
+      if (!selectedScopes.value.length) {
+        selectedScopes.value = ['auth:read']
+      }
+    }
     const [tokenRows, clientRows, projectRows] = await Promise.all([
       api.tokens(),
       api.clients(),
@@ -88,8 +117,8 @@ async function create() {
       name: name.value,
       token_type: tokenType.value,
       org_id: activeOrgId.value,
-      project_id: projectId.value || null,
-      client_id: clientId.value || null,
+      project_id: tokenType.value === 'personal' ? null : projectId.value || null,
+      client_id: tokenType.value === 'personal' ? null : clientId.value || null,
       scopes: selectedScopes.value,
       audiences: selectedAudience.value ? [selectedAudience.value] : [],
       expires_at: expiresAt.value ? new Date(expiresAt.value).toISOString() : null,
@@ -152,24 +181,24 @@ onMounted(load)
         v-if="!canIssue"
         class="rounded-md border border-orange/45 bg-orange/10 p-4 text-sm leading-6 text-orange"
       >
-        This account can inspect token metadata but cannot issue, rotate, or revoke tokens. Use an owner account for setup.
+        This account can create and manage personal API keys. Service, project, admin, and machine tokens require token-admin access.
       </article>
 
-      <form class="panel grid gap-5 p-5" :class="{ 'opacity-60': !canIssue }" @submit.prevent="create">
+      <form class="panel grid gap-5 p-5" :class="{ 'opacity-60': !canCreateSelectedToken }" @submit.prevent="create">
         <div class="grid gap-4 md:grid-cols-3">
           <label class="grid gap-2 text-sm text-muted">
             Name
-            <input v-model="name" class="input" :disabled="!canIssue" required />
+            <input v-model="name" class="input" :disabled="!canCreateSelectedToken" required />
           </label>
           <label class="grid gap-2 text-sm text-muted">
             Type
             <select v-model="tokenType" class="input" :disabled="!canIssue">
-              <option v-for="type in tokenTypes" :key="type" :value="type">{{ type }}</option>
+              <option v-for="type in availableTokenTypes" :key="type" :value="type">{{ type }}</option>
             </select>
           </label>
           <label class="grid gap-2 text-sm text-muted">
             Audience
-            <select v-model="selectedAudience" class="input font-mono" :disabled="!canIssue">
+            <select v-model="selectedAudience" class="input font-mono" :disabled="!canCreateSelectedToken">
               <option v-for="audience in audienceOptions" :key="audience" :value="audience">{{ audience }}</option>
             </select>
           </label>
@@ -178,21 +207,21 @@ onMounted(load)
         <div class="grid gap-4 md:grid-cols-3">
           <label class="grid gap-2 text-sm text-muted">
             Project
-            <select v-model="projectId" class="input" :disabled="!canIssue">
+            <select v-model="projectId" class="input" :disabled="!canCreateSelectedToken || tokenType === 'personal'">
               <option value="">No project binding</option>
               <option v-for="project in projects" :key="project.id" :value="project.id">{{ project.name }}</option>
             </select>
           </label>
           <label class="grid gap-2 text-sm text-muted">
             Client
-            <select v-model="clientId" class="input" :disabled="!canIssue">
+            <select v-model="clientId" class="input" :disabled="!canCreateSelectedToken || tokenType === 'personal'">
               <option value="">No client binding</option>
               <option v-for="client in clients" :key="client.id" :value="client.id">{{ client.name }}</option>
             </select>
           </label>
           <label class="grid gap-2 text-sm text-muted">
             Expiry
-            <input v-model="expiresAt" class="input" type="datetime-local" :disabled="!canIssue" />
+            <input v-model="expiresAt" class="input" type="datetime-local" :disabled="!canCreateSelectedToken" />
           </label>
         </div>
 
@@ -200,14 +229,14 @@ onMounted(load)
           <p class="text-sm text-muted">Scopes</p>
           <div class="flex flex-wrap gap-2">
             <label
-              v-for="scope in scopeOptions"
+              v-for="scope in allowedScopeOptions"
               :key="scope"
               class="inline-flex min-h-10 items-center gap-2 rounded-md border border-border bg-surface px-3 font-mono text-xs text-muted"
             >
               <input
                 type="checkbox"
                 :checked="selectedScopes.includes(scope)"
-                :disabled="!canIssue"
+                :disabled="!canCreateSelectedToken"
                 @change="setScope(scope, checked($event))"
               />
               {{ scope }}
@@ -215,7 +244,7 @@ onMounted(load)
           </div>
         </div>
 
-        <button class="btn-primary justify-self-start" :disabled="saving || !canIssue">
+        <button class="btn-primary justify-self-start" :disabled="saving || !canCreateSelectedToken">
           {{ saving ? 'Creating' : 'Create token' }}
         </button>
       </form>
@@ -248,6 +277,9 @@ onMounted(load)
           </div>
           <div class="mt-4 grid gap-2 text-xs text-muted md:grid-cols-3">
             <p class="break-all font-mono">audiences: {{ token.audiences.join(', ') || 'none' }}</p>
+            <p class="break-all font-mono">
+              binding: {{ token.user_id ? 'account' : token.client_id ? 'client' : token.project_id ? 'project' : token.org_id ? 'org' : 'global' }}
+            </p>
             <p>expires: {{ token.expires_at ? new Date(token.expires_at).toLocaleString() : 'never' }}</p>
             <p>last used: {{ token.last_used_at ? new Date(token.last_used_at).toLocaleString() : 'never' }}</p>
           </div>
@@ -255,7 +287,7 @@ onMounted(load)
             <button
               type="button"
               class="btn-secondary min-h-10 gap-2 px-3 text-xs"
-              :disabled="!canIssue || Boolean(token.revoked_at)"
+              :disabled="!canManageToken(token) || Boolean(token.revoked_at)"
               @click="rotate(token.id)"
             >
               <RotateCcw class="h-3.5 w-3.5" aria-hidden="true" />
@@ -264,7 +296,7 @@ onMounted(load)
             <button
               type="button"
               class="btn-secondary min-h-10 gap-2 px-3 text-xs"
-              :disabled="!canIssue || Boolean(token.revoked_at)"
+              :disabled="!canManageToken(token) || Boolean(token.revoked_at)"
               @click="revoke(token.id)"
             >
               <Trash2 class="h-3.5 w-3.5" aria-hidden="true" />

@@ -3,7 +3,7 @@ services:
     image: postgres:16-alpine
     container_name: gatekeeper-postgres
     restart: unless-stopped
-    env_file: ${B3N_ENV_FILE:-.env}
+    env_file: ${GATEKEEPER_ENV_FILE:-.env}
     volumes:
       - gatekeeper-postgres-data:/var/lib/postgresql/data
     networks:
@@ -15,10 +15,10 @@ services:
       retries: 5
 
   gatekeeper-api:
-    image: ghcr.io/benaiah-ke/gatekeeper-api:${GATEKEEPER_IMAGE_TAG:-latest}
+    image: ${GATEKEEPER_API_IMAGE:-gatekeeper-api}:${GATEKEEPER_IMAGE_TAG:-latest}
     container_name: gatekeeper-api
     restart: unless-stopped
-    env_file: ${B3N_ENV_FILE:-.env}
+    env_file: ${GATEKEEPER_ENV_FILE:-.env}
     volumes:
       - gatekeeper-api-data:/data
     depends_on:
@@ -34,10 +34,10 @@ services:
       retries: 3
 
   gatekeeper-ui:
-    image: ghcr.io/benaiah-ke/gatekeeper-ui:${GATEKEEPER_IMAGE_TAG:-latest}
+    image: ${GATEKEEPER_UI_IMAGE:-gatekeeper-ui}:${GATEKEEPER_IMAGE_TAG:-latest}
     container_name: gatekeeper-ui
     restart: unless-stopped
-    env_file: ${B3N_ENV_FILE:-.env}
+    env_file: ${GATEKEEPER_ENV_FILE:-.env}
     networks:
       - proxy
 
@@ -45,12 +45,12 @@ services:
     image: caddy:2-alpine
     container_name: caddy-proxy
     restart: unless-stopped
-    env_file: ${B3N_ENV_FILE:-.env}
+    env_file: ${GATEKEEPER_ENV_FILE:-.env}
     ports:
       - "80:80"
       - "443:443"
     volumes:
-      - /apps/gatekeeper/Caddyfile:/etc/caddy/Caddyfile
+      - ${GATEKEEPER_CADDYFILE:-/opt/gatekeeper/Caddyfile}:/etc/caddy/Caddyfile
       - gatekeeper-caddy-data:/data
       - gatekeeper-caddy-config:/config
     networks:

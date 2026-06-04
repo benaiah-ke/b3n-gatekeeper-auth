@@ -3,6 +3,7 @@ from __future__ import annotations
 import secrets
 import smtplib
 import ssl
+from datetime import timedelta
 from email.message import EmailMessage
 from typing import Any
 
@@ -36,6 +37,43 @@ from app.security import (
     utc_after,
     verify_password,
 )
+
+MFA_AMR_VALUES = {"otp", "recovery"}
+TRUSTED_DEVICE_AMR = "trusted_device"
+DEFAULT_ORG_ROLES = [
+    ("owner", ["*"]),
+    ("admin", ["admin:*", "auth:*", "mcp:*"]),
+    ("operator", ["auth:read", "token:*", "mcp:*"]),
+    ("viewer", ["auth:read"]),
+]
+
+
+def amr_satisfies_mfa(amr: list[str] | None) -> bool:
+    return bool(set(amr or []).intersection(MFA_AMR_VALUES))
+
+
+def session_trusted_device_active(session: Session) -> bool:
+    return bool(session.trusted_at and (not session.trusted_until or session.trusted_until > now_utc()))
+
+
+def trusted_device_mfa_bypass_allowed(client: AuthClient | None, org: Organization | None) -> bool:
+    client_requires_mfa = bool(client and client.require_mfa)
+    org_requires_mfa = bool(org and org.require_mfa)
+    if not client_requires_mfa and not org_requires_mfa:
+        return False
+    if client_requires_mfa and not client.trusted_device_mfa_bypass:
+        return False
+    if org_requires_mfa and not org.trusted_device_mfa_bypass:
+        return False
+    return True
+
+
+def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = None) -> list[str]:
+    selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
+    derived_scopes = set(selected_org.permissions if selected_org else [])
+    if not derived_scopes:
+        derived_scopes = {permission for org in memberships for permission in org.permissions}
+    return sorted(derived_scopes or {"auth:read"})
 
 
 async def audit(
@@ -109,6 +147,32 @@ def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
         smtp.send_message(message)
 
 
+def send_invitation_email(*, email: str, token: str, org_name: str, role_name: str) -> None:
+    if not settings.smtp_host:
+        if settings.email_dev_mode:
+            return
+        raise HTTPException(status_code=503, detail="SMTP is not configured")
+
+    accept_url = f"{settings.ui_url.rstrip('/')}/accept-invite?token={token}"
+    message = EmailMessage()
+    message["From"] = settings.smtp_from
+    message["To"] = email
+    message["Subject"] = f"GateKeeper invitation to {org_name}"
+    message.set_content(
+        f"You have been invited to {org_name} as {role_name}.\n\n"
+        f"Accept the invitation:\n{accept_url}\n\n"
+        "If your product owns the auth UI, paste this invitation token into that flow:\n"
+        f"{token}\n"
+    )
+    context = ssl.create_default_context()
+    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
+        if settings.smtp_use_tls:
+            smtp.starttls(context=context)
+        if settings.smtp_username:
+            smtp.login(settings.smtp_username, settings.smtp_password)
+        smtp.send_message(message)
+
+
 async def ensure_bootstrap(db: AsyncSession) -> Organization:
     result = await db.execute(
         select(Organization).where(Organization.slug == settings.bootstrap_org_slug)
@@ -123,18 +187,22 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     org = Organization(name=settings.bootstrap_org_name, slug=settings.bootstrap_org_slug)
     db.add(org)
     await db.flush()
-    roles = [
-        Role(org_id=org.id, name="owner", permissions=["*"]),
-        Role(org_id=org.id, name="admin", permissions=["admin:*", "auth:*", "mcp:*"]),
-        Role(org_id=org.id, name="operator", permissions=["auth:read", "token:*", "mcp:*"]),
-        Role(org_id=org.id, name="viewer", permissions=["auth:read"]),
-    ]
-    db.add_all(roles)
+    await add_default_org_roles(db, org)
     await audit(db, "org.bootstrap", org_id=org.id, target_type="organization", target_id=org.id)
     await ensure_default_clients(db, org)
     await ensure_bootstrap_owner(db, org)
     await db.commit()
     return org
+
+
+async def add_default_org_roles(db: AsyncSession, org: Organization) -> dict[str, Role]:
+    roles = {
+        name: Role(org_id=org.id, name=name, permissions=permissions)
+        for name, permissions in DEFAULT_ORG_ROLES
+    }
+    db.add_all(roles.values())
+    await db.flush()
+    return roles
 
 
 async def org_has_owner(db: AsyncSession, org_id: str) -> bool:
@@ -229,6 +297,12 @@ async def org_roles(db: AsyncSession, user_id: str) -> list[OrgRead]:
             id=org.id,
             name=org.name,
             slug=org.slug,
+            require_mfa=org.require_mfa,
+            trusted_device_mfa_bypass=org.trusted_device_mfa_bypass,
+            admin_step_up_mfa_required=org.admin_step_up_mfa_required,
+            session_idle_timeout_minutes=org.session_idle_timeout_minutes,
+            audit_retention_days=org.audit_retention_days,
+            allow_user_hard_delete=org.allow_user_hard_delete,
             role=role.name,
             permissions=role.permissions or [],
         )
@@ -299,24 +373,35 @@ async def create_session_tokens(
     org_id: str | None = None,
     scopes: list[str] | None = None,
     audience: str | list[str] | None = None,
+    bind_default_org: bool = True,
+    amr: list[str] | None = None,
+    device_id_hash: str | None = None,
+    trusted_at=None,
+    trusted_until=None,
 ) -> tuple[str, str, Session, RefreshToken]:
     memberships = await org_roles(db, user.id)
-    if scopes is None:
-        derived_scopes = {permission for org in memberships for permission in org.permissions}
-        scopes = sorted(derived_scopes or {"auth:read"})
-    if org_id is None:
+    if org_id is None and bind_default_org:
         org_id = memberships[0].id if memberships else None
     selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
     if org_id and not selected_org:
         raise HTTPException(status_code=403, detail="Organization membership required")
+    if scopes is None:
+        scopes = derive_membership_scopes(memberships, org_id)
     session_secret = new_opaque_token("gks")
     refresh_secret = new_opaque_token("gkr")
+    issued_at = now_utc()
     session = Session(
         user_id=user.id,
         org_id=org_id,
+        client_id=client.id if client else None,
         token_hash=token_hash(session_secret),
+        device_id_hash=device_id_hash,
         ip_address=request.client.host if request and request.client else None,
         user_agent=request.headers.get("user-agent") if request else None,
+        amr=list(amr or []),
+        trusted_at=trusted_at,
+        trusted_until=trusted_until,
+        last_seen_at=issued_at,
         expires_at=utc_after(days=settings.refresh_token_ttl_days),
     )
     db.add(session)
@@ -336,7 +421,10 @@ async def create_session_tokens(
         "display_name": user.display_name,
         "email_verified": user.email_verified,
         "session_id": session.id,
+        "mfa_totp_enabled": bool(user.mfa_totp_enabled_at),
     }
+    if amr:
+        extra_claims["amr"] = amr
     if selected_org:
         extra_claims.update(
             {
@@ -355,6 +443,58 @@ async def create_session_tokens(
         extra=extra_claims,
     )
     return access, refresh_secret, session, refresh
+
+
+async def revoke_session_with_refresh_tokens(
+    db: AsyncSession,
+    session: Session,
+    *,
+    revoked_at=None,
+) -> None:
+    session.revoked_at = session.revoked_at or revoked_at or now_utc()
+    result = await db.execute(
+        select(RefreshToken).where(
+            RefreshToken.session_id == session.id,
+            RefreshToken.revoked_at.is_(None),
+        )
+    )
+    for refresh in result.scalars():
+        refresh.revoked_at = refresh.revoked_at or session.revoked_at
+
+
+async def effective_session_idle_timeout_minutes(
+    db: AsyncSession,
+    *,
+    session: Session,
+    client: AuthClient | None = None,
+) -> int | None:
+    candidate_values: list[int] = []
+    if client and client.session_idle_timeout_minutes:
+        candidate_values.append(client.session_idle_timeout_minutes)
+    policy_org_id = session.org_id or (client.org_id if client else None)
+    if policy_org_id:
+        org = await db.get(Organization, policy_org_id)
+        if org and org.session_idle_timeout_minutes:
+            candidate_values.append(org.session_idle_timeout_minutes)
+    return min(candidate_values) if candidate_values else None
+
+
+async def enforce_session_idle_timeout(
+    db: AsyncSession,
+    *,
+    session: Session,
+    client: AuthClient | None = None,
+    commit_on_expire: bool = False,
+) -> None:
+    timeout_minutes = await effective_session_idle_timeout_minutes(db, session=session, client=client)
+    now = now_utc()
+    last_seen_at = session.last_seen_at or session.created_at or now
+    if timeout_minutes and last_seen_at <= now - timedelta(minutes=timeout_minutes):
+        await revoke_session_with_refresh_tokens(db, session, revoked_at=now)
+        if commit_on_expire:
+            await db.commit()
+        raise HTTPException(status_code=401, detail="Session idle timeout expired")
+    session.last_seen_at = now
 
 
 async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[str, str, User, list[str]]:
@@ -385,6 +525,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         refresh.revoked_at = refresh.revoked_at or now_utc()
         await db.commit()
         raise HTTPException(status_code=401, detail="Session revoked or expired")
+    await enforce_session_idle_timeout(db, session=session, client=client, commit_on_expire=True)
     org_id = session.org_id
     selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
     if org_id and not selected_org:
@@ -392,6 +533,19 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         refresh.revoked_at = refresh.revoked_at or session.revoked_at
         await db.commit()
         raise HTTPException(status_code=401, detail="Organization membership required")
+    policy_org_id = org_id or (client.org_id if client else None)
+    policy_org = await db.get(Organization, policy_org_id) if policy_org_id else None
+    if client and (client.require_mfa or (policy_org and policy_org.require_mfa)):
+        trusted_device_ok = (
+            TRUSTED_DEVICE_AMR in (session.amr or [])
+            and session_trusted_device_active(session)
+            and trusted_device_mfa_bypass_allowed(client, policy_org)
+        )
+        if not user.mfa_totp_enabled_at or (not amr_satisfies_mfa(session.amr) and not trusted_device_ok):
+            session.revoked_at = session.revoked_at or now_utc()
+            refresh.revoked_at = refresh.revoked_at or session.revoked_at
+            await db.commit()
+            raise HTTPException(status_code=401, detail="MFA required for this session")
     derived_scopes = set(selected_org.permissions if selected_org else [])
     if not derived_scopes:
         derived_scopes = {permission for org in memberships for permission in org.permissions}
@@ -417,7 +571,10 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         "display_name": user.display_name,
         "email_verified": user.email_verified,
         "session_id": session.id,
+        "mfa_totp_enabled": bool(user.mfa_totp_enabled_at),
     }
+    if session.amr:
+        extra_claims["amr"] = session.amr
     if selected_org:
         extra_claims.update(
             {
@@ -445,6 +602,7 @@ def user_read(user: User) -> UserRead:
         email=user.email,
         display_name=user.display_name,
         email_verified=user.email_verified,
+        mfa_totp_enabled=bool(user.mfa_totp_enabled_at),
     )
 
 

@@ -87,7 +87,7 @@ onMounted(load)
         v-if="!canManage"
         class="rounded-md border border-orange/45 bg-orange/10 p-4 text-sm leading-6 text-orange"
       >
-        Role assignment and invitations are not available to this account. Use an owner account for role creation.
+        Role creation and assignment require an owner account.
       </article>
 
       <div class="grid gap-4 md:grid-cols-3">
@@ -120,11 +120,10 @@ onMounted(load)
       <article class="panel p-5">
         <div class="flex items-center gap-2">
           <UserPlus class="h-4 w-4 text-muted" aria-hidden="true" />
-          <h2 class="font-semibold">Membership invitations</h2>
+          <h2 class="font-semibold">Membership management</h2>
         </div>
         <p class="mt-3 text-sm leading-6 text-muted">
-          Invitation and role-assignment endpoints are not implemented in this v1 control plane. Until SMTP-backed invites
-          exist, memberships are created by signup and bootstrap policy.
+          Assign existing users from the Users page, or send scoped organization invitations from the Invites page.
         </p>
       </article>
 

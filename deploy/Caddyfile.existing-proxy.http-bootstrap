@@ -1,7 +1,7 @@
 # Temporary route for pre-DNS smoke checks. Replace with
 # Caddyfile.existing-proxy.gatekeeper after DNS points at the host.
 :80 {
-  @gatekeeper_host host gatekeeper.b3n.in
+  @gatekeeper_host host auth.example.com
 
   handle @gatekeeper_host {
     encode gzip zstd

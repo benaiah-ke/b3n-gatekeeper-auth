@@ -8,7 +8,7 @@ COPY packages/vue/package.json packages/vue/package.json
 RUN pnpm install --frozen-lockfile=false
 COPY ui ui
 COPY packages packages
-RUN pnpm --filter @b3n/gatekeeper-ui build
+RUN pnpm --filter gatekeeper-ui build
 
 FROM caddy:2-alpine
 COPY ui/Caddyfile /etc/caddy/Caddyfile

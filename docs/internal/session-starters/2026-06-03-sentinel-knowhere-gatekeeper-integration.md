@@ -22,7 +22,7 @@ Context:
 Start by syncing production truth:
 - In each repo, run git status --short --branch, git fetch origin, and inspect whether local main is clean/current.
 - Read GateKeeper:
-  - docs/session-starters/2026-06-03-gatekeeper-product-core-continuation.md
+  - docs/internal/session-starters/2026-06-03-gatekeeper-product-core-continuation.md
   - docs/selfhost.md
   - api/app/security.py
   - api/app/deps.py
@@ -132,4 +132,3 @@ Expected output:
 - Keep a clear integration matrix: Sentinel backend, Sentinel UI, Sentinel CLI, Knowhere backend, Knowhere UI, Knowhere CLI.
 - At the end, state exactly what accepts GateKeeper tokens, what still uses Clerk, and what remains behind cutover approval.
 ```
-

@@ -4,14 +4,14 @@ import { defineConfig } from 'vite'
 export default defineConfig({
   plugins: [vue()],
   build: {
+    emptyOutDir: false,
     lib: {
       entry: 'src/index.ts',
       name: 'GateKeeperVue',
       fileName: 'index',
     },
     rollupOptions: {
-      external: ['vue', '@b3n/gatekeeper-js'],
+      external: ['vue', 'gatekeeper-js'],
     },
   },
 })
-

@@ -10,9 +10,10 @@ release line exists.
 
 ## Reporting
 
-Report vulnerabilities privately to `admin@b3n.in`. Include impact, affected
-version or commit, reproduction steps, and whether any secret material may have
-been exposed.
+Report vulnerabilities through the private maintainer contact for the project
+or deployment. Include impact, affected version or commit, reproduction steps,
+and whether any secret material may have been exposed. Do not open a public
+issue with secrets, exploit details, or live tenant data.
 
 ## Defaults
 
@@ -23,4 +24,3 @@ been exposed.
 - Access tokens are audience/resource bound.
 - Audit events are recorded for auth, token, client, role, and MCP changes.
 - Production docs intentionally gate DNS and service cutovers behind approval.
-

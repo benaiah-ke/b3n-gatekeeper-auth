@@ -8,10 +8,9 @@ version = "0.1.0"
 description = "Python helpers for verifying GateKeeper JWTs and API tokens"
 readme = "README.md"
 requires-python = ">=3.12"
-authors = [{ name = "B3n Inc", email = "admin@b3n.in" }]
+authors = [{ name = "GateKeeper Maintainers", email = "maintainers@example.com" }]
 dependencies = [
     "fastapi>=0.115.0",
     "httpx>=0.28.0",
     "python-jose[cryptography]>=3.4.0",
 ]
-

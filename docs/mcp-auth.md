@@ -21,10 +21,10 @@ The metadata includes:
 
 ## Challenge Header
 
-An MCP server protecting `https://sentinel.b3n.in/mcp` should return:
+An MCP server protecting `https://api.example.com/mcp` should return:
 
 ```text
-WWW-Authenticate: Bearer resource_metadata="https://sentinel.b3n.in/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"
+WWW-Authenticate: Bearer resource_metadata="https://api.example.com/.well-known/oauth-protected-resource/mcp", scope="mcp:tools"
 ```
 
 ## Token Validation
@@ -39,4 +39,3 @@ MCP servers must validate:
 
 Tool-level checks remain application policy and should be audited by the MCP
 server or by GateKeeper when issuing scoped tokens.
-

@@ -7,9 +7,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.database import get_db
 from app.models import ApiToken, AuthClient, Membership, Role, Session, User
 from app.security import decode_access_token, now_utc, token_hash
+from app.services import enforce_session_idle_timeout
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -34,8 +36,8 @@ async def current_principal(
     raw = None
     if credentials and credentials.scheme.lower() == "bearer":
         raw = credentials.credentials
-    elif request.cookies.get("gk_session"):
-        raw = request.cookies.get("gk_session")
+    elif request.cookies.get(settings.cookie_name):
+        raw = request.cookies.get(settings.cookie_name)
     if not raw:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
 
@@ -48,6 +50,10 @@ async def current_principal(
             or (api_token.expires_at and api_token.expires_at <= now_utc())
         ):
             raise HTTPException(status_code=401, detail="Invalid API token")
+        if api_token.user_id:
+            user = await db.get(User, api_token.user_id)
+            if not user or user.disabled:
+                raise HTTPException(status_code=401, detail="Invalid API token")
         api_token.last_used_at = now_utc()
         await db.commit()
         return Principal(
@@ -66,9 +72,10 @@ async def current_principal(
     scope = str(claims.get("scope", "")).split()
     token_type = str(claims.get("token_type", "access"))
     subject = str(claims.get("sub", ""))
-    session_id = claims.get("session_id") or claims.get("sid")
+    session_id_value = claims.get("session_id") or claims.get("sid")
+    session_id = session_id_value if isinstance(session_id_value, str) and session_id_value else None
     if token_type == "user":
-        if not subject or not isinstance(session_id, str) or not session_id:
+        if not subject or not session_id:
             raise HTTPException(status_code=401, detail="Session-bound user token required")
         user = await db.get(User, subject)
         if not user or user.disabled:
@@ -81,19 +88,22 @@ async def current_principal(
             or session.expires_at <= now_utc()
         ):
             raise HTTPException(status_code=401, detail="Session revoked or expired")
+        client = await db.get(AuthClient, session.client_id) if session.client_id else None
         client_id = claims.get("azp")
-        if client_id:
+        if client_id and (not client or client.client_id != str(client_id)):
             result = await db.execute(select(AuthClient).where(AuthClient.client_id == str(client_id)))
             client = result.scalar_one_or_none()
-            if not client or not client.enabled:
-                raise HTTPException(status_code=401, detail="Invalid client")
+        if (client_id and not client) or (client and not client.enabled):
+            raise HTTPException(status_code=401, detail="Invalid client")
+        await enforce_session_idle_timeout(db, session=session, client=client, commit_on_expire=True)
+        await db.commit()
     return Principal(
         subject=subject,
         auth_type=token_type,
         scopes=scope,
         org_id=claims.get("org_id"),
         user_id=subject if token_type == "user" else None,
-        session_id=session_id if isinstance(session_id, str) else None,
+        session_id=session_id,
         claims=claims,
     )
 

@@ -1,5 +1,5 @@
 {
-  "name": "@b3n/gatekeeper-js",
+  "name": "gatekeeper-js",
   "version": "0.1.0",
   "type": "module",
   "description": "Framework-agnostic GateKeeper browser and server helpers",
@@ -13,4 +13,3 @@
     "typescript": "^5.9.3"
   }
 }
-

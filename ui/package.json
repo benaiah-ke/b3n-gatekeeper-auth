@@ -1,5 +1,5 @@
 {
-  "name": "@b3n/gatekeeper-ui",
+  "name": "gatekeeper-ui",
   "private": true,
   "version": "0.1.0",
   "type": "module",
