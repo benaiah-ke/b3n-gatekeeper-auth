@@ -138,7 +138,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `GET /api/v1/roles` | Operator API | List roles and permissions visible to the current organization/operator. |
 | `POST /api/v1/roles` | Operator API | Create a current-organization role. |
 | `GET /api/v1/clients` | Operator API | List web, backend, CLI, MCP, and machine clients visible to the current organization/operator. |
-| `POST /api/v1/clients` | Operator API | Register a client, defaulting to the current organization for org-bound operators. |
+| `POST /api/v1/clients` | Operator API | Register a client, defaulting to the current organization for org-bound operators. Operators may provide a stable lowercase `client_id`; otherwise GateKeeper generates a reserved `gkc_*` ID. |
 | `PATCH /api/v1/clients/{client_id}` | Operator API | Update current-organization app metadata, publisher/verified trust metadata, client MFA policy, trusted-device MFA reuse policy, and client idle-timeout policy. |
 | `POST /api/v1/clients/{client_id}/rotate-secret` | Operator API | Rotate a current-organization confidential client secret. |
 | `DELETE /api/v1/clients/{client_id}` | Operator API | Disable/delete a current-organization client. |

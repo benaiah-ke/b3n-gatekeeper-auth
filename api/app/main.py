@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
@@ -165,6 +166,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("gatekeeper")
+CLIENT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,159}$")
 
 
 @asynccontextmanager
@@ -696,6 +698,22 @@ def normalize_optional_text(value: str | None) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def validate_operator_client_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    client_id = value.strip()
+    if not client_id:
+        return None
+    if client_id.startswith("gkc_"):
+        raise HTTPException(status_code=422, detail="client_id prefix gkc_ is reserved")
+    if not CLIENT_ID_PATTERN.fullmatch(client_id):
+        raise HTTPException(
+            status_code=422,
+            detail="client_id must be 3-160 lowercase letters, digits, dots, dashes, or underscores",
+        )
+    return client_id
 
 
 @app.middleware("http")
@@ -5639,6 +5657,11 @@ async def create_client(
 ):
     redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
     allowed_origins = validate_url_list(body.allowed_origins, field_name="allowed_origins", origin_only=True)
+    client_id = validate_operator_client_id(body.client_id)
+    if client_id:
+        existing = await db.execute(select(AuthClient.id).where(AuthClient.client_id == client_id))
+        if existing.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="client_id already exists")
     org_id = await client_create_org_id(db, principal, body.org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
     secret = None
@@ -5658,7 +5681,7 @@ async def create_client(
         terms_url=validate_optional_url(body.terms_url, field_name="terms_url"),
         publisher_name=normalize_optional_text(body.publisher_name),
         verified_at=now_utc() if body.verified else None,
-        client_id=f"gkc_{new_code(12).lower()}",
+        client_id=client_id or f"gkc_{new_code(12).lower()}",
         client_secret_hash=secret_hash,
         public=body.public,
         redirect_uris=redirect_uris,
@@ -5672,6 +5695,7 @@ async def create_client(
         mcp_resource_uri=body.mcp_resource_uri,
     )
     db.add(client)
+    await db.flush()
     await audit(
         db,
         "client.create",
@@ -5679,6 +5703,14 @@ async def create_client(
         actor_user_id=principal.user_id,
         target_type="client",
         target_id=client.id,
+        details={
+            "client_id": client.client_id,
+            "operator_specified_client_id": bool(client_id),
+            "public": client.public,
+            "audiences": client.audiences,
+            "scopes": client.scopes,
+            "require_mfa": client.require_mfa,
+        },
     )
     await db.commit()
     payload = client_read(client).model_dump()

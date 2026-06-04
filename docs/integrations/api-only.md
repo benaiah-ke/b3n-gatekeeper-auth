@@ -83,6 +83,7 @@ WEB_CLIENT=$(curl -s "$GATEKEEPER_ISSUER/api/v1/clients" \
   -H 'content-type: application/json' \
   -d '{
     "name":"Example web app",
+    "client_id":"example-web",
     "org_id":"'"$ORG_ID"'",
     "description":"Example web app uses GateKeeper for account access.",
     "logo_url":"https://app.example.com/logo.png",
@@ -103,6 +104,12 @@ WEB_CLIENT=$(curl -s "$GATEKEEPER_ISSUER/api/v1/clients" \
 WEB_CLIENT_ID=$(printf '%s' "$WEB_CLIENT" | jq -r '.client_id')
 ```
 
+If `client_id` is omitted, GateKeeper generates a `gkc_*` value. Operators can
+provide a stable `client_id` for deployment-managed clients such as
+`example-web` or `example-cli`. Stable IDs must be 3-160 lowercase letters,
+digits, dots, dashes, or underscores, and the `gkc_` prefix is reserved for
+generated IDs.
+
 `publisher_name` and `verified` drive GateKeeper's hosted authorization trust
 badge. Keep unreviewed apps unverified until the operator has checked redirects,
 origins, and public links.
@@ -121,6 +128,7 @@ API_CLIENT=$(curl -s "$GATEKEEPER_ISSUER/api/v1/clients" \
   -H 'content-type: application/json' \
   -d '{
     "name":"Example backend client",
+    "client_id":"example-backend",
     "org_id":"'"$ORG_ID"'",
     "public":false,
     "redirect_uris":[],

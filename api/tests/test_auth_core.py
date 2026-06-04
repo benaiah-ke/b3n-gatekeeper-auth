@@ -9,6 +9,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from app import main as main_module
 from app import security, services
@@ -149,6 +150,8 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
         )
         assert created.status_code == 200
         created_client = created.json()
+        assert created_client["client_id"].startswith("gkc_")
+        assert "client_secret" not in created_client
 
         app_login = await ac.post(
             "/api/v1/auth/login",
@@ -169,6 +172,92 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
         assert current_session["client_id"] == created_client["client_id"]
         assert current_session["client_name"] == "Example Web"
         assert current_session["client_public"] is True
+
+
+@pytest.mark.asyncio
+async def test_client_create_accepts_operator_stable_client_id_and_rejects_duplicates():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "owner@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        access = signup.json()["access_token"]
+
+        created = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {access}"},
+            json={
+                "name": "Sentinel Control Plane",
+                "client_id": "sentinel-control-plane",
+                "public": False,
+                "redirect_uris": ["https://sentinel.b3n.in/api/v1/auth/callback"],
+                "allowed_origins": ["https://sentinel.b3n.in"],
+                "audiences": ["sentinel-api"],
+                "scopes": ["openid", "profile", "email", "auth:read"],
+                "require_mfa": True,
+            },
+        )
+        assert created.status_code == 200
+        payload = created.json()
+        assert payload["client_id"] == "sentinel-control-plane"
+        assert payload["public"] is False
+        assert payload["require_mfa"] is True
+        assert payload["client_secret"].startswith("gkcs_")
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(AuditEvent).where(
+                    AuditEvent.action == "client.create",
+                    AuditEvent.target_id == payload["id"],
+                )
+            )
+            event = result.scalar_one()
+            assert event.details["client_id"] == "sentinel-control-plane"
+            assert event.details["operator_specified_client_id"] is True
+            assert event.details["public"] is False
+
+        duplicate = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {access}"},
+            json={
+                "name": "Duplicate Sentinel",
+                "client_id": "sentinel-control-plane",
+                "public": True,
+                "redirect_uris": ["https://sentinel.b3n.in/api/v1/auth/callback"],
+                "allowed_origins": ["https://sentinel.b3n.in"],
+                "audiences": ["sentinel-api"],
+                "scopes": ["auth:read"],
+            },
+        )
+        assert duplicate.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_client_create_rejects_reserved_or_non_normalized_stable_client_ids():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "owner@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        access = signup.json()["access_token"]
+
+        for client_id in ("gkc_operator", "Sentinel-Control-Plane", "ab", "sentinel control"):
+            response = await ac.post(
+                "/api/v1/clients",
+                headers={"Authorization": f"Bearer {access}"},
+                json={
+                    "name": "Invalid Client",
+                    "client_id": client_id,
+                    "public": True,
+                    "redirect_uris": ["https://sentinel.b3n.in/api/v1/auth/callback"],
+                    "allowed_origins": ["https://sentinel.b3n.in"],
+                    "audiences": ["sentinel-api"],
+                    "scopes": ["auth:read"],
+                },
+            )
+            assert response.status_code == 422
 
 
 @pytest.mark.asyncio
