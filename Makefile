@@ -10,11 +10,10 @@ build-ui:
 	pnpm --filter @b3n/gatekeeper-ui build
 
 compose-check:
-	B3N_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.selfhost.yml config -q
+	GATEKEEPER_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.selfhost.yml config -q
 
 api-dev:
 	cd api && uv run uvicorn app.main:app --reload
 
 ui-dev:
 	pnpm --filter @b3n/gatekeeper-ui dev
-

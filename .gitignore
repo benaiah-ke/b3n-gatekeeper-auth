@@ -19,3 +19,6 @@ htmlcov/
 .uv-cache/
 data/
 *.db
+
+# Local/private operator notes are not part of the OSS product.
+docs/internal/
