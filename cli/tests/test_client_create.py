@@ -132,6 +132,62 @@ class ClientCreateTests(unittest.TestCase):
         self.assertIn("PATH", result.output)
         self.assertEqual(self.calls, [])
 
+    def test_confidential_client_refuses_existing_secret_output_before_create(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            secret_output = Path(tmpdir) / "sentinel-control-plane.secret"
+            secret_output.write_text("existing-secret\n")
+
+            with patch("gatekeeper_cli.cli.api", self.fake_api):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "client",
+                        "create",
+                        "Sentinel control plane",
+                        "https://sentinel.b3n.in/api/v1/auth/callback",
+                        "sentinel-api",
+                        "--url",
+                        "https://gatekeeper.b3n.in",
+                        "--client-id",
+                        "sentinel-control-plane",
+                        "--confidential",
+                        "--secret-output",
+                        str(secret_output),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("already exists", result.output)
+            self.assertEqual(secret_output.read_text(), "existing-secret\n")
+            self.assertEqual(self.calls, [])
+
+    def test_confidential_client_refuses_missing_secret_output_directory_before_create(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            secret_output = Path(tmpdir) / "missing" / "sentinel-control-plane.secret"
+
+            with patch("gatekeeper_cli.cli.api", self.fake_api):
+                result = self.runner.invoke(
+                    app,
+                    [
+                        "client",
+                        "create",
+                        "Sentinel control plane",
+                        "https://sentinel.b3n.in/api/v1/auth/callback",
+                        "sentinel-api",
+                        "--url",
+                        "https://gatekeeper.b3n.in",
+                        "--client-id",
+                        "sentinel-control-plane",
+                        "--confidential",
+                        "--secret-output",
+                        str(secret_output),
+                    ],
+                )
+
+            self.assertEqual(result.exit_code, 1, result.output)
+            self.assertIn("directory does not exist", result.output)
+            self.assertEqual(self.calls, [])
+
     def test_public_device_client_payload_uses_audience_and_no_secret(self) -> None:
         with patch("gatekeeper_cli.cli.api", self.fake_api):
             result = self.runner.invoke(

@@ -499,6 +499,13 @@ def client_create(
             "Use --secret-output PATH or create the client in a trusted UI session."
         )
         raise typer.Exit(1)
+    if not public and secret_output:
+        if secret_output.exists():
+            console.print(f"[red]Secret output file already exists:[/red] {secret_output}")
+            raise typer.Exit(1)
+        if not secret_output.parent.exists():
+            console.print(f"[red]Secret output directory does not exist:[/red] {secret_output.parent}")
+            raise typer.Exit(1)
 
     all_redirect_uris = [redirect_uri] if redirect_uri else []
     all_redirect_uris.extend(redirect_uris or [])
