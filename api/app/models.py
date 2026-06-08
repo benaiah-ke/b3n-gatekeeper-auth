@@ -158,7 +158,7 @@ class AuthClient(Base, TimestampMixin):
     publisher_name: Mapped[str | None] = mapped_column(String(160), nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     client_id: Mapped[str] = mapped_column(String(160), unique=True, index=True, nullable=False)
-    client_secret_hash: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    client_secret_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     public: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     redirect_uris: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
