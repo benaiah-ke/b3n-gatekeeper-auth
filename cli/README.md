@@ -1,30 +1,30 @@
-# GateKeeper CLI
+# B3n GateKeeper CLI
 
 The CLI authenticates through OAuth device authorization and stores tokens in
 the OS keyring when available, falling back to a `0600` local credentials file.
 It refreshes expired access tokens with the stored refresh token and accepts
-`GATEKEEPER_TOKEN` or `GATEKEEPER_ACCESS_TOKEN` for automation.
+`B3N_GATEKEEPER_TOKEN` or `B3N_GATEKEEPER_ACCESS_TOKEN` for automation.
 
 ```bash
-gatekeeper doctor --url https://auth.example.com
-gatekeeper login --url https://auth.example.com
-gatekeeper whoami
-gatekeeper org list
-gatekeeper org switch <org-id> --client-id <client-id> --audience example-api --scope api:read
-gatekeeper session list
-gatekeeper session label <session-id> "Work laptop"
-gatekeeper session revoke <session-id>
-gatekeeper token list
-gatekeeper token create "Local dev key" --scope auth:read --audience gatekeeper-api
-gatekeeper token rotate <token-id>
-gatekeeper token validate gk_xxx --audience gatekeeper-api --scope auth:read
+b3n-gatekeeper doctor --url https://auth.example.com
+b3n-gatekeeper login --url https://auth.example.com
+b3n-gatekeeper whoami
+b3n-gatekeeper org list
+b3n-gatekeeper org switch <org-id> --client-id <client-id> --audience example-api --scope api:read
+b3n-gatekeeper session list
+b3n-gatekeeper session label <session-id> "Work laptop"
+b3n-gatekeeper session revoke <session-id>
+b3n-gatekeeper token list
+b3n-gatekeeper token create "Local dev key" --scope auth:read --audience gatekeeper-api
+b3n-gatekeeper token rotate <token-id>
+b3n-gatekeeper token validate gk_xxx --audience gatekeeper-api --scope auth:read
 ```
 
-`gatekeeper doctor` checks public health, OIDC discovery, JWKS, owner/setup
+`b3n-gatekeeper doctor` checks public health, OIDC discovery, JWKS, owner/setup
 state, SMTP/dev-mode, management capabilities, and visible clients, projects,
 tokens, and sessions.
 
-If `--url` is omitted, the CLI reads `GATEKEEPER_URL` and otherwise defaults to
+If `--url` is omitted, the CLI reads `B3N_GATEKEEPER_URL` and otherwise defaults to
 `http://localhost:8000` for local development.
 
 ## Client Creation
@@ -33,7 +33,7 @@ Operators can register public browser/CLI clients or confidential backend/API
 clients from the CLI:
 
 ```bash
-gatekeeper client create "Example web" \
+b3n-gatekeeper client create "Example web" \
   https://app.example.com/auth/callback \
   example-api \
   --url https://auth.example.com \
@@ -48,7 +48,7 @@ to terminal history, logs, or automation output, the CLI requires an explicit
 new output file and redacts the JSON response:
 
 ```bash
-gatekeeper client create "Example backend" \
+b3n-gatekeeper client create "Example backend" \
   https://api.example.com/auth/callback \
   example-api \
   --url https://auth.example.com \
@@ -62,3 +62,7 @@ gatekeeper client create "Example backend" \
 The secret output file is created with `0600` permissions and must not already
 exist. Move its contents into the relevant secret store, then remove the local
 copy.
+
+Generic `GATEKEEPER_*` names are intentionally not read by this B3n package so
+local automation cannot accidentally reuse credentials from another GateKeeper
+installation.

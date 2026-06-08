@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 from typer.testing import CliRunner
 
+from gatekeeper_cli import auth, config
 from gatekeeper_cli.cli import app
 
 
@@ -228,6 +230,35 @@ class ClientCreateTests(unittest.TestCase):
                 "session_idle_timeout_minutes": None,
             },
         )
+
+    def test_b3n_gatekeeper_env_token_override_wins(self) -> None:
+        with patch.dict(os.environ, {"B3N_GATEKEEPER_TOKEN": "env-token"}, clear=True):
+            self.assertEqual(auth.load_access_token("https://gatekeeper.b3n.in"), "env-token")
+
+    def test_legacy_gatekeeper_env_tokens_are_ignored(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "GATEKEEPER_TOKEN": "generic-token",
+                        "GATEKEEPER_ACCESS_TOKEN": "generic-access-token",
+                    },
+                    clear=True,
+                ),
+                patch.object(auth, "APP_DIR", Path(tmpdir) / ".b3n-gatekeeper"),
+                patch.object(auth, "CREDENTIALS_FILE", Path(tmpdir) / ".b3n-gatekeeper" / "credentials.json"),
+                patch.object(auth.keyring, "get_password", return_value=None),
+            ):
+                self.assertIsNone(auth.load_access_token("https://gatekeeper.b3n.in"))
+
+    def test_b3n_gatekeeper_url_override_is_used(self) -> None:
+        with patch.dict(os.environ, {"B3N_GATEKEEPER_URL": "https://gatekeeper.b3n.in"}, clear=True):
+            self.assertEqual(config.normalize_url(None), "https://gatekeeper.b3n.in")
+
+    def test_legacy_gatekeeper_url_override_is_ignored(self) -> None:
+        with patch.dict(os.environ, {"GATEKEEPER_URL": "https://generic-gatekeeper.example"}, clear=True):
+            self.assertEqual(config.normalize_url(None), "http://localhost:8000")
 
 
 if __name__ == "__main__":

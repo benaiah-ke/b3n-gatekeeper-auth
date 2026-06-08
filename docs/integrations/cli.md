@@ -49,49 +49,49 @@ The GateKeeper CLI stores:
 - visible memberships returned by auth responses
 
 Use `0600` file permissions or a platform keychain. Support an environment
-variable override for automation tokens with `GATEKEEPER_TOKEN` or
-`GATEKEEPER_ACCESS_TOKEN`.
+variable override for automation tokens with `B3N_GATEKEEPER_TOKEN` or
+`B3N_GATEKEEPER_ACCESS_TOKEN`.
 
 ## GateKeeper CLI Commands
 
 ```bash
-gatekeeper doctor --url https://auth.example.com
-gatekeeper login --url https://auth.example.com --client-id example-cli --scope "openid profile email cli:read"
-gatekeeper whoami --url https://auth.example.com
+b3n-gatekeeper doctor --url https://auth.example.com
+b3n-gatekeeper login --url https://auth.example.com --client-id example-cli --scope "openid profile email cli:read"
+b3n-gatekeeper whoami --url https://auth.example.com
 
-gatekeeper org list --url https://auth.example.com
-gatekeeper org switch <org-id> \
+b3n-gatekeeper org list --url https://auth.example.com
+b3n-gatekeeper org switch <org-id> \
   --url https://auth.example.com \
   --client-id example-cli \
   --audience example-api \
   --scope cli:read
 
-gatekeeper session list --url https://auth.example.com
-gatekeeper session label <session-id> "Work laptop" --url https://auth.example.com
-gatekeeper session trust <session-id> --url https://auth.example.com
-gatekeeper session revoke <session-id> --url https://auth.example.com
-gatekeeper session revoke-all --other-only --url https://auth.example.com
+b3n-gatekeeper session list --url https://auth.example.com
+b3n-gatekeeper session label <session-id> "Work laptop" --url https://auth.example.com
+b3n-gatekeeper session trust <session-id> --url https://auth.example.com
+b3n-gatekeeper session revoke <session-id> --url https://auth.example.com
+b3n-gatekeeper session revoke-all --other-only --url https://auth.example.com
 
-gatekeeper token create "Local extension token" \
+b3n-gatekeeper token create "Local extension token" \
   --url https://auth.example.com \
   --scope api:read \
   --audience example-api
 
-gatekeeper token rotate <token-id> --url https://auth.example.com
+b3n-gatekeeper token rotate <token-id> --url https://auth.example.com
 
-gatekeeper token validate gk_xxx \
+b3n-gatekeeper token validate gk_xxx \
   --url https://auth.example.com \
   --audience example-api \
   --scope api:read
 ```
 
-Run `gatekeeper doctor` before and after first setup. It checks public API
+Run `b3n-gatekeeper doctor` before and after first setup. It checks public API
 reachability, OIDC discovery, JWKS, authenticated owner/setup state, SMTP or
 email dev-mode, client/project/token capabilities, and visible clients,
 audiences, credentials, and sessions.
 
 The CLI refreshes expired access tokens automatically when a refresh token is
-available. `gatekeeper logout` revokes the current GateKeeper session when it
+available. `b3n-gatekeeper logout` revokes the current GateKeeper session when it
 can reach the issuer, then removes local credentials.
 
 `token rotate` uses GateKeeper's copy-once rotation endpoint and prints the
