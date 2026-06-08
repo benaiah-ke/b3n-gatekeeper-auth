@@ -436,6 +436,7 @@ class SessionRevokeAllResponse(BaseModel):
 
 class ClientCreate(BaseModel):
     name: str = Field(..., min_length=2, max_length=160)
+    client_id: str | None = Field(default=None, min_length=3, max_length=160)
     description: str | None = Field(default=None, max_length=1000)
     logo_url: str | None = Field(default=None, max_length=500)
     homepage_url: str | None = Field(default=None, max_length=500)

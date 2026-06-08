@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -90,6 +92,25 @@ def origin_from_url(value: str) -> str:
     if not parsed.scheme or not parsed.netloc:
         return value.rstrip("/")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def expand_cli_values(values: list[str] | None, *, fallback: list[str] | None = None) -> list[str]:
+    expanded: list[str] = []
+    for value in values or []:
+        expanded.extend(part for part in value.replace(",", " ").split() if part)
+    return expanded or list(fallback or [])
+
+
+def write_copy_once_secret(path: Path, secret: str) -> None:
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        console.print(f"[red]Secret output file already exists:[/red] {path}")
+        raise typer.Exit(1) from None
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(secret)
+        handle.write("\n")
+    path.chmod(0o600)
 
 
 def safe_count(client: AuthenticatedClient, path: str) -> int | None:
@@ -456,27 +477,68 @@ def client_list(url: Optional[str] = typer.Option(None, "--url")) -> None:
 @client_app.command("create")
 def client_create(
     name: str,
-    redirect_uri: str,
-    audience: str,
+    redirect_uri: Optional[str] = typer.Argument(None, help="Primary redirect URI for browser/OAuth clients"),
+    audience: Optional[str] = typer.Argument(None, help="Primary protected API audience"),
     url: Optional[str] = typer.Option(None, "--url"),
     org_id: Optional[str] = typer.Option(None, "--org-id"),
-    scope: str = typer.Option("auth:read", "--scope"),
+    client_id: Optional[str] = typer.Option(None, "--client-id", help="Stable client_id to register instead of a generated gkc_* id"),
+    public: bool = typer.Option(True, "--public/--confidential", help="Create a public client or a confidential client with a copy-once secret"),
+    redirect_uris: Optional[list[str]] = typer.Option(None, "--redirect-uri", help="Redirect URI; repeat or use the positional redirect URI"),
+    allowed_origins: Optional[list[str]] = typer.Option(None, "--origin", help="Allowed browser origin; defaults to redirect URI origins"),
+    audiences: Optional[list[str]] = typer.Option(None, "--audience", help="Allowed audience; repeat or use the positional audience"),
+    scopes: Optional[list[str]] = typer.Option(None, "--scope", help="Scope or space-separated scopes; repeatable"),
+    secret_output: Optional[Path] = typer.Option(None, "--secret-output", help="Write a copy-once confidential client secret to this new 0600 file"),
+    require_mfa: bool = typer.Option(False, "--require-mfa", help="Require MFA for user grants to this client"),
+    require_org_membership: bool = typer.Option(True, "--require-org-membership/--no-require-org-membership"),
+    trusted_device_mfa_bypass: bool = typer.Option(False, "--trusted-device-mfa-bypass/--no-trusted-device-mfa-bypass"),
+    session_idle_timeout_minutes: Optional[int] = typer.Option(None, "--idle-timeout-minutes", min=1),
 ) -> None:
+    if not public and secret_output is None:
+        console.print(
+            "[red]Confidential client creation returns a copy-once secret.[/red] "
+            "Use --secret-output PATH or create the client in a trusted UI session."
+        )
+        raise typer.Exit(1)
+    if not public and secret_output:
+        if secret_output.exists():
+            console.print(f"[red]Secret output file already exists:[/red] {secret_output}")
+            raise typer.Exit(1)
+        if not secret_output.parent.exists():
+            console.print(f"[red]Secret output directory does not exist:[/red] {secret_output.parent}")
+            raise typer.Exit(1)
+
+    all_redirect_uris = [redirect_uri] if redirect_uri else []
+    all_redirect_uris.extend(redirect_uris or [])
+    all_audiences = [audience] if audience else []
+    all_audiences.extend(audiences or [])
+    payload = {
+        "name": name,
+        "client_id": client_id,
+        "org_id": org_id,
+        "public": public,
+        "redirect_uris": all_redirect_uris,
+        "allowed_origins": allowed_origins or [origin_from_url(uri) for uri in all_redirect_uris],
+        "audiences": all_audiences,
+        "scopes": expand_cli_values(scopes, fallback=["auth:read"]),
+        "require_org_membership": require_org_membership,
+        "require_mfa": require_mfa,
+        "trusted_device_mfa_bypass": trusted_device_mfa_bypass,
+        "session_idle_timeout_minutes": session_idle_timeout_minutes,
+    }
     with api(normalize_url(url)) as client:
         response = client.post(
             "/api/v1/clients",
-            json={
-                "name": name,
-                "org_id": org_id,
-                "public": True,
-                "redirect_uris": [redirect_uri],
-                "allowed_origins": [origin_from_url(redirect_uri)],
-                "audiences": [audience],
-                "scopes": scope.split(),
-            },
+            json=payload,
         )
         response.raise_for_status()
-        console.print_json(data=response.json())
+        response_payload = response.json()
+        client_secret = response_payload.get("client_secret")
+        if isinstance(client_secret, str) and client_secret:
+            if secret_output:
+                write_copy_once_secret(secret_output, client_secret)
+                response_payload["client_secret_output"] = str(secret_output)
+            response_payload["client_secret"] = "<redacted>"
+        console.print_json(data=response_payload)
 
 
 @mcp_app.command("register")

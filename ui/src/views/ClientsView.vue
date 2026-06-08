@@ -91,6 +91,7 @@ const setup = ref<SetupStatus | null>(null)
 const clients = ref<AuthClient[]>([])
 const selectedTemplate = ref('api-backend')
 const name = ref('Example API backend')
+const clientId = ref('')
 const description = ref('')
 const logoUrl = ref('')
 const homepageUrl = ref('')
@@ -152,6 +153,7 @@ function applyTemplate(id: string) {
   const template = templates.find((item) => item.id === id) ?? templates[0]!
   selectedTemplate.value = template.id
   name.value = template.name
+  clientId.value = ''
   description.value = ''
   logoUrl.value = ''
   homepageUrl.value = ''
@@ -210,6 +212,7 @@ async function create() {
   try {
     const client = await api.createClient({
       name: name.value,
+      client_id: clientId.value.trim() || undefined,
       org_id: activeOrgId.value,
       description: description.value || null,
       logo_url: logoUrl.value || null,
@@ -384,7 +387,7 @@ onMounted(load)
       </article>
 
       <form class="panel grid gap-5 p-5" :class="{ 'opacity-60': !canManage }" @submit.prevent="create">
-        <div class="grid gap-4 md:grid-cols-[0.8fr_1.2fr]">
+        <div class="grid gap-4 md:grid-cols-[0.8fr_1.2fr_1.2fr]">
           <label class="grid gap-2 text-sm text-muted">
             Template
             <select class="input" :value="selectedTemplate" :disabled="!canManage" @change="applyTemplate(($event.target as HTMLSelectElement).value)">
@@ -394,6 +397,10 @@ onMounted(load)
           <label class="grid gap-2 text-sm text-muted">
             Client name
             <input v-model="name" class="input" :disabled="!canManage" required />
+          </label>
+          <label class="grid gap-2 text-sm text-muted">
+            Client ID
+            <input v-model="clientId" class="input font-mono" :disabled="!canManage" placeholder="optional-stable-id" />
           </label>
         </div>
 
