@@ -76,6 +76,7 @@ const totpQrError = ref('')
 const loading = ref(true)
 const error = ref('')
 const copiedKey = ref('')
+const activeSection = ref('overview')
 
 const activeOrg = computed(() => status.value?.org || status.value?.orgs[0] || null)
 const role = computed(() => activeOrg.value?.role || 'none')
@@ -498,6 +499,44 @@ const integrationSurfaces = computed(() => [
   },
 ])
 
+const accountSections = computed(() => [
+  {
+    key: 'overview',
+    icon: Gauge,
+    label: 'Overview',
+    detail: nextSetupStep.value ? `Next: ${nextSetupStep.value.title}` : 'Core setup complete',
+    meta: `${setupCompletionPercent.value}%`,
+  },
+  {
+    key: 'profile',
+    icon: UserRound,
+    label: 'Profile',
+    detail: 'Identity, email, password, and linked sign-in methods',
+    meta: status.value?.user?.email_verified ? 'verified' : 'check email',
+  },
+  {
+    key: 'security',
+    icon: ShieldCheck,
+    label: 'Security',
+    detail: 'Authenticator setup, sessions, policy, and audit controls',
+    meta: mfaStateLabel.value,
+  },
+  {
+    key: 'integrations',
+    icon: Server,
+    label: 'Integrations',
+    detail: 'Issuer values, clients, tokens, API audiences, CLI, and MCP',
+    meta: `${clients.value.length} clients`,
+  },
+  {
+    key: 'advanced',
+    icon: ScrollText,
+    label: 'Advanced',
+    detail: 'Account export and deactivation',
+    meta: 'data',
+  },
+])
+
 async function load() {
   loading.value = true
   error.value = ''
@@ -780,13 +819,13 @@ onMounted(load)
 </script>
 
 <template>
-  <section class="mx-auto max-w-6xl px-4 py-8 md:px-8">
+  <section class="mx-auto max-w-7xl px-4 py-8 md:px-8">
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
-        <p class="mono-label">Setup console</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">GateKeeper control plane</h1>
+        <p class="mono-label">Account console</p>
+        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">GateKeeper account</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
-          Confirm the owner path, protect APIs, register product clients, issue scoped credentials, and copy integration values.
+          Manage operator identity, security, setup readiness, and integration values from focused account sections.
         </p>
       </div>
       <button type="button" class="btn-secondary gap-2 text-sm" @click="load">
@@ -795,7 +834,7 @@ onMounted(load)
       </button>
     </div>
 
-    <article v-if="loading" class="panel mt-8 p-5 text-sm text-muted">Loading setup console...</article>
+    <article v-if="loading" class="panel mt-8 p-5 text-sm text-muted">Loading account console...</article>
     <article v-else-if="error" class="mt-8 rounded-md border border-red/40 bg-red/10 p-4 text-sm text-red">
       {{ error }}
     </article>
@@ -813,468 +852,460 @@ onMounted(load)
 
       <div class="grid gap-4 lg:grid-cols-4">
         <article class="panel p-5">
-          <p class="text-sm text-muted">Signed in as</p>
+          <p class="text-sm text-muted">Signed in</p>
           <h2 class="mt-2 break-words text-lg font-semibold leading-snug">{{ status.user?.email || 'Unknown user' }}</h2>
           <p class="mt-2 font-mono text-xs text-muted">{{ status.auth_type }}</p>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Organization</p>
-          <h2 class="mt-2 text-xl font-semibold">{{ activeOrg?.name || 'No org' }}</h2>
+          <h2 class="mt-2 truncate text-xl font-semibold">{{ activeOrg?.name || 'No org' }}</h2>
           <p class="mt-2 font-mono text-xs text-muted">{{ role }}</p>
         </article>
         <article class="panel p-5">
-          <p class="text-sm text-muted">Session</p>
-          <h2 class="mt-2 text-xl font-semibold">{{ status.owner_exists ? 'Owner path ready' : 'Owner missing' }}</h2>
-          <p class="mt-2 text-xs text-muted">{{ sessionSummary }}</p>
+          <p class="text-sm text-muted">Setup</p>
+          <h2 class="mt-2 text-xl font-semibold">{{ setupCompletionPercent }}%</h2>
+          <p class="mt-2 text-xs text-muted">{{ completedSetupCount }}/{{ setupSteps.length }} checks complete</p>
         </article>
         <article class="panel p-5">
-          <p class="text-sm text-muted">Email mode</p>
-          <h2 class="mt-2 text-xl font-semibold">{{ status.smtp_configured ? 'SMTP' : 'Dev mode' }}</h2>
-          <p class="mt-2 text-xs text-muted">
-            {{ status.email_dev_mode ? 'Codes are not delivered by SMTP' : 'SMTP delivery required' }}
-          </p>
+          <p class="text-sm text-muted">Security</p>
+          <h2 class="mt-2 text-xl font-semibold">{{ mfaStateLabel }}</h2>
+          <p class="mt-2 text-xs text-muted">{{ sessionSummary }}</p>
         </article>
       </div>
 
-      <section class="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
-        <article class="panel p-5">
-          <div class="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p class="mono-label">Readiness</p>
-              <h2 class="mt-2 text-3xl font-semibold">{{ setupCompletionPercent }}%</h2>
-            </div>
+      <nav class="panel grid gap-2 p-2 md:grid-cols-5" aria-label="Account sections">
+        <button
+          v-for="section in accountSections"
+          :key="section.key"
+          type="button"
+          class="grid min-h-28 gap-2 rounded-md border p-3 text-left transition"
+          :class="
+            activeSection === section.key
+              ? 'border-accent bg-accent/10 text-fg'
+              : 'border-border bg-surface text-muted hover:border-border-active hover:text-fg'
+          "
+          :aria-pressed="activeSection === section.key"
+          @click="activeSection = section.key"
+        >
+          <span class="flex items-start justify-between gap-3">
             <span
-              class="inline-flex min-h-9 items-center gap-2 rounded-md border px-3 font-mono text-xs"
-              :class="severityClass(readinessState === 'ready' ? 'ready' : readinessState === 'blocked' ? 'blocker' : 'warning')"
+              class="grid h-8 w-8 shrink-0 place-items-center rounded-md border"
+              :class="activeSection === section.key ? 'border-accent/50 bg-bg text-accent' : 'border-border bg-bg text-muted'"
             >
-              <Gauge class="h-4 w-4" aria-hidden="true" />
-              {{ readinessState }}
+              <component :is="section.icon" class="h-4 w-4" aria-hidden="true" />
             </span>
-          </div>
-          <div class="mt-4 h-2 overflow-hidden rounded-full bg-surface">
-            <div class="h-full rounded-full bg-accent" :style="{ width: `${setupCompletionPercent}%` }"></div>
-          </div>
-          <p class="mt-3 font-mono text-xs text-muted">
-            {{ completedSetupCount }}/{{ setupSteps.length }} setup checks complete
-          </p>
-          <RouterLink
-            v-if="nextSetupStep"
-            :to="nextSetupStep.to"
-            class="btn-secondary mt-5 justify-start gap-2 text-sm"
-          >
-            <ListChecks class="h-4 w-4" aria-hidden="true" />
-            Next: {{ nextSetupStep.title }}
-          </RouterLink>
-          <p v-else class="mt-5 text-sm text-green">Core setup checks are complete.</p>
-        </article>
-
-        <article class="panel p-5">
-          <div class="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p class="mono-label">Policy health</p>
-              <h2 class="mt-2 text-xl font-semibold">Production signals</h2>
-            </div>
-            <p class="font-mono text-xs text-muted">
-              {{ readinessBlockers.length }} blockers / {{ readinessWarnings.length }} warnings
-            </p>
-          </div>
-          <div class="mt-4 divide-y divide-border">
-            <RouterLink
-              v-for="item in policyHealthItems"
-              :key="item.key"
-              :to="item.to"
-              class="grid gap-3 py-3 transition hover:text-fg md:grid-cols-[auto_1fr_auto]"
-            >
-              <span
-                class="mt-0.5 grid h-7 w-7 place-items-center rounded-md border"
-                :class="severityClass(item.severity)"
-              >
-                <CheckCircle2 v-if="item.severity === 'ready'" class="h-4 w-4" aria-hidden="true" />
-                <ShieldAlert v-else class="h-4 w-4" aria-hidden="true" />
-              </span>
-              <span>
-                <span class="block font-semibold">{{ item.label }}</span>
-                <span class="mt-1 block text-sm leading-6 text-muted">{{ item.detail }}</span>
-              </span>
-              <span class="self-center font-mono text-xs text-muted">{{ item.severity }}</span>
-            </RouterLink>
-          </div>
-        </article>
-      </section>
-
-      <section class="grid gap-3">
-        <div class="flex items-center justify-between gap-3">
-          <p class="mono-label">Operator shortcuts</p>
-          <span class="font-mono text-xs text-muted">{{ operatorShortcuts.length }} surfaces</span>
-        </div>
-        <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-          <RouterLink
-            v-for="shortcut in operatorShortcuts"
-            :key="shortcut.key"
-            :to="shortcut.to"
-            class="panel grid gap-3 p-4 transition hover:border-border-active"
-            :class="{ 'pointer-events-none opacity-50': !shortcut.enabled }"
-          >
-            <div class="flex items-start justify-between gap-3">
-              <span class="grid h-9 w-9 place-items-center rounded-md border border-border bg-surface text-accent">
-                <component :is="shortcut.icon" class="h-4 w-4" aria-hidden="true" />
-              </span>
-              <span class="font-mono text-xs text-muted">{{ shortcut.enabled ? 'open' : 'locked' }}</span>
-            </div>
-            <div>
-              <h2 class="font-semibold">{{ shortcut.title }}</h2>
-              <p class="mt-1 text-sm leading-6 text-muted">{{ shortcut.detail }}</p>
-            </div>
-          </RouterLink>
-        </div>
-      </section>
-
-      <div class="grid gap-6 lg:grid-cols-[1fr_0.85fr]">
-        <section class="grid gap-3">
-          <div class="flex items-center justify-between gap-3">
-            <p class="mono-label">First-run wizard</p>
-            <span class="font-mono text-xs text-muted">
-              {{ completedSetupCount }}/{{ setupSteps.length }}
+            <span class="rounded-md border border-border px-2 py-1 font-mono text-[0.68rem] text-muted">
+              {{ section.meta }}
             </span>
-          </div>
-          <RouterLink
-            v-for="step in setupSteps"
-            :key="step.title"
-            :to="step.to"
-            class="panel grid gap-3 p-4 transition hover:border-border-active md:grid-cols-[auto_1fr_auto]"
-          >
-            <CheckCircle2
-              class="h-5 w-5"
-              :class="step.done ? 'text-green' : 'text-muted'"
-              aria-hidden="true"
-            />
-            <div>
-              <h2 class="font-semibold">{{ step.title }}</h2>
-              <p class="mt-1 break-all text-sm text-muted">{{ step.detail }}</p>
-            </div>
-            <span class="self-center font-mono text-xs text-muted">{{ step.done ? 'ready' : 'next' }}</span>
-          </RouterLink>
-        </section>
+          </span>
+          <span>
+            <span class="block text-sm font-semibold">{{ section.label }}</span>
+            <span class="mt-1 block text-xs leading-5 text-muted">{{ section.detail }}</span>
+          </span>
+        </button>
+      </nav>
 
-        <section class="grid gap-4">
-          <article class="panel p-5">
-            <p class="mono-label">Capabilities</p>
-            <div class="mt-4 flex flex-wrap gap-2">
-              <span
-                v-for="permission in permissions"
-                :key="permission"
-                class="rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs text-muted"
-              >
-                {{ permission }}
-              </span>
-              <span v-if="!permissions.length" class="text-sm text-muted">No org permissions returned.</span>
-            </div>
-          </article>
-
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Hosted auth</p>
-                <h2 class="mt-2 text-xl font-semibold">Social providers</h2>
+      <section id="account-section-panel" class="grid gap-6">
+        <div v-if="activeSection === 'overview'" class="grid gap-6">
+          <section class="grid gap-4 xl:grid-cols-[0.8fr_1.2fr]">
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Readiness</p>
+                  <h2 class="mt-2 text-3xl font-semibold">{{ setupCompletionPercent }}%</h2>
+                </div>
+                <span
+                  class="inline-flex min-h-9 items-center gap-2 rounded-md border px-3 font-mono text-xs"
+                  :class="severityClass(readinessState === 'ready' ? 'ready' : readinessState === 'blocked' ? 'blocker' : 'warning')"
+                >
+                  <Gauge class="h-4 w-4" aria-hidden="true" />
+                  {{ readinessState }}
+                </span>
               </div>
-              <Globe class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
-            <p class="mt-3 text-sm leading-6 text-muted">
-              Configured providers appear on hosted login and signup, and product-owned auth screens can start them through the provider API.
-            </p>
-            <div class="mt-4 grid gap-3">
-              <article v-if="!oauthProviders.length" class="rounded-md border border-border bg-surface p-3 text-sm text-muted">
-                No social providers configured.
+              <div class="mt-4 h-2 overflow-hidden rounded-full bg-surface">
+                <div class="h-full rounded-full bg-accent" :style="{ width: `${setupCompletionPercent}%` }"></div>
+              </div>
+              <p class="mt-3 font-mono text-xs text-muted">
+                {{ completedSetupCount }}/{{ setupSteps.length }} setup checks complete
+              </p>
+              <RouterLink
+                v-if="nextSetupStep"
+                :to="nextSetupStep.to"
+                class="btn-secondary mt-5 justify-start gap-2 text-sm"
+              >
+                <ListChecks class="h-4 w-4" aria-hidden="true" />
+                Next: {{ nextSetupStep.title }}
+              </RouterLink>
+              <p v-else class="mt-5 text-sm text-green">Core setup checks are complete.</p>
+            </article>
+
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Policy health</p>
+                  <h2 class="mt-2 text-xl font-semibold">Production signals</h2>
+                </div>
+                <p class="font-mono text-xs text-muted">
+                  {{ readinessBlockers.length }} blockers / {{ readinessWarnings.length }} warnings
+                </p>
+              </div>
+              <div class="mt-4 max-h-[30rem] overflow-auto divide-y divide-border pr-1">
+                <RouterLink
+                  v-for="item in policyHealthItems"
+                  :key="item.key"
+                  :to="item.to"
+                  class="grid gap-3 py-3 transition hover:text-fg md:grid-cols-[auto_1fr_auto]"
+                >
+                  <span
+                    class="mt-0.5 grid h-7 w-7 place-items-center rounded-md border"
+                    :class="severityClass(item.severity)"
+                  >
+                    <CheckCircle2 v-if="item.severity === 'ready'" class="h-4 w-4" aria-hidden="true" />
+                    <ShieldAlert v-else class="h-4 w-4" aria-hidden="true" />
+                  </span>
+                  <span>
+                    <span class="block font-semibold">{{ item.label }}</span>
+                    <span class="mt-1 block text-sm leading-6 text-muted">{{ item.detail }}</span>
+                  </span>
+                  <span class="self-center font-mono text-xs text-muted">{{ item.severity }}</span>
+                </RouterLink>
+              </div>
+            </article>
+          </section>
+
+          <section class="grid gap-6 lg:grid-cols-[1fr_0.82fr]">
+            <article class="panel p-5">
+              <div class="flex items-center justify-between gap-3">
+                <p class="mono-label">Setup checklist</p>
+                <span class="font-mono text-xs text-muted">{{ completedSetupCount }}/{{ setupSteps.length }}</span>
+              </div>
+              <div class="mt-4 max-h-[34rem] overflow-auto divide-y divide-border pr-1">
+                <RouterLink
+                  v-for="step in setupSteps"
+                  :key="step.title"
+                  :to="step.to"
+                  class="grid gap-3 py-3 transition hover:text-fg md:grid-cols-[auto_1fr_auto]"
+                >
+                  <CheckCircle2
+                    class="mt-0.5 h-5 w-5"
+                    :class="step.done ? 'text-green' : 'text-muted'"
+                    aria-hidden="true"
+                  />
+                  <span>
+                    <span class="block font-semibold">{{ step.title }}</span>
+                    <span class="mt-1 block break-words text-sm leading-6 text-muted">{{ step.detail }}</span>
+                  </span>
+                  <span class="self-center font-mono text-xs text-muted">{{ step.done ? 'ready' : 'next' }}</span>
+                </RouterLink>
+              </div>
+            </article>
+
+            <section class="grid gap-4">
+              <article class="panel p-5">
+                <p class="mono-label">Next actions</p>
+                <div class="mt-4 grid gap-3">
+                  <RouterLink
+                    to="/clients"
+                    class="btn-secondary justify-start gap-2 text-sm"
+                    :class="{ 'pointer-events-none opacity-60': !status.can_manage_clients }"
+                  >
+                    <MonitorCog class="h-4 w-4" aria-hidden="true" />
+                    Register app client
+                  </RouterLink>
+                  <RouterLink
+                    to="/providers"
+                    class="btn-secondary justify-start gap-2 text-sm"
+                    :class="{ 'pointer-events-none opacity-60': !status.scopes.includes('*') }"
+                  >
+                    <Globe class="h-4 w-4" aria-hidden="true" />
+                    Configure social provider
+                  </RouterLink>
+                  <RouterLink
+                    to="/tokens"
+                    class="btn-secondary justify-start gap-2 text-sm"
+                    :class="{ 'pointer-events-none opacity-60': !status.can_issue_tokens }"
+                  >
+                    <KeyRound class="h-4 w-4" aria-hidden="true" />
+                    Create service token
+                  </RouterLink>
+                  <RouterLink
+                    to="/device"
+                    class="btn-secondary justify-start gap-2 text-sm"
+                    :class="{ 'pointer-events-none opacity-60': !cliClient }"
+                  >
+                    <Terminal class="h-4 w-4" aria-hidden="true" />
+                    Approve CLI device login
+                  </RouterLink>
+                </div>
               </article>
-              <template v-else>
-                <article
-                  v-for="provider in oauthProviders"
+
+              <article class="panel p-5">
+                <p class="mono-label">Control plane</p>
+                <div class="mt-4 grid gap-3">
+                  <RouterLink
+                    v-for="shortcut in operatorShortcuts"
+                    :key="shortcut.key"
+                    :to="shortcut.to"
+                    class="grid gap-2 rounded-md border border-border bg-surface p-3 transition hover:border-border-active"
+                    :class="{ 'pointer-events-none opacity-50': !shortcut.enabled }"
+                  >
+                    <span class="flex items-center justify-between gap-3">
+                      <span class="inline-flex items-center gap-2 font-semibold">
+                        <component :is="shortcut.icon" class="h-4 w-4 text-accent" aria-hidden="true" />
+                        {{ shortcut.title }}
+                      </span>
+                      <span class="font-mono text-xs text-muted">{{ shortcut.enabled ? 'open' : 'locked' }}</span>
+                    </span>
+                    <span class="text-sm leading-6 text-muted">{{ shortcut.detail }}</span>
+                  </RouterLink>
+                </div>
+              </article>
+            </section>
+          </section>
+        </div>
+
+        <div v-else-if="activeSection === 'profile'" class="grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+          <section class="grid gap-4">
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Identity</p>
+                  <h2 class="mt-2 text-xl font-semibold">Profile</h2>
+                </div>
+                <UserRound class="h-5 w-5 text-accent" aria-hidden="true" />
+              </div>
+
+              <form class="mt-4 grid gap-3" @submit.prevent="saveProfile">
+                <label class="grid gap-2 text-sm text-muted">
+                  Display name
+                  <input
+                    v-model="displayName"
+                    class="input"
+                    autocomplete="name"
+                    maxlength="160"
+                    placeholder="Example User"
+                  />
+                </label>
+                <p class="break-words font-mono text-xs text-muted">{{ status.user?.email }}</p>
+                <p v-if="accountNotice" class="text-sm text-green">{{ accountNotice }}</p>
+                <button type="submit" class="btn-primary gap-2 text-sm" :disabled="accountLoading">
+                  <Save class="h-4 w-4" aria-hidden="true" />
+                  Save profile
+                </button>
+              </form>
+            </article>
+
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Identity</p>
+                  <h2 class="mt-2 text-xl font-semibold">Email</h2>
+                </div>
+                <Mail class="h-5 w-5 text-accent" aria-hidden="true" />
+              </div>
+
+              <form class="mt-4 grid gap-3" @submit.prevent="requestEmailChange">
+                <label class="grid gap-2 text-sm text-muted">
+                  New email
+                  <input
+                    v-model="emailChangeNewEmail"
+                    class="input"
+                    type="email"
+                    autocomplete="email"
+                    placeholder="you@example.com"
+                    required
+                  />
+                </label>
+                <label class="grid gap-2 text-sm text-muted">
+                  Current password
+                  <input
+                    v-model="emailChangePassword"
+                    class="input"
+                    type="password"
+                    autocomplete="current-password"
+                    placeholder="Required for password accounts"
+                  />
+                </label>
+                <button
+                  type="submit"
+                  class="btn-primary gap-2 text-sm"
+                  :disabled="emailChangeLoading || !emailChangeNewEmail || emailChangeNewEmail === status.user?.email"
+                >
+                  <Mail class="h-4 w-4" aria-hidden="true" />
+                  Send verification code
+                </button>
+              </form>
+
+              <form class="mt-4 grid gap-3 border-t border-border pt-4" @submit.prevent="confirmEmailChange">
+                <label class="grid gap-2 text-sm text-muted">
+                  Verification code
+                  <input
+                    v-model="emailChangeCode"
+                    class="input font-mono"
+                    inputmode="text"
+                    autocomplete="one-time-code"
+                    placeholder="ABC12345"
+                  />
+                </label>
+                <p v-if="emailChangeNotice" class="text-sm text-green">{{ emailChangeNotice }}</p>
+                <button
+                  type="submit"
+                  class="btn-secondary gap-2 text-sm"
+                  :disabled="emailChangeLoading || !emailChangePending || !emailChangeCode"
+                >
+                  <CheckCircle2 class="h-4 w-4" aria-hidden="true" />
+                  Confirm email change
+                </button>
+              </form>
+            </article>
+
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Identity</p>
+                  <h2 class="mt-2 text-xl font-semibold">Password</h2>
+                </div>
+                <LockKeyhole class="h-5 w-5 text-accent" aria-hidden="true" />
+              </div>
+
+              <form class="mt-4 grid gap-3" @submit.prevent="changePassword">
+                <label class="grid gap-2 text-sm text-muted">
+                  Current password
+                  <input
+                    v-model="currentPassword"
+                    class="input"
+                    type="password"
+                    autocomplete="current-password"
+                  />
+                </label>
+                <label class="grid gap-2 text-sm text-muted">
+                  New password
+                  <input
+                    v-model="newPassword"
+                    class="input"
+                    type="password"
+                    minlength="12"
+                    autocomplete="new-password"
+                  />
+                </label>
+                <p v-if="passwordNotice" class="text-sm text-green">{{ passwordNotice }}</p>
+                <button
+                  type="submit"
+                  class="btn-primary gap-2 text-sm"
+                  :disabled="passwordLoading || !currentPassword || newPassword.length < 12"
+                >
+                  <KeyRound class="h-4 w-4" aria-hidden="true" />
+                  Change password
+                </button>
+              </form>
+            </article>
+          </section>
+
+          <section class="grid gap-4 content-start">
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Sign-in methods</p>
+                  <h2 class="mt-2 text-xl font-semibold">Linked identities</h2>
+                </div>
+                <Globe class="h-5 w-5 text-accent" aria-hidden="true" />
+              </div>
+
+              <p class="mt-3 text-sm leading-6 text-muted">
+                External identities linked to this account.
+              </p>
+              <p v-if="identityNotice" class="mt-3 text-sm text-green">{{ identityNotice }}</p>
+              <div v-if="unlinkedOAuthProviders.length" class="mt-4 flex flex-wrap gap-2">
+                <button
+                  v-for="provider in unlinkedOAuthProviders"
                   :key="provider.id"
+                  type="button"
+                  class="btn-secondary gap-2 text-sm"
+                  :disabled="identityLoading === `link:${provider.id}`"
+                  @click="linkIdentity(provider)"
+                >
+                  <Link2 class="h-4 w-4" aria-hidden="true" />
+                  Link {{ provider.name }}
+                </button>
+              </div>
+              <div class="mt-4 grid gap-3">
+                <article v-if="!linkedIdentities.length" class="rounded-md border border-border bg-surface p-3 text-sm text-muted">
+                  No external identities linked.
+                </article>
+                <article
+                  v-for="identity in linkedIdentities"
+                  :key="identity.id"
                   class="rounded-md border border-border bg-surface p-3"
                 >
                   <div class="flex flex-wrap items-start justify-between gap-3">
                     <div class="min-w-0">
-                      <h3 class="font-semibold">{{ provider.name }}</h3>
-                      <p class="mt-1 break-all font-mono text-xs text-muted">{{ provider.id }}</p>
+                      <h3 class="font-semibold capitalize">{{ identity.provider }}</h3>
+                      <p class="mt-1 break-all font-mono text-xs text-muted">{{ identity.email || 'No provider email' }}</p>
                       <p class="mt-2 text-xs text-muted">
-                        {{ provider.scopes.join(' ') || 'default scopes' }}
+                        linked {{ new Date(identity.created_at).toLocaleString() }}
                       </p>
                     </div>
-                    <span
-                      class="rounded-md border px-2 py-1 font-mono text-xs"
-                      :class="provider.configured ? 'border-green/50 text-green' : 'border-border text-muted'"
+                    <button
+                      type="button"
+                      class="btn-secondary gap-2 text-sm"
+                      :disabled="identityLoading === identity.id"
+                      @click="unlinkIdentity(identity)"
                     >
-                      {{ provider.configured ? 'configured' : 'incomplete' }}
-                    </span>
+                      <Trash2 class="h-4 w-4" aria-hidden="true" />
+                      Unlink
+                    </button>
                   </div>
                 </article>
-              </template>
-            </div>
-            <p v-if="configuredOAuthProviders.length" class="mt-3 text-xs text-muted">
-              {{ configuredOAuthProviders.length }} provider{{ configuredOAuthProviders.length === 1 ? '' : 's' }} ready for hosted auth.
-            </p>
-          </article>
-
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Account</p>
-                <h2 class="mt-2 text-xl font-semibold">Linked identities</h2>
               </div>
-              <Globe class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
+            </article>
 
-            <p class="mt-3 text-sm leading-6 text-muted">
-              Review social identities connected to this account. Password accounts can unlink external identities; federated-only accounts must add another sign-in method first.
-            </p>
-            <p v-if="identityNotice" class="mt-3 text-sm text-green">{{ identityNotice }}</p>
-            <div v-if="unlinkedOAuthProviders.length" class="mt-4 flex flex-wrap gap-2">
-              <button
-                v-for="provider in unlinkedOAuthProviders"
-                :key="provider.id"
-                type="button"
-                class="btn-secondary gap-2 text-sm"
-                :disabled="identityLoading === `link:${provider.id}`"
-                @click="linkIdentity(provider)"
-              >
-                <Link2 class="h-4 w-4" aria-hidden="true" />
-                Link {{ provider.name }}
-              </button>
-            </div>
-            <div class="mt-4 grid gap-3">
-              <article v-if="!linkedIdentities.length" class="rounded-md border border-border bg-surface p-3 text-sm text-muted">
-                No external identities linked.
-              </article>
-              <article
-                v-for="identity in linkedIdentities"
-                :key="identity.id"
-                class="rounded-md border border-border bg-surface p-3"
-              >
-                <div class="flex flex-wrap items-start justify-between gap-3">
-                  <div class="min-w-0">
-                    <h3 class="font-semibold capitalize">{{ identity.provider }}</h3>
-                    <p class="mt-1 break-all font-mono text-xs text-muted">{{ identity.email || 'No provider email' }}</p>
-                    <p class="mt-2 text-xs text-muted">
-                      linked {{ new Date(identity.created_at).toLocaleString() }}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    class="btn-secondary gap-2 text-sm"
-                    :disabled="identityLoading === identity.id"
-                    @click="unlinkIdentity(identity)"
-                  >
-                    <Trash2 class="h-4 w-4" aria-hidden="true" />
-                    Unlink
-                  </button>
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Hosted auth</p>
+                  <h2 class="mt-2 text-xl font-semibold">Social providers</h2>
                 </div>
-              </article>
-            </div>
-          </article>
-
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Account</p>
-                <h2 class="mt-2 text-xl font-semibold">Export and deactivation</h2>
+                <Globe class="h-5 w-5 text-accent" aria-hidden="true" />
               </div>
-              <UserX class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
-
-            <div class="mt-4 grid gap-3 rounded-md border border-border bg-surface p-3 text-sm leading-6 text-muted">
-              <p>
-                Export returns profile, memberships, session metadata, connected apps, API-token metadata, linked identities, and recent audit events.
+              <p class="mt-3 text-sm leading-6 text-muted">
+                Providers available to hosted login and signup.
               </p>
-              <button type="button" class="btn-secondary gap-2 text-sm" :disabled="exportLoading" @click="exportAccount">
-                <Download class="h-4 w-4" aria-hidden="true" />
-                Download export
-              </button>
-              <p v-if="exportNotice" class="text-green">{{ exportNotice }}</p>
-            </div>
-
-            <form class="mt-4 grid gap-3 border-t border-border pt-4" @submit.prevent="deactivateAccount">
-              <label class="grid gap-2 text-sm text-muted">
-                Current password
-                <input
-                  v-model="deactivatePassword"
-                  class="input"
-                  type="password"
-                  autocomplete="current-password"
-                  placeholder="Required for password accounts"
-                />
-              </label>
-              <label class="grid gap-2 text-sm text-muted">
-                Authenticator code
-                <input
-                  v-model="deactivateTotpCode"
-                  class="input font-mono"
-                  inputmode="numeric"
-                  autocomplete="one-time-code"
-                  placeholder="Required if 2FA is enabled"
-                />
-              </label>
-              <label class="grid gap-2 text-sm text-muted">
-                Recovery code
-                <input
-                  v-model="deactivateRecoveryCode"
-                  class="input font-mono"
-                  autocomplete="one-time-code"
-                  placeholder="Optional backup code"
-                />
-              </label>
-              <label class="grid gap-2 text-sm text-muted">
-                Confirmation
-                <input v-model="deactivateConfirm" class="input font-mono" placeholder="DEACTIVATE" />
-              </label>
-              <p class="text-sm text-muted">
-                Deactivation suspends this account, revokes sessions, user-owned API tokens, and connected-app grants. Last owners must transfer ownership first.
+              <div class="mt-4 grid gap-3">
+                <article v-if="!oauthProviders.length" class="rounded-md border border-border bg-surface p-3 text-sm text-muted">
+                  No social providers configured.
+                </article>
+                <template v-else>
+                  <article
+                    v-for="provider in oauthProviders"
+                    :key="provider.id"
+                    class="rounded-md border border-border bg-surface p-3"
+                  >
+                    <div class="flex flex-wrap items-start justify-between gap-3">
+                      <div class="min-w-0">
+                        <h3 class="font-semibold">{{ provider.name }}</h3>
+                        <p class="mt-1 break-all font-mono text-xs text-muted">{{ provider.id }}</p>
+                        <p class="mt-2 text-xs text-muted">
+                          {{ provider.scopes.join(' ') || 'default scopes' }}
+                        </p>
+                      </div>
+                      <span
+                        class="rounded-md border px-2 py-1 font-mono text-xs"
+                        :class="provider.configured ? 'border-green/50 text-green' : 'border-border text-muted'"
+                      >
+                        {{ provider.configured ? 'configured' : 'incomplete' }}
+                      </span>
+                    </div>
+                  </article>
+                </template>
+              </div>
+              <p v-if="configuredOAuthProviders.length" class="mt-3 text-xs text-muted">
+                {{ configuredOAuthProviders.length }} provider{{ configuredOAuthProviders.length === 1 ? '' : 's' }} ready for hosted auth.
               </p>
-              <p v-if="deactivateNotice" class="text-sm text-green">{{ deactivateNotice }}</p>
-              <button
-                type="submit"
-                class="btn-secondary gap-2 text-sm"
-                :disabled="deactivateLoading || deactivateConfirm !== 'DEACTIVATE'"
-              >
-                <UserX class="h-4 w-4" aria-hidden="true" />
-                Deactivate account
-              </button>
-            </form>
-          </article>
+            </article>
+          </section>
+        </div>
 
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Account</p>
-                <h2 class="mt-2 text-xl font-semibold">Email</h2>
-              </div>
-              <Mail class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
-
-            <form class="mt-4 grid gap-3" @submit.prevent="requestEmailChange">
-              <label class="grid gap-2 text-sm text-muted">
-                New email
-                <input
-                  v-model="emailChangeNewEmail"
-                  class="input"
-                  type="email"
-                  autocomplete="email"
-                  placeholder="you@example.com"
-                  required
-                />
-              </label>
-              <label class="grid gap-2 text-sm text-muted">
-                Current password
-                <input
-                  v-model="emailChangePassword"
-                  class="input"
-                  type="password"
-                  autocomplete="current-password"
-                  placeholder="Required for password accounts"
-                />
-              </label>
-              <button
-                type="submit"
-                class="btn-primary gap-2 text-sm"
-                :disabled="emailChangeLoading || !emailChangeNewEmail || emailChangeNewEmail === status.user?.email"
-              >
-                <Mail class="h-4 w-4" aria-hidden="true" />
-                Send verification code
-              </button>
-            </form>
-
-            <form class="mt-4 grid gap-3 border-t border-border pt-4" @submit.prevent="confirmEmailChange">
-              <label class="grid gap-2 text-sm text-muted">
-                Verification code
-                <input
-                  v-model="emailChangeCode"
-                  class="input font-mono"
-                  inputmode="text"
-                  autocomplete="one-time-code"
-                  placeholder="ABC12345"
-                />
-              </label>
-              <p v-if="emailChangeNotice" class="text-sm text-green">{{ emailChangeNotice }}</p>
-              <button
-                type="submit"
-                class="btn-secondary gap-2 text-sm"
-                :disabled="emailChangeLoading || !emailChangePending || !emailChangeCode"
-              >
-                <CheckCircle2 class="h-4 w-4" aria-hidden="true" />
-                Confirm email change
-              </button>
-            </form>
-          </article>
-
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Account</p>
-                <h2 class="mt-2 text-xl font-semibold">Profile</h2>
-              </div>
-              <UserRound class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
-
-            <form class="mt-4 grid gap-3" @submit.prevent="saveProfile">
-              <label class="grid gap-2 text-sm text-muted">
-                Display name
-                <input
-                  v-model="displayName"
-                  class="input"
-                  autocomplete="name"
-                  maxlength="160"
-                  placeholder="Example User"
-                />
-              </label>
-              <p class="break-words font-mono text-xs text-muted">{{ status.user?.email }}</p>
-              <p v-if="accountNotice" class="text-sm text-green">{{ accountNotice }}</p>
-              <button type="submit" class="btn-primary gap-2 text-sm" :disabled="accountLoading">
-                <Save class="h-4 w-4" aria-hidden="true" />
-                Save profile
-              </button>
-            </form>
-          </article>
-
-          <article class="panel p-5">
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p class="mono-label">Account</p>
-                <h2 class="mt-2 text-xl font-semibold">Password</h2>
-              </div>
-              <LockKeyhole class="h-5 w-5 text-accent" aria-hidden="true" />
-            </div>
-
-            <form class="mt-4 grid gap-3" @submit.prevent="changePassword">
-              <label class="grid gap-2 text-sm text-muted">
-                Current password
-                <input
-                  v-model="currentPassword"
-                  class="input"
-                  type="password"
-                  autocomplete="current-password"
-                />
-              </label>
-              <label class="grid gap-2 text-sm text-muted">
-                New password
-                <input
-                  v-model="newPassword"
-                  class="input"
-                  type="password"
-                  minlength="12"
-                  autocomplete="new-password"
-                />
-              </label>
-              <p v-if="passwordNotice" class="text-sm text-green">{{ passwordNotice }}</p>
-              <button
-                type="submit"
-                class="btn-primary gap-2 text-sm"
-                :disabled="passwordLoading || !currentPassword || newPassword.length < 12"
-              >
-                <KeyRound class="h-4 w-4" aria-hidden="true" />
-                Change password
-              </button>
-            </form>
-          </article>
-
+        <div v-else-if="activeSection === 'security'" class="grid gap-6 xl:grid-cols-[1.1fr_0.9fr]">
           <article class="panel p-5">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
@@ -1311,14 +1342,14 @@ onMounted(load)
               <pre class="overflow-x-auto rounded-md bg-bg p-3 font-mono text-xs leading-5 text-muted">{{ recoveryCodesText }}</pre>
             </div>
 
-            <div v-if="totpSetup" class="mt-4 grid gap-3">
+            <div v-if="totpSetup" class="mt-4 grid gap-4 lg:grid-cols-[17rem_1fr]">
               <div class="grid gap-3 rounded-md border border-border bg-surface p-3">
                 <div class="flex flex-wrap items-center justify-between gap-3">
                   <span class="font-mono text-xs text-muted">qr code</span>
                   <span class="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted">local</span>
                 </div>
-                <div class="flex flex-wrap items-center gap-4">
-                  <div class="grid size-60 place-items-center rounded-md border border-border bg-white p-3">
+                <div class="grid place-items-start gap-4">
+                  <div class="grid size-60 max-w-full place-items-center rounded-md border border-border bg-white p-3">
                     <img
                       v-if="totpQrDataUrl"
                       :src="totpQrDataUrl"
@@ -1327,41 +1358,43 @@ onMounted(load)
                     />
                     <p v-else class="text-center font-mono text-xs text-bg">Generating QR</p>
                   </div>
-                  <p class="max-w-sm text-sm leading-6 text-muted">
+                  <p class="text-sm leading-6 text-muted">
                     Scan this with an authenticator app, then enter the generated code to finish setup.
                   </p>
                 </div>
                 <p v-if="totpQrError" class="text-sm text-yellow">{{ totpQrError }}</p>
               </div>
 
-              <div class="grid gap-2">
-                <div class="flex items-center justify-between gap-3">
-                  <span class="font-mono text-xs text-muted">secret</span>
-                  <button
-                    type="button"
-                    class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
-                    @click="copyText('totp-secret', totpSetup.secret)"
-                  >
-                    <Copy class="h-3.5 w-3.5" aria-hidden="true" />
-                    {{ copiedKey === 'totp-secret' ? 'Copied' : 'Copy' }}
-                  </button>
+              <div class="grid content-start gap-3">
+                <div class="grid gap-2">
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="font-mono text-xs text-muted">secret</span>
+                    <button
+                      type="button"
+                      class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
+                      @click="copyText('totp-secret', totpSetup.secret)"
+                    >
+                      <Copy class="h-3.5 w-3.5" aria-hidden="true" />
+                      {{ copiedKey === 'totp-secret' ? 'Copied' : 'Copy' }}
+                    </button>
+                  </div>
+                  <pre class="overflow-x-auto rounded-md bg-bg p-3 font-mono text-xs text-muted">{{ totpSetup.secret }}</pre>
                 </div>
-                <pre class="overflow-x-auto rounded-md bg-bg p-3 font-mono text-xs text-muted">{{ totpSetup.secret }}</pre>
-              </div>
 
-              <div class="grid gap-2">
-                <div class="flex items-center justify-between gap-3">
-                  <span class="font-mono text-xs text-muted">otpauth uri</span>
-                  <button
-                    type="button"
-                    class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
-                    @click="copyText('totp-uri', totpSetup.otpauth_uri)"
-                  >
-                    <Copy class="h-3.5 w-3.5" aria-hidden="true" />
-                    {{ copiedKey === 'totp-uri' ? 'Copied' : 'Copy' }}
-                  </button>
+                <div class="grid gap-2">
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="font-mono text-xs text-muted">otpauth uri</span>
+                    <button
+                      type="button"
+                      class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
+                      @click="copyText('totp-uri', totpSetup.otpauth_uri)"
+                    >
+                      <Copy class="h-3.5 w-3.5" aria-hidden="true" />
+                      {{ copiedKey === 'totp-uri' ? 'Copied' : 'Copy' }}
+                    </button>
+                  </div>
+                  <pre class="max-h-24 overflow-auto rounded-md bg-bg p-3 font-mono text-xs leading-5 text-muted">{{ totpSetup.otpauth_uri }}</pre>
                 </div>
-                <pre class="max-h-24 overflow-auto rounded-md bg-bg p-3 font-mono text-xs leading-5 text-muted">{{ totpSetup.otpauth_uri }}</pre>
               </div>
             </div>
 
@@ -1421,118 +1454,219 @@ onMounted(load)
             </div>
           </article>
 
-          <article class="panel p-5">
-            <p class="mono-label">Next actions</p>
-            <div class="mt-4 grid gap-3">
-              <RouterLink
-                to="/clients"
-                class="btn-secondary justify-start gap-2 text-sm"
-                :class="{ 'pointer-events-none opacity-60': !status.can_manage_clients }"
-              >
-                <MonitorCog class="h-4 w-4" aria-hidden="true" />
-                Register app client
-              </RouterLink>
-              <RouterLink
-                to="/providers"
-                class="btn-secondary justify-start gap-2 text-sm"
-                :class="{ 'pointer-events-none opacity-60': !status.scopes.includes('*') }"
-              >
-                <Globe class="h-4 w-4" aria-hidden="true" />
-                Configure social provider
-              </RouterLink>
-              <RouterLink
-                to="/tokens"
-                class="btn-secondary justify-start gap-2 text-sm"
-                :class="{ 'pointer-events-none opacity-60': !status.can_issue_tokens }"
-              >
-                <KeyRound class="h-4 w-4" aria-hidden="true" />
-                Create service token
-              </RouterLink>
-              <RouterLink
-                to="/device"
-                class="btn-secondary justify-start gap-2 text-sm"
-                :class="{ 'pointer-events-none opacity-60': !cliClient }"
-              >
-                <Terminal class="h-4 w-4" aria-hidden="true" />
-                Approve CLI device login
-              </RouterLink>
-            </div>
-          </article>
+          <section class="grid gap-4 content-start">
+            <article class="panel p-5">
+              <p class="mono-label">Security routes</p>
+              <div class="mt-4 grid gap-3">
+                <RouterLink
+                  v-for="shortcut in operatorShortcuts.filter((item) => ['sessions', 'policy', 'audit'].includes(item.key))"
+                  :key="shortcut.key"
+                  :to="shortcut.to"
+                  class="grid gap-2 rounded-md border border-border bg-surface p-3 transition hover:border-border-active"
+                  :class="{ 'pointer-events-none opacity-50': !shortcut.enabled }"
+                >
+                  <span class="flex items-center justify-between gap-3">
+                    <span class="inline-flex items-center gap-2 font-semibold">
+                      <component :is="shortcut.icon" class="h-4 w-4 text-accent" aria-hidden="true" />
+                      {{ shortcut.title }}
+                    </span>
+                    <span class="font-mono text-xs text-muted">{{ shortcut.enabled ? 'open' : 'locked' }}</span>
+                  </span>
+                  <span class="text-sm leading-6 text-muted">{{ shortcut.detail }}</span>
+                </RouterLink>
+              </div>
+            </article>
 
-          <article class="panel p-5">
-            <div class="flex items-center justify-between gap-3">
-              <p class="mono-label">Integration values</p>
-              <button type="button" class="btn-secondary min-h-9 gap-2 px-3 text-xs" @click="copySnippet">
-                <Copy class="h-3.5 w-3.5" aria-hidden="true" />
-                {{ copiedKey === 'env' ? 'Copied' : 'Copy' }}
-              </button>
-            </div>
-            <pre class="mt-4 overflow-x-auto rounded-md bg-bg p-3 text-xs text-muted">{{ integrationSnippet }}</pre>
-          </article>
-        </section>
-      </div>
-
-      <section class="grid gap-3">
-        <div class="flex items-center justify-between gap-3">
-          <p class="mono-label">Integration surfaces</p>
-          <span class="font-mono text-xs text-muted">{{ integrationSurfaces.length }} paths</span>
-        </div>
-        <div class="grid gap-4 xl:grid-cols-2">
-          <article
-            v-for="surface in integrationSurfaces"
-            :key="surface.key"
-            class="panel grid gap-4 p-4"
-          >
-            <div class="flex flex-wrap items-start justify-between gap-3">
-              <div class="flex items-start gap-3">
-                <span class="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-border bg-surface text-accent">
-                  <component :is="surface.icon" class="h-4 w-4" aria-hidden="true" />
-                </span>
-                <div>
-                  <h2 class="font-semibold">{{ surface.title }}</h2>
-                  <p class="mt-1 font-mono text-xs text-muted">{{ surface.status }}</p>
+            <article class="panel p-5">
+              <p class="mono-label">Session</p>
+              <div class="mt-4 grid gap-3 text-sm leading-6 text-muted">
+                <div class="rounded-md border border-border bg-surface p-3">
+                  <p class="font-semibold text-fg">{{ status.owner_exists ? 'Owner path ready' : 'Owner missing' }}</p>
+                  <p class="mt-1">{{ sessionSummary }}</p>
+                </div>
+                <div class="rounded-md border border-border bg-surface p-3">
+                  <p class="font-semibold text-fg">{{ status.smtp_configured ? 'SMTP configured' : 'Email dev mode' }}</p>
+                  <p class="mt-1">
+                    {{ status.email_dev_mode ? 'Codes are not delivered by SMTP.' : 'Email delivery is available.' }}
+                  </p>
                 </div>
               </div>
-              <RouterLink :to="surface.to" class="btn-secondary min-h-9 px-3 text-xs">
-                {{ surface.cta }}
-              </RouterLink>
-            </div>
-            <div class="grid gap-2">
-              <div class="flex items-center justify-between gap-3">
-                <span class="font-mono text-xs text-muted">copy block</span>
-                <button
-                  type="button"
-                  class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
-                  @click="copyText(surface.key, surface.snippet)"
+            </article>
+          </section>
+        </div>
+
+        <div v-else-if="activeSection === 'integrations'" class="grid gap-6">
+          <section class="grid gap-4 md:grid-cols-4">
+            <article class="panel p-5">
+              <p class="text-sm text-muted">Clients</p>
+              <h2 class="mt-2 text-3xl font-semibold">{{ clients.length }}</h2>
+            </article>
+            <article class="panel p-5">
+              <p class="text-sm text-muted">Active tokens</p>
+              <h2 class="mt-2 text-3xl font-semibold">{{ activeTokens.length }}</h2>
+            </article>
+            <article class="panel p-5">
+              <p class="text-sm text-muted">Projects</p>
+              <h2 class="mt-2 text-3xl font-semibold">{{ projects.length }}</h2>
+            </article>
+            <article class="panel p-5">
+              <p class="text-sm text-muted">MCP resources</p>
+              <h2 class="mt-2 text-3xl font-semibold">{{ canManageMcp ? mcpResources.length : 'locked' }}</h2>
+            </article>
+          </section>
+
+          <section class="grid gap-6 lg:grid-cols-[0.8fr_1.2fr]">
+            <article class="panel p-5">
+              <p class="mono-label">Capabilities</p>
+              <div class="mt-4 flex flex-wrap gap-2">
+                <span
+                  v-for="permission in permissions"
+                  :key="permission"
+                  class="rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs text-muted"
                 >
+                  {{ permission }}
+                </span>
+                <span v-if="!permissions.length" class="text-sm text-muted">No org permissions returned.</span>
+              </div>
+            </article>
+
+            <article class="panel p-5">
+              <div class="flex items-center justify-between gap-3">
+                <p class="mono-label">Integration values</p>
+                <button type="button" class="btn-secondary min-h-9 gap-2 px-3 text-xs" @click="copySnippet">
                   <Copy class="h-3.5 w-3.5" aria-hidden="true" />
-                  {{ copiedKey === surface.key ? 'Copied' : 'Copy' }}
+                  {{ copiedKey === 'env' ? 'Copied' : 'Copy' }}
                 </button>
               </div>
-              <pre class="min-h-28 overflow-x-auto rounded-md bg-bg p-3 text-xs leading-5 text-muted">{{ surface.snippet }}</pre>
+              <pre class="mt-4 overflow-x-auto rounded-md bg-bg p-3 text-xs text-muted">{{ integrationSnippet }}</pre>
+            </article>
+          </section>
+
+          <section class="grid gap-3">
+            <div class="flex items-center justify-between gap-3">
+              <p class="mono-label">Integration surfaces</p>
+              <span class="font-mono text-xs text-muted">{{ integrationSurfaces.length }} paths</span>
             </div>
+            <div class="grid gap-4 xl:grid-cols-2">
+              <article
+                v-for="surface in integrationSurfaces"
+                :key="surface.key"
+                class="panel grid gap-4 p-4"
+              >
+                <div class="flex flex-wrap items-start justify-between gap-3">
+                  <div class="flex items-start gap-3">
+                    <span class="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-border bg-surface text-accent">
+                      <component :is="surface.icon" class="h-4 w-4" aria-hidden="true" />
+                    </span>
+                    <div>
+                      <h2 class="font-semibold">{{ surface.title }}</h2>
+                      <p class="mt-1 font-mono text-xs text-muted">{{ surface.status }}</p>
+                    </div>
+                  </div>
+                  <RouterLink :to="surface.to" class="btn-secondary min-h-9 px-3 text-xs">
+                    {{ surface.cta }}
+                  </RouterLink>
+                </div>
+                <div class="grid gap-2">
+                  <div class="flex items-center justify-between gap-3">
+                    <span class="font-mono text-xs text-muted">copy block</span>
+                    <button
+                      type="button"
+                      class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
+                      @click="copyText(surface.key, surface.snippet)"
+                    >
+                      <Copy class="h-3.5 w-3.5" aria-hidden="true" />
+                      {{ copiedKey === surface.key ? 'Copied' : 'Copy' }}
+                    </button>
+                  </div>
+                  <pre class="min-h-28 overflow-x-auto rounded-md bg-bg p-3 text-xs leading-5 text-muted">{{ surface.snippet }}</pre>
+                </div>
+              </article>
+            </div>
+          </section>
+        </div>
+
+        <div v-else-if="activeSection === 'advanced'" class="grid gap-6 lg:grid-cols-[0.9fr_1.1fr]">
+          <article class="panel p-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="mono-label">Account data</p>
+                <h2 class="mt-2 text-xl font-semibold">Export</h2>
+              </div>
+              <Download class="h-5 w-5 text-accent" aria-hidden="true" />
+            </div>
+
+            <div class="mt-4 grid gap-3 rounded-md border border-border bg-surface p-3 text-sm leading-6 text-muted">
+              <p>
+                Export includes profile, memberships, session metadata, connected apps, API-token metadata, linked identities, and recent audit events.
+              </p>
+              <button type="button" class="btn-secondary gap-2 text-sm" :disabled="exportLoading" @click="exportAccount">
+                <Download class="h-4 w-4" aria-hidden="true" />
+                Download export
+              </button>
+              <p v-if="exportNotice" class="text-green">{{ exportNotice }}</p>
+            </div>
+          </article>
+
+          <article class="panel p-5">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="mono-label">Danger zone</p>
+                <h2 class="mt-2 text-xl font-semibold">Deactivation</h2>
+              </div>
+              <UserX class="h-5 w-5 text-accent" aria-hidden="true" />
+            </div>
+
+            <form class="mt-4 grid gap-3" @submit.prevent="deactivateAccount">
+              <label class="grid gap-2 text-sm text-muted">
+                Current password
+                <input
+                  v-model="deactivatePassword"
+                  class="input"
+                  type="password"
+                  autocomplete="current-password"
+                  placeholder="Required for password accounts"
+                />
+              </label>
+              <label class="grid gap-2 text-sm text-muted">
+                Authenticator code
+                <input
+                  v-model="deactivateTotpCode"
+                  class="input font-mono"
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  placeholder="Required if 2FA is enabled"
+                />
+              </label>
+              <label class="grid gap-2 text-sm text-muted">
+                Recovery code
+                <input
+                  v-model="deactivateRecoveryCode"
+                  class="input font-mono"
+                  autocomplete="one-time-code"
+                  placeholder="Optional backup code"
+                />
+              </label>
+              <label class="grid gap-2 text-sm text-muted">
+                Confirmation
+                <input v-model="deactivateConfirm" class="input font-mono" placeholder="DEACTIVATE" />
+              </label>
+              <p class="text-sm text-muted">
+                Deactivation suspends this account, revokes sessions, user-owned API tokens, and connected-app grants. Last owners must transfer ownership first.
+              </p>
+              <p v-if="deactivateNotice" class="text-sm text-green">{{ deactivateNotice }}</p>
+              <button
+                type="submit"
+                class="btn-secondary gap-2 text-sm"
+                :disabled="deactivateLoading || deactivateConfirm !== 'DEACTIVATE'"
+              >
+                <UserX class="h-4 w-4" aria-hidden="true" />
+                Deactivate account
+              </button>
+            </form>
           </article>
         </div>
       </section>
-
-      <div class="grid gap-4 md:grid-cols-4">
-        <article class="panel p-5">
-          <p class="text-sm text-muted">Clients</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ clients.length }}</h2>
-        </article>
-        <article class="panel p-5">
-          <p class="text-sm text-muted">Active tokens</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ activeTokens.length }}</h2>
-        </article>
-        <article class="panel p-5">
-          <p class="text-sm text-muted">Projects</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ projects.length }}</h2>
-        </article>
-        <article class="panel p-5">
-          <p class="text-sm text-muted">MCP resources</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ canManageMcp ? mcpResources.length : 'locked' }}</h2>
-        </article>
-      </div>
     </div>
   </section>
 </template>
