@@ -231,7 +231,7 @@ instead of the auth-provider model.
   session revocation surface. The provider API now supports org-bound session
   switching, and the Python SDK now includes FastAPI helpers for MCP
   protected-resource metadata and `WWW-Authenticate` challenges. The CLI now
-  supports install readiness checks with `gatekeeper doctor`, copy-once
+  supports install readiness checks with `b3n-gatekeeper doctor`, copy-once
   API-token rotation, and API-token validation with audience, scope, org, and
   project checks. Adaptive risk signals and richer policy controls still need
   work.

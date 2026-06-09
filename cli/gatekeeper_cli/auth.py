@@ -13,7 +13,7 @@ from rich.console import Console
 
 from gatekeeper_cli.config import APP_DIR, CREDENTIALS_FILE
 
-SERVICE = "gatekeeper"
+SERVICE = "b3n-gatekeeper"
 console = Console()
 
 
@@ -118,7 +118,7 @@ def refresh_access_token(base_url: str) -> str | None:
 
 
 def load_access_token(base_url: str) -> str | None:
-    override = os.environ.get("GATEKEEPER_TOKEN") or os.environ.get("GATEKEEPER_ACCESS_TOKEN")
+    override = os.environ.get("B3N_GATEKEEPER_TOKEN") or os.environ.get("B3N_GATEKEEPER_ACCESS_TOKEN")
     if override:
         return override
     data = _read_credentials()
