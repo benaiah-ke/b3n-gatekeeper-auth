@@ -27,7 +27,8 @@ import {
   Users,
   UserX,
 } from 'lucide-vue-next'
-import { computed, onMounted, ref } from 'vue'
+import QRCode from 'qrcode'
+import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 
 import { api, clearTokens } from '@/services/api'
@@ -70,6 +71,8 @@ const totpCode = ref('')
 const recoveryCodes = ref<string[]>([])
 const mfaNotice = ref('')
 const mfaLoading = ref(false)
+const totpQrDataUrl = ref('')
+const totpQrError = ref('')
 const loading = ref(true)
 const error = ref('')
 const copiedKey = ref('')
@@ -127,6 +130,31 @@ const mfaDetail = computed(() => {
 })
 
 const recoveryCodesText = computed(() => recoveryCodes.value.join('\n'))
+
+watch(
+  () => totpSetup.value?.otpauth_uri || '',
+  async (otpauthUri) => {
+    totpQrDataUrl.value = ''
+    totpQrError.value = ''
+    if (!otpauthUri) {
+      return
+    }
+    try {
+      totpQrDataUrl.value = await QRCode.toDataURL(otpauthUri, {
+        color: {
+          dark: '#050507',
+          light: '#ffffff',
+        },
+        errorCorrectionLevel: 'M',
+        margin: 2,
+        scale: 6,
+        width: 224,
+      })
+    } catch {
+      totpQrError.value = 'QR unavailable. Use the manual setup values below.'
+    }
+  },
+)
 
 const setupSteps = computed(() => [
   {
@@ -1284,6 +1312,28 @@ onMounted(load)
             </div>
 
             <div v-if="totpSetup" class="mt-4 grid gap-3">
+              <div class="grid gap-3 rounded-md border border-border bg-surface p-3">
+                <div class="flex flex-wrap items-center justify-between gap-3">
+                  <span class="font-mono text-xs text-muted">qr code</span>
+                  <span class="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted">local</span>
+                </div>
+                <div class="flex flex-wrap items-center gap-4">
+                  <div class="grid size-60 place-items-center rounded-md border border-border bg-white p-3">
+                    <img
+                      v-if="totpQrDataUrl"
+                      :src="totpQrDataUrl"
+                      alt="Authenticator QR code"
+                      class="size-full"
+                    />
+                    <p v-else class="text-center font-mono text-xs text-bg">Generating QR</p>
+                  </div>
+                  <p class="max-w-sm text-sm leading-6 text-muted">
+                    Scan this with an authenticator app, then enter the generated code to finish setup.
+                  </p>
+                </div>
+                <p v-if="totpQrError" class="text-sm text-yellow">{{ totpQrError }}</p>
+              </div>
+
               <div class="grid gap-2">
                 <div class="flex items-center justify-between gap-3">
                   <span class="font-mono text-xs text-muted">secret</span>

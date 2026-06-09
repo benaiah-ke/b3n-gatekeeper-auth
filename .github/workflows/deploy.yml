@@ -48,7 +48,7 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile=false
-      - run: pnpm --filter @b3n/gatekeeper-ui build
+      - run: pnpm --filter gatekeeper-ui build
 
   images:
     if: github.ref == 'refs/heads/main'
