@@ -624,6 +624,8 @@ class DeviceAuthorizeApprove(BaseModel):
     user_code: str
     approve: bool = True
     org_id: str | None = None
+    totp_code: str | None = None
+    recovery_code: str | None = None
 
 
 class OAuthAuthorizeRequest(BaseModel):

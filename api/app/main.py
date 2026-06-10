@@ -5214,6 +5214,15 @@ async def approve_device(
             await ensure_user_org_membership(db, user_id=user.id, org_id=selected_org_id)
         elif client.require_org_membership:
             raise HTTPException(status_code=403, detail="Organization membership required")
+        if user.mfa_totp_enabled_at:
+            if body.totp_code:
+                verify_user_totp(user, body.totp_code)
+                if "otp" not in amr:
+                    amr.append("otp")
+            elif body.recovery_code:
+                await verify_user_recovery_code(db, user, body.recovery_code)
+                if "recovery" not in amr:
+                    amr.append("recovery")
         await enforce_client_and_org_mfa_policy(
             db,
             client=client,

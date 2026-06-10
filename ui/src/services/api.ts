@@ -562,10 +562,16 @@ export const api = {
       return result
     })
   },
-  approveDevice(userCode: string, approve = true, orgId?: string) {
+  approveDevice(userCode: string, approve = true, orgId?: string, totpCode?: string, recoveryCode?: string) {
     return request<{ status: string }>('/api/v1/auth/device/approve', {
       method: 'POST',
-      body: JSON.stringify({ user_code: userCode, approve, org_id: orgId || null }),
+      body: JSON.stringify({
+        user_code: userCode,
+        approve,
+        org_id: orgId || null,
+        totp_code: totpCode || null,
+        recovery_code: recoveryCode || null,
+      }),
     })
   },
   clients() {

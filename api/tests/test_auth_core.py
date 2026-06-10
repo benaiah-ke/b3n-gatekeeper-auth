@@ -2605,6 +2605,33 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
         device_claims = decode_access_token(device_token.json()["access_token"], audience="mfa-api")
         assert device_claims["amr"] == ["pwd", "otp"]
 
+        inline_mfa_device = await ac.post(
+            "/oauth/device_authorization",
+            json={"client_id": created.json()["client_id"], "scope": "api:read", "audience": "mfa-api"},
+        )
+        assert inline_mfa_device.status_code == 200
+        inline_mfa_approve = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers={"Authorization": f"Bearer {setup_access}"},
+            json={
+                "user_code": inline_mfa_device.json()["user_code"],
+                "approve": True,
+                "totp_code": totp_code(secret),
+            },
+        )
+        assert inline_mfa_approve.status_code == 200
+        inline_device_token = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": inline_mfa_device.json()["device_code"],
+                "client_id": created.json()["client_id"],
+            },
+        )
+        assert inline_device_token.status_code == 200
+        inline_device_claims = decode_access_token(inline_device_token.json()["access_token"], audience="mfa-api")
+        assert inline_device_claims["amr"] == ["pwd", "otp"]
+
 
 @pytest.mark.asyncio
 async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
