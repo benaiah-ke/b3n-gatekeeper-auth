@@ -99,7 +99,7 @@ onMounted(loadProviders)
             <span>GateKeeper</span>
           </div>
           <p class="mono-label mt-12">Control plane auth</p>
-          <h2 class="mt-3 max-w-lg font-serif text-5xl leading-[0.98] sm:text-6xl">Sign in to the trust boundary.</h2>
+          <h2 class="mt-3 max-w-lg text-3xl font-semibold leading-tight sm:text-4xl">Sign in to the trust boundary.</h2>
           <p class="mt-5 max-w-md text-sm leading-6 text-muted">
             Use an owner, admin, or operator account to manage sessions, clients, project tokens, and audit events.
           </p>
@@ -123,7 +123,7 @@ onMounted(loadProviders)
 
       <form class="auth-card" @submit.prevent="submit">
         <p class="mono-label">GateKeeper</p>
-        <h1 class="mt-3 font-serif text-4xl leading-none">{{ isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight">{{ isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
         <p class="mt-3 text-sm leading-6 text-muted">
           {{ isStepUp ? 'This application requires a fresh MFA-backed GateKeeper session.' : 'Manage auth from your self-hosted control plane.' }}
         </p>

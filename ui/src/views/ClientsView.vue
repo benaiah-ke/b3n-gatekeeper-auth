@@ -368,7 +368,7 @@ onMounted(load)
 <template>
   <section class="mx-auto max-w-6xl px-4 py-8 md:px-8">
     <p class="mono-label">OAuth clients</p>
-    <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">Application registration</h1>
+    <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Application registration</h1>
     <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
       Register UI apps, service clients, CLIs, and MCP resources with explicit redirects, origins, audiences, and scopes.
     </p>

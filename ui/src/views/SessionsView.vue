@@ -125,7 +125,7 @@ onMounted(load)
 <template>
   <section class="mx-auto max-w-6xl px-4 py-10 md:px-8">
     <p class="mono-label">Sessions</p>
-    <h1 class="mt-3 font-serif text-5xl">Active sessions</h1>
+    <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Active sessions</h1>
     <p class="mt-3 max-w-2xl text-sm text-muted">
       Review browser and API sessions, then revoke anything that should no longer be trusted.
     </p>

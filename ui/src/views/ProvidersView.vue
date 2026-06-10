@@ -246,7 +246,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Social auth</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">OIDC providers</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">OIDC providers</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Manage the sign-in providers shown on hosted and product-owned auth screens.
         </p>

@@ -82,7 +82,7 @@ function resetApproval() {
       <div class="flex flex-wrap items-start justify-between gap-4">
         <div>
           <p class="mono-label">CLI</p>
-          <h1 class="mt-3 font-serif text-4xl leading-none sm:text-5xl">Device login</h1>
+          <h1 class="mt-3 text-2xl font-semibold leading-tight sm:text-3xl">Device login</h1>
         </div>
         <span
           class="inline-flex min-h-9 items-center gap-2 rounded-md border px-3 font-mono text-xs"

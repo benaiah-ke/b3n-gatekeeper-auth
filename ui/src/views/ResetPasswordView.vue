@@ -27,7 +27,7 @@ async function submit() {
   <section class="grid min-h-svh place-items-center px-4 py-10">
     <form class="panel w-full max-w-md p-6" @submit.prevent="submit">
       <p class="mono-label">Account</p>
-      <h1 class="mt-3 font-serif text-4xl">Reset password</h1>
+      <h1 class="mt-3 text-2xl font-semibold leading-tight">Reset password</h1>
       <div class="mt-8 grid gap-4">
         <input v-model="email" class="input" type="email" placeholder="Email" required />
         <button class="btn-primary" :disabled="loading">{{ loading ? 'Sending' : 'Send reset code' }}</button>

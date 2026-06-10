@@ -43,7 +43,7 @@ async function switchOrg(org: Org) {
 <template>
   <section class="mx-auto max-w-4xl px-4 py-10 md:px-8">
     <p class="mono-label">Organizations</p>
-    <h1 class="mt-3 font-serif text-4xl">Select org</h1>
+    <h1 class="mt-3 text-2xl font-semibold leading-tight">Select org</h1>
     <div class="mt-8 grid gap-3">
       <article v-if="loading" class="panel p-4 text-sm text-muted">Loading organizations...</article>
       <article v-else-if="error" class="rounded-md border border-red/40 bg-red/10 p-4 text-sm text-red">

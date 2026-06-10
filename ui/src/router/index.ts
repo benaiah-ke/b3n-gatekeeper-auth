@@ -36,6 +36,7 @@ const router = createRouter({
     { path: '/reset-password', component: ResetPasswordView },
     { path: '/device', component: DeviceLoginView },
     { path: '/authorize', component: AuthorizeView },
+    { path: '/oauth/authorize', component: AuthorizeView },
     { path: '/select-org', component: OrgSelectView },
     { path: '/account', component: AccountView },
     { path: '/users', component: UsersView },

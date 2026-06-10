@@ -823,7 +823,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Account console</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">GateKeeper account</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">GateKeeper account</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Manage operator identity, security, setup readiness, and integration values from focused account sections.
         </p>
@@ -912,7 +912,7 @@ onMounted(load)
               <div class="flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <p class="mono-label">Readiness</p>
-                  <h2 class="mt-2 text-3xl font-semibold">{{ setupCompletionPercent }}%</h2>
+                  <h2 class="mt-2 text-2xl font-semibold">{{ setupCompletionPercent }}%</h2>
                 </div>
                 <span
                   class="inline-flex min-h-9 items-center gap-2 rounded-md border px-3 font-mono text-xs"
@@ -1499,19 +1499,19 @@ onMounted(load)
           <section class="grid gap-4 md:grid-cols-4">
             <article class="panel p-5">
               <p class="text-sm text-muted">Clients</p>
-              <h2 class="mt-2 text-3xl font-semibold">{{ clients.length }}</h2>
+              <h2 class="mt-2 text-2xl font-semibold">{{ clients.length }}</h2>
             </article>
             <article class="panel p-5">
               <p class="text-sm text-muted">Active tokens</p>
-              <h2 class="mt-2 text-3xl font-semibold">{{ activeTokens.length }}</h2>
+              <h2 class="mt-2 text-2xl font-semibold">{{ activeTokens.length }}</h2>
             </article>
             <article class="panel p-5">
               <p class="text-sm text-muted">Projects</p>
-              <h2 class="mt-2 text-3xl font-semibold">{{ projects.length }}</h2>
+              <h2 class="mt-2 text-2xl font-semibold">{{ projects.length }}</h2>
             </article>
             <article class="panel p-5">
               <p class="text-sm text-muted">MCP resources</p>
-              <h2 class="mt-2 text-3xl font-semibold">{{ canManageMcp ? mcpResources.length : 'locked' }}</h2>
+              <h2 class="mt-2 text-2xl font-semibold">{{ canManageMcp ? mcpResources.length : 'locked' }}</h2>
             </article>
           </section>
 

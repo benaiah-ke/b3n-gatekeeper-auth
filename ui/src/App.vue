@@ -22,7 +22,16 @@ import { api } from '@/services/api'
 
 const route = useRoute()
 const router = useRouter()
-const authRoutes = ['/login', '/signup', '/verify', '/reset-password', '/device', '/accept-invite', '/authorize']
+const authRoutes = [
+  '/login',
+  '/signup',
+  '/verify',
+  '/reset-password',
+  '/device',
+  '/accept-invite',
+  '/authorize',
+  '/oauth/authorize',
+]
 const isAuthRoute = computed(() => authRoutes.includes(route.path))
 
 const nav: Array<{ path: string; label: string; icon: Component }> = [
@@ -63,7 +72,7 @@ async function signOut() {
           GK
         </span>
         <div>
-          <p class="font-serif text-2xl leading-none">GateKeeper</p>
+          <p class="text-base font-semibold leading-none">GateKeeper</p>
           <p class="mono-label mt-1">AUTH / 01</p>
         </div>
       </RouterLink>
@@ -90,7 +99,7 @@ async function signOut() {
             <span class="grid h-8 w-8 place-items-center rounded-md border border-border bg-surface font-mono text-xs text-accent">
               GK
             </span>
-            <span class="font-serif text-xl">GateKeeper</span>
+            <span class="text-base font-semibold">GateKeeper</span>
           </RouterLink>
           <div class="hidden lg:block">
             <p class="mono-label">AUTH CONTROL</p>

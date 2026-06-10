@@ -201,7 +201,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Users</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">User administration</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">User administration</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Review accounts, assign roles, suspend access, verify email state, and revoke sessions from one provider surface.
         </p>
@@ -234,23 +234,23 @@ onMounted(load)
       <div class="grid gap-4 md:grid-cols-5">
         <article class="panel p-5">
           <p class="text-sm text-muted">Users</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ users.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ users.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Active</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ activeUsers.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ activeUsers.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Suspended</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ disabledUsers.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ disabledUsers.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">2FA</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ mfaUsers.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ mfaUsers.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Owners</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ owners.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ owners.length }}</h2>
         </article>
       </div>
 

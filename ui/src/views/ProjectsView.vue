@@ -110,7 +110,7 @@ onMounted(load)
 <template>
   <section class="mx-auto max-w-6xl px-4 py-8 md:px-8">
     <p class="mono-label">Workspaces</p>
-    <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">Projects and audiences</h1>
+    <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Projects and audiences</h1>
     <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
       Bind audiences to workspaces and projects before issuing project or machine credentials.
     </p>
@@ -131,15 +131,15 @@ onMounted(load)
       <div class="grid gap-4 md:grid-cols-3">
         <article class="panel p-5">
           <p class="text-sm text-muted">Workspaces</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ workspaces.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ workspaces.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Projects</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ projects.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ projects.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Audiences</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ audienceSummaries.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ audienceSummaries.length }}</h2>
         </article>
       </div>
 

@@ -106,7 +106,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Invitations</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">Invite users</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Invite users</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Add people to an organization with an audited, scoped invitation that can be accepted through the API or hosted UI.
         </p>
@@ -129,11 +129,11 @@ onMounted(load)
       <div class="grid gap-4 md:grid-cols-3">
         <article class="panel p-5">
           <p class="text-sm text-muted">Pending</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ pendingInvitations.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ pendingInvitations.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Accepted</p>
-          <h2 class="mt-2 text-3xl font-semibold">{{ acceptedInvitations.length }}</h2>
+          <h2 class="mt-2 text-2xl font-semibold">{{ acceptedInvitations.length }}</h2>
         </article>
         <article class="panel p-5">
           <p class="text-sm text-muted">Organization</p>

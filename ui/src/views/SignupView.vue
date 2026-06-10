@@ -74,7 +74,7 @@ onMounted(loadProviders)
             <span>GateKeeper</span>
           </div>
           <p class="mono-label mt-12">Self-host setup</p>
-          <h2 class="mt-3 max-w-lg font-serif text-5xl leading-[0.98] sm:text-6xl">Own the auth layer.</h2>
+          <h2 class="mt-3 max-w-lg text-3xl font-semibold leading-tight sm:text-4xl">Own the auth layer.</h2>
           <p class="mt-5 max-w-md text-sm leading-6 text-muted">
             Create the first owner, then connect products through OAuth clients, scoped tokens, and
             API-first sessions.
@@ -99,7 +99,7 @@ onMounted(loadProviders)
 
       <form class="auth-card" @submit.prevent="submit">
         <p class="mono-label">GateKeeper</p>
-        <h1 class="mt-3 font-serif text-4xl leading-none">Create account</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight">Create account</h1>
         <p class="mt-3 text-sm leading-6 text-muted">The first account becomes the owner for this install.</p>
 
         <div v-if="configuredProviders.length" class="mt-7 grid gap-2">

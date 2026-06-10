@@ -186,7 +186,7 @@ onMounted(load)
 <template>
   <section class="mx-auto max-w-6xl px-4 py-8 md:px-8">
     <p class="mono-label">Audit</p>
-    <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">Security events</h1>
+    <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Security events</h1>
     <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
       Filter operator, token, client, and session events written by the auth core.
     </p>

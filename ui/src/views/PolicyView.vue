@@ -277,7 +277,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Policy</p>
-        <h1 class="mt-3 font-serif text-4xl leading-tight md:text-5xl">Security and account policy</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">Security and account policy</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Set the baseline assurance and account lifecycle rules for organization apps, CLI approvals, and product sessions.
         </p>

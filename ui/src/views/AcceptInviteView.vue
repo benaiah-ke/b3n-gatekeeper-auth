@@ -49,7 +49,7 @@ async function submit() {
             <span>GateKeeper</span>
           </div>
           <p class="mono-label mt-12">Invitation</p>
-          <h2 class="mt-3 max-w-lg font-serif text-5xl leading-[0.98] sm:text-6xl">Join the control plane.</h2>
+          <h2 class="mt-3 max-w-lg text-3xl font-semibold leading-tight sm:text-4xl">Join the control plane.</h2>
           <p class="mt-5 max-w-md text-sm leading-6 text-muted">
             Accept a scoped organization invitation and continue with the same central GateKeeper account.
           </p>
@@ -73,7 +73,7 @@ async function submit() {
 
       <form class="auth-card" @submit.prevent="submit">
         <p class="mono-label">GateKeeper</p>
-        <h1 class="mt-3 font-serif text-4xl leading-none">Accept invite</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight">Accept invite</h1>
         <p class="mt-3 text-sm leading-6 text-muted">Use the email address that received the invitation.</p>
 
         <div class="mt-7 grid gap-4">

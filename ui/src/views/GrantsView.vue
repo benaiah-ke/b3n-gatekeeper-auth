@@ -76,7 +76,7 @@ onMounted(load)
     <div class="flex flex-wrap items-start justify-between gap-4">
       <div>
         <p class="mono-label">Connected apps</p>
-        <h1 class="mt-3 font-serif text-5xl">OAuth grants</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight md:text-3xl">OAuth grants</h1>
         <p class="mt-3 max-w-2xl text-sm leading-6 text-muted">
           Review apps that can skip hosted authorization because access has already been approved.
         </p>
