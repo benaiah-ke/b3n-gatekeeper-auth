@@ -34,6 +34,26 @@ const origin = computed(() => {
     return context.value.redirect_uri
   }
 })
+const permissionItems = computed(() => {
+  const scopes = new Set(context.value?.scopes || [])
+  const items: string[] = []
+  if (scopes.has('openid')) {
+    items.push('Confirm that you are signed in')
+  }
+  if (scopes.has('profile')) {
+    items.push('Share your basic profile')
+  }
+  if (scopes.has('email')) {
+    items.push('Share your email address')
+  }
+  if (scopes.has('auth:read')) {
+    items.push('Verify your GateKeeper account access')
+  }
+  if (!items.length) {
+    items.push('Continue with your GateKeeper account')
+  }
+  return items
+})
 
 function currentQuery() {
   return new URLSearchParams(window.location.search)
@@ -81,18 +101,27 @@ onMounted(load)
 </script>
 
 <template>
-  <section class="mx-auto grid min-h-[calc(100svh-4rem)] max-w-3xl place-items-center px-4 py-8 md:px-8">
-    <article v-if="loading" class="panel w-full p-6 text-sm text-muted">Loading authorization request...</article>
-    <article v-else-if="error" class="w-full rounded-md border border-red/40 bg-red/10 p-4 text-sm text-red">
+  <section class="grid min-h-svh place-items-center px-4 py-8">
+    <article v-if="loading" class="panel w-full max-w-xl p-6 text-sm text-muted">Loading sign-in request...</article>
+    <article v-else-if="error" class="w-full max-w-xl rounded-md border border-red/40 bg-red/10 p-4 text-sm text-red">
       {{ error }}
     </article>
-    <article v-else-if="context" class="panel w-full p-6">
-      <div class="flex items-start justify-between gap-4">
-        <div>
-          <p class="mono-label">Authorize application</p>
-          <h1 class="mt-3 font-serif text-4xl leading-tight">{{ context.client.name }}</h1>
-          <p class="mt-3 max-w-xl text-sm leading-6 text-muted">
-            Review this request before GateKeeper shares an authorization code and remembers this app grant.
+    <article v-else-if="context" class="panel w-full max-w-xl p-6">
+      <div class="flex items-start gap-4">
+        <span
+          v-if="context.client.logo_url"
+          class="grid h-12 w-12 shrink-0 place-items-center overflow-hidden rounded-md border border-border bg-surface"
+        >
+          <img :src="context.client.logo_url" :alt="`${context.client.name} logo`" class="h-full w-full object-cover" />
+        </span>
+        <span v-else class="grid h-12 w-12 shrink-0 place-items-center rounded-md border border-border bg-surface">
+          <ExternalLink class="h-5 w-5 text-accent" aria-hidden="true" />
+        </span>
+        <div class="min-w-0 flex-1">
+          <p class="mono-label">GateKeeper sign-in</p>
+          <h1 class="mt-2 break-words text-2xl font-semibold leading-tight">Continue to {{ context.client.name }}</h1>
+          <p class="mt-3 text-sm leading-6 text-muted">
+            GateKeeper will securely sign you in. Continue only if you recognize this app.
           </p>
           <div class="mt-4 flex flex-wrap gap-2">
             <span
@@ -100,22 +129,13 @@ onMounted(load)
               :class="context.client.verified ? 'border-green/35 bg-green/10 text-green' : 'border-orange/45 bg-orange/10 text-orange'"
             >
               <BadgeCheck class="h-4 w-4" aria-hidden="true" />
-              {{ context.client.verified ? 'verified app' : 'unverified app' }}
+              {{ context.client.verified ? 'trusted app' : 'needs review' }}
             </span>
             <span v-if="context.client.publisher_name" class="inline-flex min-h-8 items-center rounded-md border border-border px-2.5 font-mono text-xs text-muted">
               {{ context.client.publisher_name }}
             </span>
           </div>
         </div>
-        <span
-          v-if="context.client.logo_url"
-          class="grid h-14 w-14 shrink-0 place-items-center overflow-hidden rounded-md border border-border bg-surface"
-        >
-          <img :src="context.client.logo_url" :alt="`${context.client.name} logo`" class="h-full w-full object-cover" />
-        </span>
-        <span v-else class="grid h-11 w-11 shrink-0 place-items-center rounded-md border border-border bg-surface">
-          <ExternalLink class="h-5 w-5 text-accent" aria-hidden="true" />
-        </span>
       </div>
 
       <section v-if="context.client.description || clientLinks.length" class="mt-6 rounded-md border border-border bg-bg/40 p-4">
@@ -140,25 +160,23 @@ onMounted(load)
         class="mt-6 flex gap-3 rounded-md border border-orange/45 bg-orange/10 p-4 text-sm leading-6 text-orange"
       >
         <AlertTriangle class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
-        <p>This app is not marked verified by the organization operator. Check the redirect origin and links before approving.</p>
+        <p>This app has not been marked trusted yet. Check that the app name and website look right before continuing.</p>
       </div>
 
-      <dl class="mt-7 grid gap-4 text-sm">
-        <div class="rounded-md border border-border bg-bg/40 p-4">
-          <dt class="mono-label">Application</dt>
-          <dd class="mt-2 font-mono text-fg">{{ context.client.client_id }}</dd>
-        </div>
-        <div class="rounded-md border border-border bg-bg/40 p-4">
-          <dt class="mono-label">Redirect origin</dt>
-          <dd class="mt-2 break-all font-mono text-fg">{{ origin }}</dd>
-        </div>
-        <div class="rounded-md border border-border bg-bg/40 p-4">
-          <dt class="mono-label">Audience</dt>
-          <dd class="mt-2 break-all font-mono text-fg">{{ context.audience || context.client.audiences.join(', ') }}</dd>
-        </div>
-        <div class="rounded-md border border-border bg-bg/40 p-4">
-          <dt class="mono-label">Account scope</dt>
-          <dd v-if="context.orgs.length > 1 || !context.client.require_org_membership" class="mt-3">
+      <section class="mt-7 rounded-md border border-border bg-bg/40 p-4">
+        <p class="text-sm font-semibold">This app can</p>
+        <ul class="mt-3 grid gap-2 text-sm leading-6 text-muted">
+          <li v-for="item in permissionItems" :key="item" class="flex gap-2">
+            <CheckCircle2 class="mt-1 h-4 w-4 shrink-0 text-green" aria-hidden="true" />
+            <span>{{ item }}</span>
+          </li>
+        </ul>
+      </section>
+
+      <section class="mt-4 rounded-md border border-border bg-bg/40 p-4 text-sm">
+        <p class="font-semibold">Use account</p>
+        <div class="mt-3">
+          <div v-if="context.orgs.length > 1 || !context.client.require_org_membership">
             <select
               v-model="selectedOrgId"
               class="w-full rounded-md border border-border bg-surface px-3 py-2 text-sm text-fg outline-none focus:border-accent"
@@ -168,18 +186,8 @@ onMounted(load)
                 {{ org.name }}
               </option>
             </select>
-          </dd>
-          <dd v-else class="mt-2 text-fg">{{ selectedOrg?.name || 'No organization selected' }}</dd>
-        </div>
-      </dl>
-
-      <section class="mt-6">
-        <p class="mono-label">Requested scopes</p>
-        <div class="mt-3 flex flex-wrap gap-2">
-          <span v-for="scope in context.scopes" :key="scope" class="rounded-md border border-border px-2 py-1 font-mono text-xs">
-            {{ scope }}
-          </span>
-          <span v-if="!context.scopes.length" class="text-sm text-muted">No scopes requested.</span>
+          </div>
+          <div v-else class="text-fg">{{ selectedOrg?.name || 'No organization selected' }}</div>
         </div>
       </section>
 
@@ -188,7 +196,7 @@ onMounted(load)
         class="mt-6 flex gap-3 rounded-md border border-orange/45 bg-orange/10 p-4 text-sm leading-6 text-orange"
       >
         <AlertTriangle class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
-        <p>This client requires organization membership. GateKeeper will bind this authorization to the selected organization.</p>
+        <p>This app is available only to members of the selected organization.</p>
       </div>
 
       <div
@@ -196,17 +204,44 @@ onMounted(load)
         class="mt-3 flex gap-3 rounded-md border border-green/35 bg-green/10 p-4 text-sm leading-6 text-green"
       >
         <ShieldCheck class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
-        <p>This client requires authenticator MFA before GateKeeper issues app or device tokens.</p>
+        <p>This app requires authenticator verification for stronger account protection.</p>
       </div>
+
+      <details class="mt-5 rounded-md border border-border bg-bg/40 p-4 text-sm text-muted">
+        <summary class="cursor-pointer text-fg">Technical details</summary>
+        <dl class="mt-4 grid gap-3">
+          <div>
+            <dt class="mono-label">Application id</dt>
+            <dd class="mt-1 break-all font-mono text-xs text-fg">{{ context.client.client_id }}</dd>
+          </div>
+          <div>
+            <dt class="mono-label">Website</dt>
+            <dd class="mt-1 break-all font-mono text-xs text-fg">{{ origin }}</dd>
+          </div>
+          <div>
+            <dt class="mono-label">Audience</dt>
+            <dd class="mt-1 break-all font-mono text-xs text-fg">{{ context.audience || context.client.audiences.join(', ') }}</dd>
+          </div>
+          <div>
+            <dt class="mono-label">Scopes</dt>
+            <dd class="mt-2 flex flex-wrap gap-2">
+              <span v-for="scope in context.scopes" :key="scope" class="rounded-md border border-border px-2 py-1 font-mono text-xs text-fg">
+                {{ scope }}
+              </span>
+              <span v-if="!context.scopes.length" class="text-xs text-muted">No scopes requested.</span>
+            </dd>
+          </div>
+        </dl>
+      </details>
 
       <div class="mt-7 flex flex-wrap justify-end gap-3">
         <button type="button" class="btn-secondary gap-2" @click="deny">
           <XCircle class="h-4 w-4" aria-hidden="true" />
-          Deny
+          Cancel
         </button>
         <button type="button" class="btn-primary gap-2" @click="approve">
           <CheckCircle2 class="h-4 w-4" aria-hidden="true" />
-          Approve
+          Continue
         </button>
       </div>
     </article>

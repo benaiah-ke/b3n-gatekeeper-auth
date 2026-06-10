@@ -22,7 +22,7 @@ import { api } from '@/services/api'
 
 const route = useRoute()
 const router = useRouter()
-const authRoutes = ['/login', '/signup', '/verify', '/reset-password', '/device', '/accept-invite']
+const authRoutes = ['/login', '/signup', '/verify', '/reset-password', '/device', '/accept-invite', '/authorize']
 const isAuthRoute = computed(() => authRoutes.includes(route.path))
 
 const nav: Array<{ path: string; label: string; icon: Component }> = [
