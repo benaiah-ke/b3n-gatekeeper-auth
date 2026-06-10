@@ -42,6 +42,10 @@ class Settings(BaseSettings):
 
     database_url: str = "sqlite+aiosqlite:///./gatekeeper.db"
     test_database_url: str = "sqlite+aiosqlite:///./test_gatekeeper.db"
+    database_pool_size: int = 2
+    database_max_overflow: int = 1
+    database_pool_timeout_seconds: int = 10
+    database_pool_recycle_seconds: int = 300
 
     secret_key: str = "change-me-in-production"
     jwt_private_key_pem: str = ""
