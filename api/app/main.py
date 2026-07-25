@@ -529,6 +529,23 @@ def require_webauthn_configuration() -> tuple[str, list[str]]:
     origins = settings.webauthn_origin_list
     if not rp_id or not origins:
         raise HTTPException(status_code=503, detail="Passkeys are not configured")
+    for origin in origins:
+        parsed = urlparse(origin)
+        hostname = (parsed.hostname or "").lower()
+        loopback = hostname in {"localhost", "127.0.0.1", "::1"}
+        exact_origin = (
+            parsed.scheme in {"http", "https"}
+            and bool(parsed.netloc)
+            and not parsed.username
+            and not parsed.password
+            and parsed.path in {"", "/"}
+            and not parsed.params
+            and not parsed.query
+            and not parsed.fragment
+        )
+        rp_matches = hostname == rp_id or hostname.endswith(f".{rp_id}")
+        if not exact_origin or (parsed.scheme != "https" and not loopback) or not rp_matches:
+            raise HTTPException(status_code=503, detail="Passkey origin configuration is invalid")
     return rp_id, origins
 
 

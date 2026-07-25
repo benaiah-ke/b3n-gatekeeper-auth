@@ -2752,6 +2752,17 @@ async def test_failed_login_attempts_persist_rate_limit_counters():
 
 
 @pytest.mark.asyncio
+async def test_passkey_options_reject_invalid_origin_configuration(monkeypatch):
+    monkeypatch.setattr(settings, "webauthn_rp_id", "unrelated.example.com")
+    monkeypatch.setattr(settings, "webauthn_origins", "http://auth.example.com/path")
+
+    async with await client() as ac:
+        options = await ac.post("/api/v1/auth/passkeys/authentication/options", json={})
+        assert options.status_code == 503
+        assert options.json()["detail"] == "Passkey origin configuration is invalid"
+
+
+@pytest.mark.asyncio
 async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows():
     async with await client() as ac:
         signup = await ac.post(

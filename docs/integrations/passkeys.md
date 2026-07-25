@@ -23,7 +23,8 @@ WEBAUTHN_CHALLENGE_TTL_SECONDS=300
 `WEBAUTHN_RP_ID` is a hostname, without a scheme or port.
 `WEBAUTHN_ORIGINS` is a comma-separated list of complete origins, including
 scheme and any non-default port. Production passkeys require a secure HTTPS
-context. `http://localhost` is suitable for local development.
+context. `http://localhost` is suitable for local development. Challenge
+lifetimes must remain between 60 and 600 seconds.
 
 When the explicit values are absent, GateKeeper derives the RP ID and one
 origin from `UI_URL`. Explicit values are recommended for deployed installs,

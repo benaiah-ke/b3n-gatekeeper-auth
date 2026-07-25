@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     webauthn_rp_id: str = ""
     webauthn_rp_name: str = "GateKeeper"
     webauthn_origins: str = ""
-    webauthn_challenge_ttl_seconds: int = 300
+    webauthn_challenge_ttl_seconds: int = Field(default=300, ge=60, le=600)
 
     bootstrap_admin_email: EmailStr = "admin@example.com"
     bootstrap_org_name: str = "Example Org"
