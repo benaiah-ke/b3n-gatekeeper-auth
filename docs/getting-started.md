@@ -63,7 +63,19 @@ The response includes `access_token`, `refresh_token`, `expires_in`, user data,
 and organization memberships. Products that own their own UI can build signup,
 signin, reset, sessions, and API-key screens directly on this API.
 
-## 5. Add Hosted Auth When Needed
+## 5. Add Passkeys Or Authenticator MFA
+
+Open the Security section on `/account` to add a passkey or authenticator.
+Passkeys provide passwordless sign-in and satisfy client, organization, device,
+and admin step-up MFA policy. Product-owned UIs can use the same registration
+and authentication APIs described in
+[integrations/passkeys.md](integrations/passkeys.md).
+
+For deployment, set `WEBAUTHN_RP_ID` to the public auth hostname and
+`WEBAUTHN_ORIGINS` to the exact HTTPS UI origin before users register
+credentials.
+
+## 6. Add Hosted Auth When Needed
 
 For a hosted UI web app, create an OAuth client with exact redirect URIs,
 allowed origins, audiences, and scopes. Then use authorization-code + PKCE.
@@ -71,14 +83,14 @@ allowed origins, audiences, and scopes. Then use authorization-code + PKCE.
 See [integrations/web-app.md](integrations/web-app.md) and
 [integrations/vue-nuxt.md](integrations/vue-nuxt.md).
 
-## 6. Add API Keys
+## 7. Add API Keys
 
 API products should issue scoped API tokens or keys tied to the same account,
 organization, project, audience, and audit model.
 
 See [integrations/api-keys.md](integrations/api-keys.md).
 
-## 7. Add CLI And MCP
+## 8. Add CLI And MCP
 
 CLIs should use device authorization or another user-bound login flow, store
 refreshable credentials locally, switch organization context through GateKeeper,
@@ -91,7 +103,8 @@ See [integrations/cli.md](integrations/cli.md) and
 ## Current Parity Notes
 
 GateKeeper already has direct auth APIs, OAuth/OIDC, JWKS, refresh rotation,
-authenticator TOTP with recovery codes, client and organization MFA policy,
+passwordless passkeys, authenticator TOTP with recovery codes, client and
+organization MFA policy,
 trusted-device MFA reuse policy, admin step-up MFA policy, client credentials,
 database-managed social provider setup through API and UI, device
 authorization, sessions, connected-app grants, API tokens, MCP resources, and

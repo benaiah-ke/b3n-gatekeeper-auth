@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import { api } from '@/services/api'
@@ -13,10 +13,25 @@ const totpCode = ref('')
 const recoveryCode = ref('')
 const error = ref('')
 const loading = ref(false)
+const authenticated = ref(false)
 
 const token = computed(() => {
   const value = Array.isArray(route.query.token) ? route.query.token[0] : route.query.token
   return typeof value === 'string' ? value : ''
+})
+const signInRoute = computed(() => ({ path: '/login', query: { redirect: route.fullPath } }))
+
+onMounted(async () => {
+  try {
+    const session = await api.me()
+    if (session.user) {
+      authenticated.value = true
+      email.value = session.user.email
+      displayName.value = session.user.display_name || ''
+    }
+  } catch {
+    authenticated.value = false
+  }
 })
 
 async function submit() {
@@ -37,6 +52,11 @@ async function submit() {
   } finally {
     loading.value = false
   }
+}
+
+async function useAnotherAccount() {
+  await api.logout()
+  await router.push(signInRoute.value)
 }
 </script>
 
@@ -62,7 +82,7 @@ async function submit() {
           </li>
           <li class="setup-step">
             <span class="setup-step-number">02</span>
-            <span><span class="setup-step-title">Create or confirm account</span> Existing accounts use their current password.</span>
+            <span><span class="setup-step-title">Create or confirm account</span> Existing accounts can sign in first, including with a passkey.</span>
           </li>
           <li class="setup-step">
             <span class="setup-step-number">03</span>
@@ -79,13 +99,21 @@ async function submit() {
         <div class="mt-7 grid gap-4">
           <label class="auth-field">
             Email
-            <input v-model="email" class="input" type="email" placeholder="you@example.com" autocomplete="email" required />
+            <input
+              v-model="email"
+              class="input"
+              type="email"
+              placeholder="you@example.com"
+              autocomplete="email"
+              required
+              :readonly="authenticated"
+            />
           </label>
           <label class="auth-field">
             Name
             <input v-model="displayName" class="input" placeholder="Optional for new accounts" autocomplete="name" />
           </label>
-          <label class="auth-field">
+          <label v-if="!authenticated" class="auth-field">
             Password
             <input
               v-model="password"
@@ -96,6 +124,9 @@ async function submit() {
               required
             />
           </label>
+          <p v-else class="rounded-md border border-green/35 bg-green/10 p-3 text-sm leading-6 text-muted">
+            You are signed in as {{ email }}. GateKeeper will use this active session to accept the invitation.
+          </p>
           <label class="auth-field">
             Authenticator code
             <input
@@ -122,7 +153,17 @@ async function submit() {
           </button>
         </div>
 
-        <RouterLink to="/login" class="mt-5 block text-sm text-muted hover:text-fg">Sign in instead</RouterLink>
+        <button
+          v-if="authenticated"
+          type="button"
+          class="mt-5 block text-sm text-muted hover:text-fg"
+          @click="useAnotherAccount"
+        >
+          Sign out to use another account
+        </button>
+        <RouterLink v-else :to="signInRoute" class="mt-5 block text-sm text-muted hover:text-fg">
+          Sign in first, including with a passkey
+        </RouterLink>
       </form>
     </div>
   </section>

@@ -4,9 +4,10 @@ import { computed, onMounted, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 
 import { api } from '@/services/api'
-import type { AuthClient, Org, SetupStatus } from '@/types'
+import type { AuthClient, MfaStatus, Org, SetupStatus } from '@/types'
 
 const setup = ref<SetupStatus | null>(null)
+const mfa = ref<MfaStatus | null>(null)
 const clients = ref<AuthClient[]>([])
 const loading = ref(true)
 const saving = ref(false)
@@ -17,7 +18,7 @@ const baselineIdleTimeoutMinutes = 720
 
 const activeOrg = computed(() => setup.value?.org || setup.value?.orgs[0] || null)
 const canManage = computed(() => Boolean(setup.value?.can_manage_roles))
-const currentUserMfaEnabled = computed(() => Boolean(setup.value?.user?.mfa_totp_enabled))
+const currentUserMfaEnabled = computed(() => Boolean(mfa.value?.totp_enabled || mfa.value?.passkey_count))
 const orgMfaRequired = computed(() => Boolean(activeOrg.value?.require_mfa))
 const orgTrustedDeviceBypass = computed(() => Boolean(activeOrg.value?.trusted_device_mfa_bypass))
 const adminStepUpRequired = computed(() => Boolean(activeOrg.value?.admin_step_up_mfa_required))
@@ -46,7 +47,7 @@ const baselineItems = computed(() => [
     label: 'Owner MFA enrolled',
     detail: currentUserMfaEnabled.value
       ? 'This session can safely enforce sensitive-action step-up.'
-      : 'Enroll authenticator MFA before locking sensitive admin changes behind step-up.',
+      : 'Add a passkey or authenticator before locking sensitive admin changes behind step-up.',
     done: currentUserMfaEnabled.value,
     to: '/account',
   },
@@ -116,9 +117,14 @@ async function load() {
   error.value = ''
   notice.value = ''
   try {
-    const [setupStatus, clientRows] = await Promise.all([api.setupStatus(), api.clients()])
+    const [setupStatus, clientRows, mfaStatus] = await Promise.all([
+      api.setupStatus(),
+      api.clients(),
+      api.mfaStatus(),
+    ])
     setup.value = setupStatus
     clients.value = clientRows
+    mfa.value = mfaStatus
     orgIdleTimeoutMinutes.value = setupStatus.org?.session_idle_timeout_minutes || null
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Could not load policy'
@@ -261,7 +267,7 @@ async function applyRecommendedBaseline() {
     orgIdleTimeoutMinutes.value = updated.session_idle_timeout_minutes || null
     notice.value = currentUserMfaEnabled.value || updated.admin_step_up_mfa_required
       ? 'Recommended policy baseline applied.'
-      : 'Baseline applied. Enroll authenticator MFA to enable admin step-up safely.'
+      : 'Baseline applied. Add a passkey or authenticator to enable admin step-up safely.'
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Could not apply recommended baseline'
   } finally {
@@ -404,7 +410,7 @@ onMounted(load)
         <div class="flex flex-wrap items-start justify-between gap-4">
           <div>
             <p class="mono-label">Organization MFA</p>
-            <h2 class="mt-2 text-xl font-semibold">Require authenticator MFA</h2>
+            <h2 class="mt-2 text-xl font-semibold">Require MFA</h2>
             <p class="mt-2 max-w-2xl text-sm leading-6 text-muted">
               {{ orgMfaRequired ? 'Client-bound sessions must prove MFA.' : 'Client-bound sessions can use the client-level rule.' }}
             </p>
@@ -459,7 +465,7 @@ onMounted(load)
             <p class="mono-label">Trusted Devices</p>
             <h2 class="mt-2 text-xl font-semibold">Allow trusted-device MFA reuse</h2>
             <p class="mt-2 max-w-2xl text-sm leading-6 text-muted">
-              Trusted devices can satisfy org MFA only when the user has already enrolled authenticator MFA and every active app policy also allows reuse.
+              Trusted devices can satisfy org MFA only when the user has already added a passkey or authenticator and every active app policy also allows reuse.
             </p>
           </div>
           <span

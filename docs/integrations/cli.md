@@ -21,7 +21,10 @@ The response includes:
 - `interval`
 
 The CLI shows the verification URI and user code. The user approves the request
-in the browser.
+in the browser. The hosted `/device` page verifies an active user session
+before showing the grant form and can approve with a registered passkey, TOTP,
+recovery code, trusted-session assurance, or the policy-permitted current
+session. It never accepts an unauthenticated browser approval.
 
 ## Poll For Tokens
 

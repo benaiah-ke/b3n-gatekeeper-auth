@@ -20,6 +20,7 @@ jobs:
       - run: uv sync --all-extras
       - run: uv run ruff check app tests
       - run: uv run pytest
+      - run: DATABASE_URL=sqlite+aiosqlite:////tmp/gatekeeper-ci.db uv run alembic upgrade head
 
   cli:
     runs-on: ubuntu-latest
@@ -47,12 +48,21 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      - run: pnpm install --frozen-lockfile=false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter gatekeeper-js build
+      - run: pnpm --filter gatekeeper-vue build
       - run: pnpm --filter gatekeeper-ui build
+
+  deploy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: GATEKEEPER_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.selfhost.yml config -q
+      - run: GATEKEEPER_ENV_FILE=.env.example.selfhost docker compose -f deploy/docker-compose.existing-proxy.yml config -q
 
   images:
     if: github.ref == 'refs/heads/main'
-    needs: [api, cli, ui]
+    needs: [api, cli, ui, deploy-config]
     runs-on: ubuntu-latest
     permissions:
       contents: read

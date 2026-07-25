@@ -575,7 +575,7 @@ onMounted(load)
                   </label>
                   <label class="inline-flex items-center gap-2 text-sm text-muted">
                     <input v-model="requireMfa" type="checkbox" />
-                    Require authenticator MFA for user sessions
+                    Require passkey or authenticator MFA for user sessions
                   </label>
                   <label class="inline-flex items-center gap-2 text-sm text-muted">
                     <input v-model="trustedDeviceMfaBypass" type="checkbox" :disabled="!requireMfa" />

@@ -1,3 +1,10 @@
+import type {
+  AuthenticationResponseJSON,
+  PublicKeyCredentialCreationOptionsJSON,
+  PublicKeyCredentialRequestOptionsJSON,
+  RegistrationResponseJSON,
+} from '@simplewebauthn/browser'
+
 export interface User {
   id: string
   email: string
@@ -42,6 +49,7 @@ export interface AdminUser extends User {
   created_at: string
   updated_at: string
   mfa_totp_enabled_at?: string | null
+  passkey_count: number
   memberships: UserMembership[]
 }
 
@@ -172,8 +180,10 @@ export interface AccountExport {
   mfa: {
     totp_enabled: boolean
     totp_enabled_at?: string | null
+    passkey_count: number
     recovery_codes_remaining: number
   }
+  passkeys: PasskeyCredential[]
   sessions: Session[]
   api_tokens: ApiToken[]
   oauth_grants: OAuthGrant[]
@@ -214,8 +224,32 @@ export interface MfaStatus {
   totp_enabled: boolean
   totp_enabled_at?: string | null
   totp_pending: boolean
+  passkey_count: number
   recovery_codes_remaining: number
 }
+
+export interface PasskeyCredential {
+  id: string
+  name: string
+  transports: string[]
+  credential_device_type: string
+  backed_up: boolean
+  created_at: string
+  last_used_at?: string | null
+}
+
+export interface PasskeyRegistrationOptions {
+  challenge_id: string
+  public_key: PublicKeyCredentialCreationOptionsJSON
+}
+
+export interface PasskeyAuthenticationOptions {
+  challenge_id: string
+  public_key: PublicKeyCredentialRequestOptionsJSON
+}
+
+export type PasskeyRegistrationResponse = RegistrationResponseJSON
+export type PasskeyAuthenticationResponse = AuthenticationResponseJSON
 
 export interface TotpSetup {
   secret: string

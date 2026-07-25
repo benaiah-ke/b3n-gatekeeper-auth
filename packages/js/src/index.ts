@@ -51,7 +51,7 @@ export interface GateKeeperLoginParams {
 
 export interface GateKeeperInvitationAcceptParams {
   email: string
-  password: string
+  password?: string | null
   token: string
   displayName?: string | null
   display_name?: string | null
@@ -118,7 +118,40 @@ export interface GateKeeperAdminUser extends GateKeeperUser {
   created_at: string
   updated_at: string
   mfa_totp_enabled_at?: string | null
+  passkey_count: number
   memberships: GateKeeperUserMembership[]
+}
+
+export interface GateKeeperPasskeyCredential {
+  id: string
+  name: string
+  transports: string[]
+  credential_device_type: string
+  backed_up: boolean
+  created_at: string
+  last_used_at?: string | null
+}
+
+export interface GateKeeperPasskeyOptions {
+  challenge_id: string
+  public_key: Record<string, unknown>
+}
+
+export interface GateKeeperPasskeyAuthenticationParams {
+  clientId?: string | null
+  client_id?: string | null
+  scope?: string | null
+  audience?: string | null
+}
+
+export interface GateKeeperPasskeyVerifyParams {
+  challengeId?: string
+  challenge_id?: string
+  credential: Record<string, unknown>
+}
+
+export interface GateKeeperPasskeyRegistrationParams extends GateKeeperPasskeyVerifyParams {
+  name?: string | null
 }
 
 export interface GateKeeperProfileUpdateParams {
@@ -249,8 +282,10 @@ export interface GateKeeperAccountExport {
   mfa: {
     totp_enabled: boolean
     totp_enabled_at?: string | null
+    passkey_count: number
     recovery_codes_remaining: number
   }
+  passkeys: GateKeeperPasskeyCredential[]
   sessions: GateKeeperSession[]
   api_tokens: unknown[]
   oauth_grants: GateKeeperOAuthGrant[]
@@ -433,6 +468,7 @@ export interface GateKeeperJwtClaims {
   display_name?: string | null
   email_verified?: boolean
   mfa_totp_enabled?: boolean
+  mfa_passkey_enabled?: boolean
   org_id?: string | null
   org_slug?: string | null
   org_role?: string | null
@@ -453,6 +489,7 @@ export interface GateKeeperPrincipal {
   displayName?: string | null
   emailVerified?: boolean
   mfaTotpEnabled?: boolean
+  mfaPasskeyEnabled?: boolean
   permissions: string[]
   amr: string[]
   authorizedParty?: string | null
@@ -866,6 +903,7 @@ export class GateKeeperJwtVerifier {
       displayName: claims.display_name,
       emailVerified: claims.email_verified,
       mfaTotpEnabled: claims.mfa_totp_enabled,
+      mfaPasskeyEnabled: claims.mfa_passkey_enabled,
       permissions: stringListClaim(claims.permissions),
       amr: stringListClaim(claims.amr),
       authorizedParty: claims.azp,
@@ -988,6 +1026,142 @@ export class GateKeeperClient {
     return parseJsonResponse<GateKeeperTokenResponse>(response, 'Could not sign in with GateKeeper')
   }
 
+  async passkeyAuthenticationOptions(
+    params: GateKeeperPasskeyAuthenticationParams = {},
+  ): Promise<GateKeeperPasskeyOptions> {
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/authentication/options`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({
+        client_id: params.client_id ?? params.clientId ?? this.clientId ?? null,
+        scope: params.scope ?? this.scope ?? null,
+        audience: params.audience ?? this.audience ?? null,
+      }),
+    })
+    return parseJsonResponse<GateKeeperPasskeyOptions>(response, 'Could not start GateKeeper passkey sign-in')
+  }
+
+  async verifyPasskeyAuthentication(
+    params: GateKeeperPasskeyVerifyParams,
+  ): Promise<GateKeeperTokenResponse> {
+    const challengeId = params.challenge_id ?? params.challengeId
+    if (!challengeId) {
+      throw new Error('challengeId is required')
+    }
+    const headers = new Headers()
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/authentication/verify`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({ challenge_id: challengeId, credential: params.credential }),
+    })
+    return parseJsonResponse<GateKeeperTokenResponse>(response, 'Could not verify GateKeeper passkey sign-in')
+  }
+
+  async passkeys(accessToken: string): Promise<GateKeeperPasskeyCredential[]> {
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys`, {
+      headers: tokenHeaders(accessToken),
+      credentials: 'include',
+    })
+    return parseJsonResponse<GateKeeperPasskeyCredential[]>(response, 'Could not load GateKeeper passkeys')
+  }
+
+  async passkeyRegistrationOptions(accessToken: string): Promise<GateKeeperPasskeyOptions> {
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/registration/options`, {
+      method: 'POST',
+      headers: tokenHeaders(accessToken),
+      credentials: 'include',
+    })
+    return parseJsonResponse<GateKeeperPasskeyOptions>(response, 'Could not start GateKeeper passkey registration')
+  }
+
+  async registerPasskey(
+    accessToken: string,
+    params: GateKeeperPasskeyRegistrationParams,
+  ): Promise<GateKeeperPasskeyCredential> {
+    const challengeId = params.challenge_id ?? params.challengeId
+    if (!challengeId) {
+      throw new Error('challengeId is required')
+    }
+    const headers = tokenHeaders(accessToken)
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/registration/verify`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({
+        challenge_id: challengeId,
+        credential: params.credential,
+        name: params.name || null,
+      }),
+    })
+    return parseJsonResponse<GateKeeperPasskeyCredential>(response, 'Could not register GateKeeper passkey')
+  }
+
+  async renamePasskey(
+    accessToken: string,
+    credentialId: string,
+    name: string,
+  ): Promise<GateKeeperPasskeyCredential> {
+    const headers = tokenHeaders(accessToken)
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/${credentialId}`, {
+      method: 'PATCH',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({ name }),
+    })
+    return parseJsonResponse<GateKeeperPasskeyCredential>(response, 'Could not rename GateKeeper passkey')
+  }
+
+  async revokePasskey(accessToken: string, credentialId: string): Promise<{ status: string; id: string }> {
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/passkeys/${credentialId}`, {
+      method: 'DELETE',
+      headers: tokenHeaders(accessToken),
+      credentials: 'include',
+    })
+    return parseJsonResponse(response, 'Could not remove GateKeeper passkey')
+  }
+
+  async devicePasskeyOptions(
+    accessToken: string,
+    userCode: string,
+    orgId?: string | null,
+  ): Promise<GateKeeperPasskeyOptions> {
+    const headers = tokenHeaders(accessToken)
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/device/passkey/options`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({ user_code: userCode, org_id: orgId || null }),
+    })
+    return parseJsonResponse<GateKeeperPasskeyOptions>(response, 'Could not start GateKeeper device approval')
+  }
+
+  async verifyDevicePasskey(
+    accessToken: string,
+    params: GateKeeperPasskeyVerifyParams,
+  ): Promise<{ status: string }> {
+    const challengeId = params.challenge_id ?? params.challengeId
+    if (!challengeId) {
+      throw new Error('challengeId is required')
+    }
+    const headers = tokenHeaders(accessToken)
+    headers.set('Content-Type', 'application/json')
+    const response = await this.fetcher(`${this.issuer}/api/v1/auth/device/passkey/verify`, {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({ challenge_id: challengeId, credential: params.credential }),
+    })
+    return parseJsonResponse(response, 'Could not verify GateKeeper device approval')
+  }
+
   async acceptInvitation(params: GateKeeperInvitationAcceptParams): Promise<GateKeeperTokenResponse> {
     const headers = new Headers()
     headers.set('Content-Type', 'application/json')
@@ -997,7 +1171,7 @@ export class GateKeeperClient {
       credentials: 'include',
       body: JSON.stringify({
         email: params.email,
-        password: params.password,
+        password: params.password || null,
         token: params.token,
         display_name: params.display_name ?? params.displayName ?? null,
         totp_code: params.totp_code ?? params.totpCode ?? null,

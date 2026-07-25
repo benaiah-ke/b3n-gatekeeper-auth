@@ -307,14 +307,19 @@ curl -s "$GATEKEEPER_ISSUER/api/v1/auth/login" \
 Successful TOTP logins add `mfa_totp_enabled=true` and `amr=["pwd","otp"]` to
 the user access token.
 
+For passwordless passkey registration and authentication, including the
+browser ceremony and JS/Vue helpers, see [passkeys.md](passkeys.md). Successful
+passkey sessions add `mfa_passkey_enabled=true` and `amr=["webauthn"]`.
+
 When a registered client has `"require_mfa":true`, GateKeeper refuses
 client-bound login, hosted OAuth authorization-code issuance, and device
-approval unless the user has authenticator MFA enrolled and the current
-session/token proves MFA through `amr=["pwd","otp"]` or `["pwd","recovery"]`.
+approval unless the user has a passkey or authenticator enrolled and the
+current session/token proves MFA through `webauthn`, `otp`, or `recovery` in
+`amr`.
 If a hosted OAuth request reaches `/oauth/authorize` with an existing
 password-only session, GateKeeper redirects back to hosted login with
-`step_up=mfa` so the user can enter a TOTP or recovery code and resume the same
-authorization request.
+`step_up=mfa` so the user can use a passkey, TOTP, or recovery code and resume
+the same authorization request.
 Owners can also require MFA across organization-owned clients:
 
 ```bash
@@ -329,8 +334,8 @@ carry MFA assurance, and future client-bound login, hosted OAuth, device
 approval, and refresh flows must preserve MFA `amr`.
 
 Trusted devices can satisfy a client or organization MFA rule only after the
-user has enrolled authenticator MFA and marked a current session trusted. Every
-active MFA policy must explicitly allow trusted-device reuse:
+user has enrolled a passkey or authenticator and marked a current session
+trusted. Every active MFA policy must explicitly allow trusted-device reuse:
 
 ```bash
 curl -s -X PATCH "$GATEKEEPER_ISSUER/api/v1/clients/$CLIENT_ROW_ID" \
@@ -345,9 +350,10 @@ curl -s -X PATCH "$GATEKEEPER_ISSUER/api/v1/orgs/$ORG_ID" \
 ```
 
 If both the client and organization require MFA, both toggles must be enabled.
-GateKeeper still rejects password-only login for users without authenticator MFA
-enrollment, and it stops accepting `amr=["pwd","trusted_device"]` after trust
-expires or the relevant policy is disabled.
+GateKeeper still rejects policy-bound login for users without an enrolled
+passkey or authenticator, and it stops accepting
+`amr=["pwd","trusted_device"]` after trust expires or the relevant policy is
+disabled.
 
 Owners can also require MFA assurance before sensitive organization mutations:
 
@@ -362,8 +368,8 @@ After this is enabled, changes to organization policy, clients/secrets,
 database-managed social providers, users, memberships, invitations, roles,
 workspaces, API resources, API tokens, and MCP resources require a user session
 with MFA assurance. Password-only owner sessions and service/API tokens cannot
-perform those mutations until a user signs in with TOTP or an accepted trusted
-device session.
+perform those mutations until a user signs in with a passkey, TOTP, recovery
+code, or an accepted trusted-device session.
 
 If the authenticator is unavailable, submit one unused recovery code instead of
 `totp_code`:
@@ -427,13 +433,11 @@ curl -s "$GATEKEEPER_ISSUER/api/v1/auth/mfa/totp/disable" \
   -d '{"code":"123456"}'
 ```
 
-Current scope: account-level authenticator TOTP enrollment, login enforcement,
-status, recovery codes, recovery-code login, recovery-code regeneration,
-client-level MFA policy, org-wide MFA policy for registered app/device
-sessions, trusted-device MFA reuse policy, admin step-up MFA policy for
-sensitive organization mutations, disable, admin reset, audit events, session
-revocation, and token claims. Richer adaptive risk signals and hosted challenge
-polish remain future provider work.
+Current scope: passkey registration, passwordless login, credential management,
+device approval, invitation assurance, account-level authenticator TOTP,
+recovery codes, client/org MFA policy, trusted-device reuse, admin step-up,
+audit events, session revocation, and token claims. Richer adaptive risk and
+attestation policy remain future provider work.
 
 ## Current Account
 
@@ -530,7 +534,7 @@ SMTP, owner, scope, and capability state.
 
 Owners can provision users, inspect users, update profile/verification/suspension
 state, assign organization roles, suspend memberships, revoke a user's sessions,
-and reset authenticator 2FA:
+and reset authenticator 2FA. Passkeys remain user-managed:
 
 ```bash
 curl -s -X POST "$GATEKEEPER_ISSUER/api/v1/users/provision" \
@@ -785,11 +789,14 @@ curl -s "$GATEKEEPER_ISSUER/api/v1/auth/invitations/accept" \
   }'
 ```
 
-Existing accounts must provide their current password, plus `totp_code` or
-`recovery_code` when authenticator 2FA is enabled. Accepted invitations create
-or update the organization membership, mark the invitation used, and issue a
-normal user session bound to the invited organization. Pending invitations can
-be revoked:
+Existing accounts may accept with their active session. Password accounts can
+provide their current password plus `totp_code` or `recovery_code` when
+authenticator 2FA is enabled. Passkey-enrolled accounts must use a
+passkey-backed session or another enrolled MFA method; invitation acceptance
+cannot downgrade them to password-only authentication. Accepted invitations
+create or update the organization membership, mark the invitation used, and
+issue a normal user session bound to the invited organization. Pending
+invitations can be revoked:
 
 ```bash
 curl -s -X DELETE "$GATEKEEPER_ISSUER/api/v1/invitations/<invitation-id>" \
@@ -909,8 +916,8 @@ policy invalidates the access and refresh tokens bound to the revoked sessions.
 
 Marking a session trusted records the current device cookie against that
 session. That trusted device can satisfy future client/org MFA policy only when
-the user has authenticator MFA enrolled and the matching client/org policies
-allow trusted-device reuse:
+the user has a passkey or authenticator enrolled and the matching client/org
+policies allow trusted-device reuse:
 
 ```bash
 curl -s -X PATCH "$GATEKEEPER_ISSUER/api/v1/sessions/<session-id>/device" \
@@ -1125,7 +1132,8 @@ The product backend should:
 ## Current Parity Notes
 
 Current GateKeeper builds support direct signup, signin, reset, email-code
-verification/login, authenticator TOTP, linked identity listing/unlinking,
+verification/login, passwordless passkeys, authenticator TOTP, linked identity
+listing/unlinking,
 explicit session-bound provider linking, configured and admin-managed OIDC
 social providers, refresh rotation, logout, admin user lifecycle controls,
 invitations, role assignment, session inventory, trusted-device metadata,

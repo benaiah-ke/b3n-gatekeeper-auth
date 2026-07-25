@@ -22,6 +22,10 @@ async def list_projects(
     return {"subject": principal.subject, "org_id": principal.org_id}
 ```
 
+`Principal` exposes `mfa_passkey_enabled`, `mfa_totp_enabled`, and the raw
+claims (including `amr`) so product APIs can distinguish passkey,
+authenticator, recovery, and trusted-session assurance.
+
 ## Opaque API Keys
 
 Accept customer API keys in `X-API-Key` or `Authorization: Bearer` and validate

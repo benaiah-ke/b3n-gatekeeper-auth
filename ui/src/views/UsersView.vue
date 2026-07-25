@@ -30,7 +30,7 @@ const canManage = computed(() => Boolean(setup.value?.can_manage_roles))
 const hardDeleteAllowed = computed(() => Boolean(activeOrg.value?.allow_user_hard_delete))
 const activeUsers = computed(() => users.value.filter((user) => !user.disabled))
 const disabledUsers = computed(() => users.value.filter((user) => user.disabled))
-const mfaUsers = computed(() => users.value.filter((user) => user.mfa_totp_enabled))
+const mfaUsers = computed(() => users.value.filter((user) => user.mfa_totp_enabled || user.passkey_count))
 const owners = computed(() =>
   users.value.filter((user) => membershipFor(user)?.status === 'active' && membershipFor(user)?.role === 'owner'),
 )
@@ -338,10 +338,16 @@ onMounted(load)
               </span>
               <span
                 class="inline-flex items-center gap-1 rounded-md border px-2 py-1 font-mono text-xs"
-                :class="user.mfa_totp_enabled ? 'border-green/50 text-green' : 'border-border text-muted'"
+                :class="user.mfa_totp_enabled || user.passkey_count ? 'border-green/50 text-green' : 'border-border text-muted'"
               >
-                <ShieldCheck v-if="user.mfa_totp_enabled" class="h-3 w-3" aria-hidden="true" />
-                {{ user.mfa_totp_enabled ? '2fa on' : '2fa off' }}
+                <ShieldCheck v-if="user.mfa_totp_enabled || user.passkey_count" class="h-3 w-3" aria-hidden="true" />
+                {{
+                  user.passkey_count
+                    ? `${user.passkey_count} passkey${user.passkey_count === 1 ? '' : 's'}`
+                    : user.mfa_totp_enabled
+                      ? 'authenticator on'
+                      : 'mfa off'
+                }}
               </span>
             </div>
           </div>
@@ -419,7 +425,7 @@ onMounted(load)
                 @click="resetTotp(user)"
               >
                 <KeyRound class="h-4 w-4" aria-hidden="true" />
-                Reset 2FA
+                Reset authenticator
               </button>
               <button
                 type="button"

@@ -1,17 +1,21 @@
 <script setup lang="ts">
+import { browserSupportsWebAuthn, startAuthentication } from '@simplewebauthn/browser'
 import { AlertTriangle, CheckCircle2, KeyRound, RefreshCw, ShieldCheck, Terminal } from 'lucide-vue-next'
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
-import { api } from '@/services/api'
+import { api, GateKeeperApiError } from '@/services/api'
 
 const route = useRoute()
+const router = useRouter()
 const userCode = ref('')
 const totpCode = ref('')
 const recoveryCode = ref('')
 const status = ref('')
 const error = ref('')
 const loading = ref(false)
+const passkeyLoading = ref(false)
+const passkeyAvailable = ref(false)
 
 const approved = computed(() => status.value === 'approved')
 const statusLabel = computed(() => {
@@ -48,9 +52,47 @@ const errorDetail = computed(() => {
   return error.value
 })
 
-onMounted(() => {
+async function redirectForExpiredSession(err: unknown) {
+  if (!(err instanceof GateKeeperApiError) || err.status !== 401) {
+    return false
+  }
+  await router.replace({ path: '/login', query: { redirect: route.fullPath } })
+  return true
+}
+
+onMounted(async () => {
   userCode.value = String(route.query.user_code || '')
+  if (!browserSupportsWebAuthn()) {
+    return
+  }
+  try {
+    passkeyAvailable.value = (await api.mfaStatus()).passkey_count > 0
+  } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
+    passkeyAvailable.value = false
+  }
 })
+
+async function approveWithPasskey() {
+  error.value = ''
+  status.value = ''
+  passkeyLoading.value = true
+  try {
+    const options = await api.devicePasskeyOptions(userCode.value)
+    const credential = await startAuthentication({ optionsJSON: options.public_key })
+    const result = await api.verifyDevicePasskey(options.challenge_id, credential)
+    status.value = result.status
+  } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
+    error.value = err instanceof Error ? err.message : 'Passkey approval failed'
+  } finally {
+    passkeyLoading.value = false
+  }
+}
 
 async function approve() {
   error.value = ''
@@ -62,6 +104,9 @@ async function approve() {
     totpCode.value = ''
     recoveryCode.value = ''
   } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
     error.value = err instanceof Error ? err.message : 'Device approval failed'
   } finally {
     loading.value = false
@@ -132,7 +177,7 @@ function resetApproval() {
               <div>
                 <h2 class="font-semibold">Verify this approval</h2>
                 <p class="mt-1 text-sm leading-6 text-muted">
-                  Required for CLI clients protected by GateKeeper MFA policy.
+                  Use a passkey or authenticator when this CLI connection requires two-factor verification.
                 </p>
               </div>
             </div>
@@ -159,9 +204,20 @@ function resetApproval() {
             </div>
           </section>
 
-          <button class="btn-primary gap-2" :disabled="loading">
+          <button
+            v-if="passkeyAvailable"
+            type="button"
+            class="btn-primary gap-2"
+            :disabled="loading || passkeyLoading || !userCode"
+            @click="approveWithPasskey"
+          >
             <KeyRound class="h-4 w-4" aria-hidden="true" />
-            {{ loading ? 'Approving' : 'Approve device' }}
+            {{ passkeyLoading ? 'Waiting for passkey' : 'Approve with a passkey' }}
+          </button>
+
+          <button :class="passkeyAvailable ? 'btn-secondary gap-2' : 'btn-primary gap-2'" :disabled="loading || passkeyLoading">
+            <KeyRound class="h-4 w-4" aria-hidden="true" />
+            {{ loading ? 'Approving' : passkeyAvailable ? 'Approve with authenticator or session' : 'Approve device' }}
           </button>
 
           <section

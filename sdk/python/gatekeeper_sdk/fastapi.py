@@ -23,6 +23,7 @@ class Principal:
     display_name: str | None = None
     email_verified: bool | None = None
     mfa_totp_enabled: bool | None = None
+    mfa_passkey_enabled: bool | None = None
     permissions: list[str] = field(default_factory=list)
 
 
@@ -110,6 +111,7 @@ class GateKeeperVerifier:
             display_name=claims.get("display_name"),
             email_verified=claims.get("email_verified"),
             mfa_totp_enabled=claims.get("mfa_totp_enabled"),
+            mfa_passkey_enabled=claims.get("mfa_passkey_enabled"),
             permissions=[str(permission) for permission in permissions],
         )
 

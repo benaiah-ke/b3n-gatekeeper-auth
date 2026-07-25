@@ -19,6 +19,7 @@ htmlcov/
 .uv-cache/
 data/
 *.db
+graphify-out/
 
 # Local/private operator notes are not part of the OSS product.
 docs/internal/

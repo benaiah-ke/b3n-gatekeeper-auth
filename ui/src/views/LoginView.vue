@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { browserSupportsWebAuthn, startAuthentication } from '@simplewebauthn/browser'
 import { computed, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -15,8 +16,9 @@ const recoveryCode = ref('')
 const providers = ref<OAuthProvider[]>([])
 const error = ref('')
 const loading = ref(false)
+const passkeyLoading = ref(false)
 const providerLoading = ref('')
-const mfaChallenge = ref(false)
+const passkeysSupported = ref(false)
 
 const redirectTarget = computed(() => {
   return safeInternalRedirect(route.query.redirect)
@@ -37,7 +39,6 @@ const oauthLoginContext = computed(() => {
     return {}
   }
 })
-const showMfaFields = computed(() => isStepUp.value || mfaChallenge.value || Boolean(totpCode.value || recoveryCode.value))
 const signupRoute = computed(() =>
   redirectTarget.value ? { path: '/signup', query: { redirect: redirectTarget.value } } : '/signup',
 )
@@ -64,21 +65,43 @@ async function startProvider(provider: OAuthProvider) {
   }
 }
 
+async function finishSignIn() {
+  if (redirectTarget.value.startsWith('/oauth/')) {
+    window.location.assign(gatekeeperApiUrl(redirectTarget.value))
+    return
+  }
+  await router.push(redirectTarget.value || '/account')
+}
+
+async function signInWithPasskey() {
+  error.value = ''
+  passkeyLoading.value = true
+  try {
+    const options = await api.passkeyAuthenticationOptions(oauthLoginContext.value)
+    const credential = await startAuthentication({ optionsJSON: options.public_key })
+    await api.authenticateWithPasskey(options.challenge_id, credential)
+    await finishSignIn()
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Passkey sign-in failed'
+  } finally {
+    passkeyLoading.value = false
+  }
+}
+
 async function submit() {
   error.value = ''
   loading.value = true
   try {
     await api.login(email.value, password.value, totpCode.value, recoveryCode.value, oauthLoginContext.value)
-    if (redirectTarget.value.startsWith('/oauth/')) {
-      window.location.assign(gatekeeperApiUrl(redirectTarget.value))
-      return
-    }
-    router.push(redirectTarget.value || '/account')
+    await finishSignIn()
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Sign in failed'
     if (message.includes('TOTP code required') || message.includes('MFA required')) {
-      mfaChallenge.value = true
       error.value = 'Enter an authenticator code or recovery code to finish this sign in.'
+    } else if (message.includes('Passkey verification required')) {
+      error.value = passkeysSupported.value
+        ? 'This account uses a passkey. Choose “Sign in with a passkey” above.'
+        : 'This account uses a passkey. Open GateKeeper from a secure browser that supports passkeys.'
     } else {
       error.value = message
     }
@@ -87,7 +110,10 @@ async function submit() {
   }
 }
 
-onMounted(loadProviders)
+onMounted(() => {
+  passkeysSupported.value = browserSupportsWebAuthn()
+  loadProviders()
+})
 </script>
 
 <template>
@@ -125,8 +151,18 @@ onMounted(loadProviders)
         <p class="mono-label">GateKeeper</p>
         <h1 class="mt-3 text-2xl font-semibold leading-tight">{{ isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
         <p class="mt-3 text-sm leading-6 text-muted">
-          {{ isStepUp ? 'This application requires a fresh MFA-backed GateKeeper session.' : 'Manage auth from your self-hosted control plane.' }}
+          {{ isStepUp ? 'Use a passkey or your password and authenticator to verify this sign in.' : 'Use a passkey, or sign in with your password.' }}
         </p>
+
+        <button
+          v-if="passkeysSupported"
+          type="button"
+          class="btn-primary mt-7 w-full text-sm"
+          :disabled="loading || passkeyLoading || Boolean(providerLoading)"
+          @click="signInWithPasskey"
+        >
+          {{ passkeyLoading ? 'Waiting for passkey' : 'Sign in with a passkey' }}
+        </button>
 
         <div v-if="configuredProviders.length" class="mt-7 grid gap-2">
           <button
@@ -150,16 +186,13 @@ onMounted(loadProviders)
             Password
             <input v-model="password" class="input" type="password" autocomplete="current-password" required />
           </label>
-          <div
-            v-if="showMfaFields"
-            class="rounded-md border border-border bg-surface p-3"
-          >
-            <p class="text-sm font-semibold text-fg">Additional verification</p>
+          <div class="rounded-md border border-border bg-surface p-3">
+            <p class="text-sm font-semibold text-fg">Two-factor verification</p>
             <p class="mt-1 text-xs leading-5 text-muted">
-              Use a current authenticator code, or a recovery code if the authenticator is unavailable.
+              If your account uses an authenticator, enter the current code now. You do not need to submit the form first.
             </p>
           </div>
-          <label v-if="showMfaFields" class="auth-field">
+          <label class="auth-field">
             Authenticator code
             <input
               v-model="totpCode"
@@ -169,7 +202,7 @@ onMounted(loadProviders)
               placeholder="Optional unless 2FA is enabled"
             />
           </label>
-          <label v-if="showMfaFields" class="auth-field">
+          <label class="auth-field">
             Recovery code
             <input
               v-model="recoveryCode"

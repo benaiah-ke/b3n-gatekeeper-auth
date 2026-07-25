@@ -28,7 +28,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | Endpoint | Surface | Use |
 | --- | --- | --- |
 | `POST /api/v1/auth/signup` | Provider API | Product-owned signup. |
-| `POST /api/v1/auth/login` | Provider API | Product-owned signin. Accepts optional `client_id`, `totp_code`, and recovery code. |
+| `POST /api/v1/auth/login` | Provider API | Product-owned password signin. Accepts optional `client_id`, `totp_code`, and recovery code; passkey-enrolled accounts cannot downgrade to password-only signin. |
 | `POST /api/v1/auth/refresh` | Provider API | Rotate a refresh token and issue a new access token. |
 | `POST /api/v1/auth/session/switch-org` | Provider API | Issue a fresh session token for a selected organization, optional client, scope, and audience. |
 | `POST /api/v1/auth/logout` | Provider API | Revoke the current session/refresh family when called with a session-bound token. |
@@ -40,7 +40,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `GET /api/v1/auth/identities` | Provider API | List social/federated identities linked to the current account. |
 | `GET /api/v1/auth/identities/{provider_id}/link/start` | Provider API | Start a signed, current-session-bound OAuth flow to link a provider identity to the current account. |
 | `DELETE /api/v1/auth/identities/{identity_id}` | Provider API | Unlink a social/federated identity when another sign-in method remains. |
-| `GET /api/v1/auth/account/export` | Provider API | Export current account profile, memberships, sessions, grants, token metadata, identities, and recent audit events. |
+| `GET /api/v1/auth/account/export` | Provider API | Export current account profile, memberships, passkey metadata, sessions, grants, token metadata, identities, and recent audit events. |
 | `POST /api/v1/auth/account/deactivate` | Provider API | Deactivate the current account with proof, last-owner protection, and revocation cleanup. |
 | `POST /api/v1/auth/email-code/request` | Provider API | Request email code for login, verification, or password reset. |
 | `POST /api/v1/auth/email-code/verify` | Provider API | Verify an email code and issue tokens where applicable. |
@@ -60,7 +60,14 @@ product wants to own its own auth screens, use the provider APIs directly.
 
 | Endpoint | Surface | Use |
 | --- | --- | --- |
-| `GET /api/v1/auth/mfa/status` | Provider API | Current authenticator and recovery-code state. |
+| `GET /api/v1/auth/mfa/status` | Provider API | Current passkey count, authenticator state, and recovery-code count. |
+| `GET /api/v1/auth/passkeys` | Provider API | List the current user's active passkey metadata. |
+| `POST /api/v1/auth/passkeys/registration/options` | Provider API | Start a session-bound, user-verifying passkey registration ceremony. |
+| `POST /api/v1/auth/passkeys/registration/verify` | Provider API | Verify registration and store the passkey public credential. |
+| `POST /api/v1/auth/passkeys/authentication/options` | Provider API | Start discoverable passwordless passkey authentication, optionally bound to client/scope/audience context. |
+| `POST /api/v1/auth/passkeys/authentication/verify` | Provider API | Verify a passkey assertion and issue a `webauthn`-assured user session. |
+| `PATCH /api/v1/auth/passkeys/{credential_id}` | Provider API | Rename a passkey owned by the current user. |
+| `DELETE /api/v1/auth/passkeys/{credential_id}` | Provider API | Revoke a passkey while preserving at least one sign-in method. |
 | `POST /api/v1/auth/mfa/totp/setup` | Provider API | Create a pending TOTP setup secret and `otpauth://` URI. |
 | `POST /api/v1/auth/mfa/totp/enable` | Provider API | Confirm TOTP and return copy-once recovery codes. |
 | `POST /api/v1/auth/mfa/recovery-codes/regenerate` | Provider API | Replace unused recovery codes after TOTP verification. |
@@ -86,7 +93,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `GET /api/v1/invitations` | Operator API | List organization invitations. |
 | `POST /api/v1/invitations` | Operator API | Create an invitation and receive the copy-once token. |
 | `DELETE /api/v1/invitations/{invitation_id}` | Operator API | Revoke a pending invitation. |
-| `POST /api/v1/auth/invitations/accept` | Provider API | Product-owned or hosted invitation acceptance. |
+| `POST /api/v1/auth/invitations/accept` | Provider API | Product-owned or hosted invitation acceptance. Existing passkey users can use an active passkey session; password-only factor bypass is rejected. |
 
 ## OAuth, Device, And Machine Flows
 
@@ -97,7 +104,9 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `GET /api/v1/oauth/authorize/context` | Hosted UI backing API | Context for the hosted authorize page. |
 | `POST /oauth/token` | OAuth/OIDC | Authorization-code, refresh-token, device-code, and client-credentials exchange. |
 | `POST /oauth/device_authorization` | OAuth/OIDC | Start CLI/device authorization. |
-| `POST /api/v1/auth/device/approve` | Provider API | Approve a device flow from a signed-in account. |
+| `POST /api/v1/auth/device/approve` | Provider API | Approve or deny a device flow from an active session, with TOTP/recovery input when required. |
+| `POST /api/v1/auth/device/passkey/options` | Provider API | Start a current-user passkey assertion bound to a pending device grant. |
+| `POST /api/v1/auth/device/passkey/verify` | Provider API | Verify the assertion and approve the device grant with `webauthn` assurance. |
 | `POST /oauth/revoke` | OAuth/OIDC | Token revocation. |
 | `POST /oauth/introspect` | OAuth/OIDC | Opaque token and signed JWT introspection with session, membership, and client-disabled checks. |
 | `POST /oauth/register` | OAuth/OIDC | Dynamic client registration placeholder, disabled until policy exists. |
@@ -190,5 +199,7 @@ product wants to own its own auth screens, use the provider APIs directly.
   organization admin step-up MFA policy, and organization user hard-delete
   policy are implemented; organization audit retention/pruning is explicit
   operator policy; adaptive risk signals still need provider APIs.
-- WebAuthn/passkey tables exist in the data model but product endpoints are not
-  implemented yet.
+- Passkey registration, passwordless authentication, account management,
+  invitation assurance, and signed-in device approval are implemented.
+  Adaptive risk scoring and attestation policy beyond normal WebAuthn
+  verification remain future policy work.

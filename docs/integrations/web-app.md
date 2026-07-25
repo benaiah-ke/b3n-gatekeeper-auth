@@ -62,9 +62,14 @@ explicit approval flag and then issues the authorization code.
 When the requested client or selected organization requires MFA and the current
 GateKeeper browser session only proves password authentication,
 `/oauth/authorize` redirects to hosted login with `step_up=mfa`. The hosted
-login page asks for an authenticator or recovery code, creates a fresh
-client-bound session using the same OAuth `client_id`, `scope`, and `audience`,
-then navigates back to the original authorization request.
+login page offers a passkey and shows authenticator/recovery inputs immediately.
+It creates a fresh client-bound session using the same OAuth `client_id`,
+`scope`, and `audience`, then navigates back to the original authorization
+request.
+
+Passkey credentials belong to the GateKeeper hosted UI RP, not the product
+application origin. Configure the GateKeeper RP ID and exact hosted UI origin
+as described in [passkeys.md](passkeys.md).
 
 Configured OIDC/social providers appear on the hosted login and signup screens.
 When a hosted OAuth authorization request redirects to login first, provider

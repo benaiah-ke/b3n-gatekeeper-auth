@@ -23,6 +23,11 @@ import {
   type GateKeeperOAuthProvider,
   type GateKeeperOAuthProviderUpdate,
   type GateKeeperOrg,
+  type GateKeeperPasskeyAuthenticationParams,
+  type GateKeeperPasskeyCredential,
+  type GateKeeperPasskeyOptions,
+  type GateKeeperPasskeyRegistrationParams,
+  type GateKeeperPasskeyVerifyParams,
   type GateKeeperPasswordChangeParams,
   type GateKeeperPasswordChangeResponse,
   type GateKeeperPasswordResetConfirmParams,
@@ -277,6 +282,49 @@ export function useGateKeeperAuth(options: UseGateKeeperAuthOptions = {}) {
 
   async function loginWithPassword(params: GateKeeperLoginParams): Promise<GateKeeperTokenResponse> {
     return runTokenFlow(() => client.login(params), 'GateKeeper password login failed')
+  }
+
+  async function passkeyAuthenticationOptions(
+    params: GateKeeperPasskeyAuthenticationParams = {},
+  ): Promise<GateKeeperPasskeyOptions> {
+    return client.passkeyAuthenticationOptions(params)
+  }
+
+  async function loginWithPasskey(params: GateKeeperPasskeyVerifyParams): Promise<GateKeeperTokenResponse> {
+    return runTokenFlow(
+      () => client.verifyPasskeyAuthentication(params),
+      'GateKeeper passkey login failed',
+    )
+  }
+
+  async function passkeys(): Promise<GateKeeperPasskeyCredential[]> {
+    return client.passkeys(requireAccessToken())
+  }
+
+  async function passkeyRegistrationOptions(): Promise<GateKeeperPasskeyOptions> {
+    return client.passkeyRegistrationOptions(requireAccessToken())
+  }
+
+  async function registerPasskey(
+    params: GateKeeperPasskeyRegistrationParams,
+  ): Promise<GateKeeperPasskeyCredential> {
+    return client.registerPasskey(requireAccessToken(), params)
+  }
+
+  async function renamePasskey(credentialId: string, name: string): Promise<GateKeeperPasskeyCredential> {
+    return client.renamePasskey(requireAccessToken(), credentialId, name)
+  }
+
+  async function revokePasskey(credentialId: string) {
+    return client.revokePasskey(requireAccessToken(), credentialId)
+  }
+
+  async function devicePasskeyOptions(userCode: string, orgId?: string | null): Promise<GateKeeperPasskeyOptions> {
+    return client.devicePasskeyOptions(requireAccessToken(), userCode, orgId)
+  }
+
+  async function verifyDevicePasskey(params: GateKeeperPasskeyVerifyParams) {
+    return client.verifyDevicePasskey(requireAccessToken(), params)
   }
 
   async function acceptInvitation(params: GateKeeperInvitationAcceptParams): Promise<GateKeeperTokenResponse> {
@@ -576,6 +624,15 @@ export function useGateKeeperAuth(options: UseGateKeeperAuthOptions = {}) {
     needsRefresh,
     signup,
     loginWithPassword,
+    passkeyAuthenticationOptions,
+    loginWithPasskey,
+    passkeys,
+    passkeyRegistrationOptions,
+    registerPasskey,
+    renamePasskey,
+    revokePasskey,
+    devicePasskeyOptions,
+    verifyDevicePasskey,
     acceptInvitation,
     requestEmailCode,
     verifyEmailCode,

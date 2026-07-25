@@ -84,9 +84,15 @@ await gatekeeper.confirmPasswordReset({
 })
 ```
 
+For a product-owned passkey button, obtain options from
+`gatekeeper.passkeyAuthenticationOptions()`, pass `public_key` to a WebAuthn
+browser helper, then call `gatekeeper.verifyPasskeyAuthentication()`. The same
+client exposes registration, list, rename, removal, and device-approval
+ceremony endpoints. See [passkeys.md](passkeys.md) for a complete example.
+
 `gatekeeper-js` also includes refresh, logout, client-credentials token
 exchange, direct signup/signin/invitation/email-code/password-reset helpers,
-`/me`, protected-resource metadata, API-token validation, API-token
+passkey ceremony helpers, `/me`, protected-resource metadata, API-token validation, API-token
 list/create/rotate/revoke helpers, session revocation, global signout,
 connected-app grant listing, and grant revocation helpers.
 

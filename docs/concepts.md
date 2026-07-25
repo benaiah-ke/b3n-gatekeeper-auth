@@ -58,6 +58,14 @@ A session represents a user-bound login. Device inventory and session rules are
 part of the target product surface: operators should be able to see, revoke, and
 policy-control browser, CLI, and MCP sessions from one account view.
 
+## Passkey And MFA
+
+A passkey is a WebAuthn public-key credential owned by a user. GateKeeper stores
+the public credential and verification metadata; the private key remains with
+the user's authenticator. Passkey sessions carry `amr=["webauthn"]` and satisfy
+the same client, organization, device, and admin step-up policies as TOTP or a
+recovery code. See [integrations/passkeys.md](integrations/passkeys.md).
+
 ## API Token Or Key
 
 API tokens are opaque GateKeeper credentials for personal, service, project,

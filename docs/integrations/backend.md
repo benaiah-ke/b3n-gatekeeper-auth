@@ -63,7 +63,8 @@ Session-bound user JWTs include:
 - `sub`: GateKeeper user id.
 - `email`, `email_verified`, and `display_name`.
 - `session_id`: backing session id used for revocation checks.
-- `mfa_totp_enabled` and `amr`: MFA enrollment and authentication-method evidence.
+- `mfa_totp_enabled`, `mfa_passkey_enabled`, and `amr`: MFA enrollment and
+  authentication-method evidence. Passkey sessions use `webauthn` in `amr`.
 - `org_id`: selected organization when the token is organization-bound.
 - `org_slug`, `org_role`, and `permissions`: active membership claims for the
   selected organization.
