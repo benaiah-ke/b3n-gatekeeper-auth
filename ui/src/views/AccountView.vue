@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { browserSupportsWebAuthn, startRegistration } from '@simplewebauthn/browser'
 import {
   BadgeCheck,
   CheckCircle2,
@@ -32,7 +33,17 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRouter } from 'vue-router'
 
 import { api, clearTokens } from '@/services/api'
-import type { ApiToken, AuthClient, LinkedIdentity, MfaStatus, OAuthProvider, Project, SetupStatus, TotpSetup } from '@/types'
+import type {
+  ApiToken,
+  AuthClient,
+  LinkedIdentity,
+  MfaStatus,
+  OAuthProvider,
+  PasskeyCredential,
+  Project,
+  SetupStatus,
+  TotpSetup,
+} from '@/types'
 
 const router = useRouter()
 const status = ref<SetupStatus | null>(null)
@@ -66,6 +77,11 @@ const deactivateLoading = ref(false)
 const identityNotice = ref('')
 const identityLoading = ref('')
 const mfa = ref<MfaStatus | null>(null)
+const passkeys = ref<PasskeyCredential[]>([])
+const passkeyName = ref('')
+const passkeyNames = ref<Record<string, string>>({})
+const passkeyLoading = ref(false)
+const passkeysSupported = ref(false)
 const totpSetup = ref<TotpSetup | null>(null)
 const totpCode = ref('')
 const recoveryCodes = ref<string[]>([])
@@ -101,6 +117,7 @@ const suggestedScopes = computed(() => {
   const values = webClient.value?.scopes?.length ? webClient.value.scopes : ['openid', 'profile', 'email', 'api:read']
   return values.join(' ')
 })
+const hasMfaEnrollment = computed(() => Boolean(mfa.value?.totp_enabled || mfa.value?.passkey_count))
 
 const sessionSummary = computed(() => {
   if (!status.value?.access_expires_at) {
@@ -110,8 +127,14 @@ const sessionSummary = computed(() => {
 })
 
 const mfaStateLabel = computed(() => {
+  if (mfa.value?.totp_enabled && mfa.value.passkey_count) {
+    return 'passkey + authenticator'
+  }
+  if (mfa.value?.passkey_count) {
+    return mfa.value.passkey_count === 1 ? 'passkey enabled' : `${mfa.value.passkey_count} passkeys`
+  }
   if (mfa.value?.totp_enabled) {
-    return 'enabled'
+    return 'authenticator enabled'
   }
   if (mfa.value?.totp_pending || totpSetup.value) {
     return 'setup pending'
@@ -120,14 +143,20 @@ const mfaStateLabel = computed(() => {
 })
 
 const mfaDetail = computed(() => {
+  const passkeyDetail = mfa.value?.passkey_count
+    ? `${mfa.value.passkey_count} passkey${mfa.value.passkey_count === 1 ? '' : 's'} can sign in and satisfy MFA.`
+    : ''
   if (mfa.value?.totp_enabled) {
     const enabledAt = mfa.value.totp_enabled_at ? new Date(mfa.value.totp_enabled_at).toLocaleString() : 'enabled'
-    return `Authenticator 2FA active since ${enabledAt}. ${mfa.value.recovery_codes_remaining} recovery codes remain.`
+    return `${passkeyDetail ? `${passkeyDetail} ` : ''}Authenticator 2FA active since ${enabledAt}. ${mfa.value.recovery_codes_remaining} recovery codes remain.`
+  }
+  if (passkeyDetail) {
+    return passkeyDetail
   }
   if (mfa.value?.totp_pending || totpSetup.value) {
     return 'Verify an authenticator code to finish setup'
   }
-  return 'Add authenticator 2FA before inviting operators or connecting production apps'
+  return 'Add a passkey or authenticator before inviting operators or protecting apps with MFA'
 })
 
 const recoveryCodesText = computed(() => recoveryCodes.value.join('\n'))
@@ -173,8 +202,8 @@ const setupSteps = computed(() => [
     to: '/account',
   },
   {
-    title: 'Authenticator 2FA',
-    done: Boolean(mfa.value?.totp_enabled),
+    title: 'MFA enrollment',
+    done: hasMfaEnrollment.value,
     detail: mfaDetail.value,
     to: '/account',
   },
@@ -262,7 +291,7 @@ const policyHealthItems = computed(() => {
     {
       key: 'mfa',
       label: 'MFA enrollment',
-      severity: mfa.value?.totp_enabled ? 'ready' : 'warning',
+      severity: hasMfaEnrollment.value ? 'ready' : 'warning',
       detail: mfaDetail.value,
       to: '/account',
     },
@@ -553,11 +582,12 @@ async function load() {
     status.value = setup
     displayName.value = setup.user?.display_name || ''
     emailChangeNewEmail.value = setup.user?.email || ''
-    const [clientRows, tokenRows, projectRows, mfaStatus, identities, providers] = await Promise.all([
+    const [clientRows, tokenRows, projectRows, mfaStatus, passkeyRows, identities, providers] = await Promise.all([
       api.clients(),
       api.tokens(),
       api.projects(setup.org?.id),
       api.mfaStatus(),
+      api.passkeys(),
       api.linkedIdentities(),
       api.oauthProviders(),
     ])
@@ -565,6 +595,8 @@ async function load() {
     tokens.value = tokenRows
     projects.value = projectRows
     mfa.value = mfaStatus
+    passkeys.value = passkeyRows
+    passkeyNames.value = Object.fromEntries(passkeyRows.map((passkey) => [passkey.id, passkey.name]))
     linkedIdentities.value = identities
     oauthProviders.value = providers
     if (setup.scopes.includes('*') || setup.scopes.includes('mcp:*')) {
@@ -815,7 +847,68 @@ async function disableTotp() {
   }
 }
 
-onMounted(load)
+async function registerPasskey() {
+  passkeyLoading.value = true
+  error.value = ''
+  mfaNotice.value = ''
+  try {
+    const options = await api.passkeyRegistrationOptions()
+    const credential = await startRegistration({ optionsJSON: options.public_key })
+    const registered = await api.registerPasskey(options.challenge_id, credential, passkeyName.value || undefined)
+    passkeys.value = [...passkeys.value, registered]
+    passkeyNames.value[registered.id] = registered.name
+    passkeyName.value = ''
+    mfa.value = await api.mfaStatus()
+    mfaNotice.value = 'Passkey added.'
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Could not add passkey'
+  } finally {
+    passkeyLoading.value = false
+  }
+}
+
+async function renamePasskey(passkey: PasskeyCredential) {
+  const name = passkeyNames.value[passkey.id]?.trim()
+  if (!name || name === passkey.name) {
+    return
+  }
+  passkeyLoading.value = true
+  error.value = ''
+  try {
+    const updated = await api.renamePasskey(passkey.id, name)
+    passkeys.value = passkeys.value.map((item) => (item.id === updated.id ? updated : item))
+    passkeyNames.value[updated.id] = updated.name
+    mfaNotice.value = 'Passkey name updated.'
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Could not rename passkey'
+  } finally {
+    passkeyLoading.value = false
+  }
+}
+
+async function removePasskey(passkey: PasskeyCredential) {
+  if (!window.confirm(`Remove “${passkey.name}”? You will no longer be able to use it to sign in.`)) {
+    return
+  }
+  passkeyLoading.value = true
+  error.value = ''
+  try {
+    await api.revokePasskey(passkey.id)
+    passkeys.value = passkeys.value.filter((item) => item.id !== passkey.id)
+    delete passkeyNames.value[passkey.id]
+    mfa.value = await api.mfaStatus()
+    mfaNotice.value = 'Passkey removed.'
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Could not remove passkey'
+  } finally {
+    passkeyLoading.value = false
+  }
+}
+
+onMounted(() => {
+  passkeysSupported.value = browserSupportsWebAuthn()
+  load()
+})
 </script>
 
 <template>
@@ -1455,6 +1548,92 @@ onMounted(load)
           </article>
 
           <section class="grid gap-4 content-start">
+            <article class="panel p-5">
+              <div class="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p class="mono-label">Sign-in methods</p>
+                  <h2 class="mt-2 text-xl font-semibold">Passkeys</h2>
+                </div>
+                <span class="rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs text-muted">
+                  {{ passkeys.length }}
+                </span>
+              </div>
+              <p class="mt-3 text-sm leading-6 text-muted">
+                Sign in with your device unlock instead of a password. Passkeys also satisfy GateKeeper MFA policies.
+              </p>
+
+              <div v-if="passkeys.length" class="mt-4 grid gap-3">
+                <article
+                  v-for="passkey in passkeys"
+                  :key="passkey.id"
+                  class="grid gap-3 rounded-md border border-border bg-surface p-3"
+                >
+                  <div class="flex items-start gap-3">
+                    <MonitorSmartphone class="mt-1 h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+                    <div class="min-w-0 flex-1">
+                      <input
+                        v-model="passkeyNames[passkey.id]"
+                        class="input"
+                        :aria-label="`Name for ${passkey.name}`"
+                        maxlength="160"
+                      />
+                      <p class="mt-2 text-xs leading-5 text-muted">
+                        Added {{ new Date(passkey.created_at).toLocaleDateString() }}
+                        <template v-if="passkey.last_used_at">
+                          · Last used {{ new Date(passkey.last_used_at).toLocaleString() }}
+                        </template>
+                        <template v-if="passkey.backed_up"> · Synced</template>
+                      </p>
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      class="btn-secondary min-h-8 px-2.5 text-xs"
+                      :disabled="passkeyLoading || !passkeyNames[passkey.id]?.trim() || passkeyNames[passkey.id]?.trim() === passkey.name"
+                      @click="renamePasskey(passkey)"
+                    >
+                      Save name
+                    </button>
+                    <button
+                      type="button"
+                      class="btn-secondary min-h-8 gap-2 px-2.5 text-xs"
+                      :disabled="passkeyLoading"
+                      @click="removePasskey(passkey)"
+                    >
+                      <Trash2 class="h-3.5 w-3.5" aria-hidden="true" />
+                      Remove
+                    </button>
+                  </div>
+                </article>
+              </div>
+
+              <div class="mt-4 grid gap-3">
+                <label class="grid gap-2 text-sm text-muted">
+                  Passkey name
+                  <input
+                    v-model="passkeyName"
+                    class="input"
+                    placeholder="This laptop"
+                    maxlength="160"
+                    :disabled="passkeyLoading || !passkeysSupported"
+                  />
+                </label>
+                <button
+                  type="button"
+                  class="btn-primary w-fit gap-2 text-sm"
+                  :disabled="passkeyLoading || !passkeysSupported"
+                  @click="registerPasskey"
+                >
+                  <KeyRound class="h-4 w-4" aria-hidden="true" />
+                  {{ passkeyLoading ? 'Waiting for passkey' : 'Add a passkey' }}
+                </button>
+                <p v-if="!passkeysSupported" class="text-xs leading-5 text-muted">
+                  Passkeys are not available in this browser.
+                </p>
+              </div>
+            </article>
+
             <article class="panel p-5">
               <p class="mono-label">Security routes</p>
               <div class="mt-4 grid gap-3">

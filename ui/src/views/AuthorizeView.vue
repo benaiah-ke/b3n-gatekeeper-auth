@@ -204,7 +204,7 @@ onMounted(load)
         class="mt-3 flex gap-3 rounded-md border border-green/35 bg-green/10 p-4 text-sm leading-6 text-green"
       >
         <ShieldCheck class="mt-0.5 h-5 w-5 shrink-0" aria-hidden="true" />
-        <p>This app requires authenticator verification for stronger account protection.</p>
+        <p>This app requires a passkey or authenticator verification for stronger account protection.</p>
       </div>
 
       <details class="mt-5 rounded-md border border-border bg-bg/40 p-4 text-sm text-muted">

@@ -31,6 +31,7 @@ class UserAdminRead(UserRead):
     created_at: datetime
     updated_at: datetime
     mfa_totp_enabled_at: datetime | None = None
+    passkey_count: int = 0
     memberships: list[MembershipRead] = []
 
 
@@ -252,7 +253,7 @@ class InvitationCreateResponse(InvitationRead):
 class InvitationAcceptRequest(BaseModel):
     email: EmailStr
     token: str
-    password: str = Field(..., min_length=12)
+    password: str | None = Field(default=None, min_length=12)
     display_name: str | None = Field(default=None, max_length=160)
     totp_code: str | None = None
     recovery_code: str | None = None
@@ -410,6 +411,16 @@ class PasskeyAuthenticationOptionsRead(BaseModel):
 
 
 class PasskeyAuthenticationVerifyRequest(BaseModel):
+    challenge_id: str
+    credential: dict[str, Any]
+
+
+class PasskeyDeviceOptionsRequest(BaseModel):
+    user_code: str = Field(..., min_length=4, max_length=32)
+    org_id: str | None = None
+
+
+class PasskeyDeviceVerifyRequest(BaseModel):
     challenge_id: str
     credential: dict[str, Any]
 

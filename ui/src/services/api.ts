@@ -18,6 +18,11 @@ import type {
   OAuthProviderAdminCreate,
   OAuthProviderAdminUpdate,
   Org,
+  PasskeyAuthenticationOptions,
+  PasskeyAuthenticationResponse,
+  PasskeyCredential,
+  PasskeyRegistrationOptions,
+  PasskeyRegistrationResponse,
   PasswordChangeResult,
   Project,
   Role,
@@ -288,7 +293,7 @@ export const api = {
   },
   async acceptInvitation(
     email: string,
-    password: string,
+    password: string | undefined,
     token: string,
     displayName?: string,
     totpCode?: string,
@@ -298,7 +303,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         email,
-        password,
+        password: password || null,
         token,
         display_name: displayName || null,
         totp_code: totpCode || null,
@@ -397,6 +402,63 @@ export const api = {
   },
   mfaStatus() {
     return request<MfaStatus>('/api/v1/auth/mfa/status')
+  },
+  passkeys() {
+    return request<PasskeyCredential[]>('/api/v1/auth/passkeys')
+  },
+  passkeyRegistrationOptions() {
+    return request<PasskeyRegistrationOptions>('/api/v1/auth/passkeys/registration/options', {
+      method: 'POST',
+    })
+  },
+  registerPasskey(challengeId: string, credential: PasskeyRegistrationResponse, name?: string) {
+    return request<PasskeyCredential>('/api/v1/auth/passkeys/registration/verify', {
+      method: 'POST',
+      body: JSON.stringify({
+        challenge_id: challengeId,
+        credential,
+        name: name || null,
+      }),
+    })
+  },
+  passkeyAuthenticationOptions(
+    context: { clientId?: string | null; scope?: string | null; audience?: string | null } = {},
+  ) {
+    return request<PasskeyAuthenticationOptions>(
+      '/api/v1/auth/passkeys/authentication/options',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          client_id: context.clientId || null,
+          scope: context.scope || null,
+          audience: context.audience || null,
+        }),
+      },
+      false,
+    )
+  },
+  async authenticateWithPasskey(challengeId: string, credential: PasskeyAuthenticationResponse) {
+    const result = await request<TokenResponse>(
+      '/api/v1/auth/passkeys/authentication/verify',
+      {
+        method: 'POST',
+        body: JSON.stringify({ challenge_id: challengeId, credential }),
+      },
+      false,
+    )
+    saveTokens(result)
+    return result
+  },
+  renamePasskey(id: string, name: string) {
+    return request<PasskeyCredential>(`/api/v1/auth/passkeys/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ name }),
+    })
+  },
+  revokePasskey(id: string) {
+    return request<{ status: string; id: string }>(`/api/v1/auth/passkeys/${id}`, {
+      method: 'DELETE',
+    })
   },
   setupTotp() {
     return request<TotpSetup>('/api/v1/auth/mfa/totp/setup', { method: 'POST' })
@@ -572,6 +634,18 @@ export const api = {
         totp_code: totpCode || null,
         recovery_code: recoveryCode || null,
       }),
+    })
+  },
+  devicePasskeyOptions(userCode: string, orgId?: string) {
+    return request<PasskeyAuthenticationOptions>('/api/v1/auth/device/passkey/options', {
+      method: 'POST',
+      body: JSON.stringify({ user_code: userCode, org_id: orgId || null }),
+    })
+  },
+  verifyDevicePasskey(challengeId: string, credential: PasskeyAuthenticationResponse) {
+    return request<{ status: string }>('/api/v1/auth/device/passkey/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challenge_id: challengeId, credential }),
     })
   },
   clients() {

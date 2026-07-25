@@ -2487,6 +2487,20 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
     monkeypatch.setattr(main_module, "verify_authentication_response", fake_verify_authentication_response)
 
     async with await client() as ac:
+        inviter = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "inviter@example.com", "password": "correct horse battery"},
+        )
+        assert inviter.status_code == 200
+        inviter_access = inviter.json()["access_token"]
+        inviter_org_id = inviter.json()["orgs"][0]["id"]
+        invitation = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {inviter_access}"},
+            json={"email": "passkey@example.com", "org_id": inviter_org_id, "role": "operator"},
+        )
+        assert invitation.status_code == 200
+
         signup = await ac.post(
             "/api/v1/auth/signup",
             json={"email": "passkey@example.com", "password": "correct horse battery"},
@@ -2602,11 +2616,98 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         assert authentication_verification["expected_origin"] == ["http://localhost:5173"]
         assert authentication_verification["require_user_verification"] is True
 
+        accepted_invitation = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            headers={"Authorization": f"Bearer {authenticated.json()['access_token']}"},
+            json={
+                "email": "passkey@example.com",
+                "token": invitation.json()["token"],
+            },
+        )
+        assert accepted_invitation.status_code == 200
+        assert decode_access_token(accepted_invitation.json()["access_token"])["amr"] == ["webauthn"]
+        password_fallback_invitation = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {inviter_access}"},
+            json={"email": "passkey@example.com", "org_id": inviter_org_id, "role": "viewer"},
+        )
+        assert password_fallback_invitation.status_code == 200
+        ac.cookies.clear()
+        password_fallback = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={
+                "email": "passkey@example.com",
+                "password": "correct horse battery",
+                "token": password_fallback_invitation.json()["token"],
+            },
+        )
+        assert password_fallback.status_code == 401
+        assert password_fallback.json()["detail"] == "Passkey sign-in required"
+
         async with async_session_factory() as db:
             credential = await db.get(WebAuthnCredential, passkey_id)
             assert credential is not None
             assert credential.sign_count == 4
             assert credential.last_used_at is not None
+
+        device = await ac.post(
+            "/oauth/device_authorization",
+            json={"client_id": "gatekeeper-cli", "scope": "auth:read", "audience": "gatekeeper-api"},
+        )
+        assert device.status_code == 200
+        ac.cookies.clear()
+        unauthenticated_options = await ac.post(
+            "/api/v1/auth/device/passkey/options",
+            json={"user_code": device.json()["user_code"]},
+        )
+        assert unauthenticated_options.status_code == 401
+        passkey_device_options = await ac.post(
+            "/api/v1/auth/device/passkey/options",
+            headers={"Authorization": f"Bearer {authenticated.json()['access_token']}"},
+            json={"user_code": device.json()["user_code"]},
+        )
+        assert passkey_device_options.status_code == 200
+        assert passkey_device_options.json()["public_key"]["allowCredentials"][0]["id"] == credential_id
+        device_challenge_id = passkey_device_options.json()["challenge_id"]
+        device_approved = await ac.post(
+            "/api/v1/auth/device/passkey/verify",
+            headers={"Authorization": f"Bearer {authenticated.json()['access_token']}"},
+            json={
+                "challenge_id": device_challenge_id,
+                "credential": {
+                    "id": credential_id,
+                    "rawId": credential_id,
+                    "type": "public-key",
+                    "response": {
+                        "authenticatorData": "authenticator-data",
+                        "clientDataJSON": "client-data",
+                        "signature": "signature",
+                        "userHandle": None,
+                    },
+                },
+            },
+        )
+        assert device_approved.status_code == 200
+        assert device_approved.json()["status"] == "approved"
+        device_replay = await ac.post(
+            "/api/v1/auth/device/passkey/verify",
+            headers={"Authorization": f"Bearer {authenticated.json()['access_token']}"},
+            json={"challenge_id": device_challenge_id, "credential": {"id": credential_id}},
+        )
+        assert device_replay.status_code == 400
+        device_token = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert device_token.status_code == 200
+        assert "webauthn" in decode_access_token(
+            device_token.json()["access_token"],
+            audience="gatekeeper-api",
+        )["amr"]
 
         revoked = await ac.delete(
             f"/api/v1/auth/passkeys/{passkey_id}",

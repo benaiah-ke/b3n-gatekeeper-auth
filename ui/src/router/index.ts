@@ -23,7 +23,7 @@ import VerifyView from '@/views/VerifyView.vue'
 import { gatekeeperApiUrl, hasAuthenticatedSession } from '@/services/api'
 import { safeInternalRedirect } from '@/services/redirects'
 
-const publicRoutes = new Set(['/login', '/signup', '/verify', '/reset-password', '/device', '/accept-invite'])
+const publicRoutes = new Set(['/login', '/signup', '/verify', '/reset-password', '/accept-invite'])
 
 const router = createRouter({
   history: createWebHistory(),

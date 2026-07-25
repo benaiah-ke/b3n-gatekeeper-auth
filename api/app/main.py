@@ -107,6 +107,8 @@ from app.schemas import (
     PasskeyAuthenticationVerifyRequest,
     PasskeyCredentialRead,
     PasskeyCredentialUpdate,
+    PasskeyDeviceOptionsRequest,
+    PasskeyDeviceVerifyRequest,
     PasskeyRegistrationOptionsRead,
     PasskeyRegistrationVerifyRequest,
     PasswordChangeRequest,
@@ -1514,7 +1516,11 @@ async def unlink_identity(
     identity = await db.get(Identity, identity_id)
     if not identity or identity.user_id != user.id:
         raise HTTPException(status_code=404, detail="Linked identity not found")
-    if not user.password_hash and await count_user_identities(db, user.id) <= 1:
+    if (
+        not user.password_hash
+        and await count_user_identities(db, user.id) <= 1
+        and await active_passkey_count(db, user.id) == 0
+    ):
         raise HTTPException(status_code=400, detail="Cannot unlink the last sign-in method")
     target_id = identity.id
     provider = identity.provider
@@ -1556,6 +1562,7 @@ async def export_account(
         .order_by(OAuthGrant.created_at.desc())
     )
     identity_result = await db.execute(select(Identity).where(Identity.user_id == user.id))
+    passkeys = await active_passkeys(db, user.id)
     audit_result = await db.execute(
         select(AuditEvent)
         .where(AuditEvent.actor_user_id == user.id)
@@ -1569,8 +1576,10 @@ async def export_account(
         "mfa": {
             "totp_enabled": bool(user.mfa_totp_enabled_at),
             "totp_enabled_at": user.mfa_totp_enabled_at,
+            "passkey_count": len(passkeys),
             "recovery_codes_remaining": await recovery_codes_remaining(db, user.id),
         },
+        "passkeys": [passkey_credential_read(credential).model_dump() for credential in passkeys],
         "sessions": [
             session_read(session, client=client, current_session_id=principal.session_id)
             for session, client in session_result.all()
@@ -1601,13 +1610,14 @@ async def deactivate_account(
     user = await require_session_user(principal, db)
     if user.password_hash and not verify_password(body.current_password or "", user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid current password")
-    if user.mfa_totp_enabled_at:
-        if body.totp_code:
+    if await user_has_mfa(db, user) and not amr_satisfies_mfa(principal_amr(principal)):
+        if user.mfa_totp_enabled_at and body.totp_code:
             verify_user_totp(user, body.totp_code)
-        elif body.recovery_code:
+        elif user.mfa_totp_enabled_at and body.recovery_code:
             await verify_user_recovery_code(db, user, body.recovery_code)
         else:
-            raise HTTPException(status_code=401, detail="TOTP code required")
+            detail = "TOTP code required" if user.mfa_totp_enabled_at else "Passkey verification required"
+            raise HTTPException(status_code=401, detail=detail)
     await ensure_user_can_deactivate(db, user_id=user.id)
 
     revoked_sessions = await revoke_user_sessions(db, user_id=user.id)
@@ -2086,6 +2096,7 @@ async def enable_totp(
         totp_enabled=True,
         totp_enabled_at=user.mfa_totp_enabled_at,
         totp_pending=False,
+        passkey_count=await active_passkey_count(db, user.id),
         recovery_codes=recovery_codes,
         recovery_codes_remaining=len(recovery_codes),
     )
@@ -2133,7 +2144,13 @@ async def disable_totp(
         user.mfa_totp_secret_encrypted = None
         await retire_recovery_codes(db, user.id)
         await db.commit()
-        return MfaStatusRead(totp_enabled=False, totp_enabled_at=None, totp_pending=False, recovery_codes_remaining=0)
+        return MfaStatusRead(
+            totp_enabled=False,
+            totp_enabled_at=None,
+            totp_pending=False,
+            passkey_count=await active_passkey_count(db, user.id),
+            recovery_codes_remaining=0,
+        )
     verify_user_totp(user, body.code)
     user.mfa_totp_secret_encrypted = None
     user.mfa_totp_enabled_at = None
@@ -2146,7 +2163,13 @@ async def disable_totp(
         target_id=user.id,
     )
     await db.commit()
-    return MfaStatusRead(totp_enabled=False, totp_enabled_at=None, totp_pending=False, recovery_codes_remaining=0)
+    return MfaStatusRead(
+        totp_enabled=False,
+        totp_enabled_at=None,
+        totp_pending=False,
+        passkey_count=await active_passkey_count(db, user.id),
+        recovery_codes_remaining=0,
+    )
 
 
 @app.get("/api/v1/setup/status", response_model=SetupStatusRead)
@@ -2211,6 +2234,7 @@ async def user_admin_read(db: AsyncSession, user: User, org_ids: list[str] | Non
         email_verified=user.email_verified,
         mfa_totp_enabled=bool(user.mfa_totp_enabled_at),
         mfa_totp_enabled_at=user.mfa_totp_enabled_at,
+        passkey_count=await active_passkey_count(db, user.id),
         disabled=user.disabled,
         created_at=user.created_at,
         updated_at=user.updated_at,
@@ -4145,6 +4169,7 @@ async def accept_invitation(
     body: InvitationAcceptRequest,
     request: Request,
     response: Response,
+    principal: Principal | None = Depends(optional_principal),
     db: AsyncSession = Depends(get_db),
 ):
     email = str(body.email).lower()
@@ -4171,20 +4196,35 @@ async def accept_invitation(
 
     user_result = await db.execute(select(User).where(User.email == email))
     user = user_result.scalar_one_or_none()
-    amr = ["pwd"]
+    amr: list[str] = []
     if user:
-        if user.disabled or not verify_password(body.password, user.password_hash):
+        if user.disabled:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        if user.mfa_totp_enabled_at:
-            if body.totp_code:
+        authenticated_user = (
+            principal
+            and principal.auth_type == "user"
+            and principal.user_id == user.id
+            and principal.session_id
+        )
+        if authenticated_user:
+            amr = principal_amr(principal)
+        elif verify_password(body.password or "", user.password_hash):
+            amr = ["pwd"]
+        else:
+            raise HTTPException(status_code=401, detail="Sign in to accept this invitation")
+        if await user_has_mfa(db, user) and not amr_satisfies_mfa(amr):
+            if user.mfa_totp_enabled_at and body.totp_code:
                 verify_user_totp(user, body.totp_code)
                 amr.append("otp")
-            elif body.recovery_code:
+            elif user.mfa_totp_enabled_at and body.recovery_code:
                 await verify_user_recovery_code(db, user, body.recovery_code)
                 amr.append("recovery")
             else:
-                raise HTTPException(status_code=401, detail="TOTP code required")
+                detail = "TOTP code required" if user.mfa_totp_enabled_at else "Passkey sign-in required"
+                raise HTTPException(status_code=401, detail=detail)
     else:
+        if not body.password:
+            raise HTTPException(status_code=422, detail="Password is required for a new account")
         user = await create_user(
             db,
             email=email,
@@ -5685,35 +5725,204 @@ async def device_authorization(body: DeviceAuthorizationRequest, db: AsyncSessio
     }
 
 
+async def active_device_grant(db: AsyncSession, user_code: str) -> DeviceGrant:
+    result = await db.execute(
+        select(DeviceGrant).where(DeviceGrant.user_code_hash == token_hash(user_code.strip().upper()))
+    )
+    grant = result.scalar_one_or_none()
+    if (
+        not grant
+        or grant.expires_at <= now_utc()
+        or grant.used_at
+        or grant.approved_at
+        or grant.denied_at
+    ):
+        raise HTTPException(status_code=404, detail="Device grant not found")
+    return grant
+
+
+async def apply_device_grant_approval(
+    db: AsyncSession,
+    *,
+    grant: DeviceGrant,
+    principal: Principal,
+    user: User,
+    org_id: str | None,
+    amr: list[str],
+) -> None:
+    client = await db.get(AuthClient, grant.client_id)
+    if not client:
+        raise HTTPException(status_code=404, detail="Device grant not found")
+    selected_org_id = org_id or principal.org_id or client.org_id
+    if client.require_org_membership and client.org_id:
+        if org_id and org_id != client.org_id:
+            raise HTTPException(status_code=403, detail="Client is bound to another organization")
+        selected_org_id = client.org_id
+    if selected_org_id:
+        await ensure_user_org_membership(db, user_id=user.id, org_id=selected_org_id)
+    elif client.require_org_membership:
+        raise HTTPException(status_code=403, detail="Organization membership required")
+    await enforce_client_and_org_mfa_policy(
+        db,
+        client=client,
+        org_id=selected_org_id,
+        user=user,
+        amr=amr,
+        trusted_device=await principal_trusted_device_active(db, principal),
+    )
+    grant.approved_at = now_utc()
+    grant.user_id = user.id
+    grant.org_id = selected_org_id
+    grant.amr = amr
+
+
+@app.post(
+    "/api/v1/auth/device/passkey/options",
+    response_model=PasskeyAuthenticationOptionsRead,
+)
+async def device_passkey_options(
+    body: PasskeyDeviceOptionsRequest,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await require_session_user(principal, db)
+    rp_id, _origins = require_webauthn_configuration()
+    grant = await active_device_grant(db, body.user_code)
+    descriptors = [
+        descriptor
+        for credential in await active_passkeys(db, user.id)
+        if (descriptor := passkey_descriptor(credential)) is not None
+    ]
+    if not descriptors:
+        raise HTTPException(status_code=400, detail="No passkey is registered for this account")
+    await enforce_rate_limit(
+        db,
+        key=f"device-passkey:{user.id}:{request.client.host if request.client else 'unknown'}",
+        limit=20,
+        window_seconds=300,
+    )
+    challenge_bytes = secrets.token_bytes(32)
+    options = generate_authentication_options(
+        rp_id=rp_id,
+        challenge=challenge_bytes,
+        timeout=settings.webauthn_challenge_ttl_seconds * 1000,
+        allow_credentials=descriptors,
+        user_verification=UserVerificationRequirement.REQUIRED,
+    )
+    challenge = await create_webauthn_challenge(
+        db,
+        purpose="device_approval",
+        challenge=challenge_bytes,
+        user_id=user.id,
+        session_id=principal.session_id,
+        context={"device_grant_id": grant.id, "org_id": body.org_id},
+    )
+    await db.commit()
+    return PasskeyAuthenticationOptionsRead(
+        challenge_id=challenge.id,
+        public_key=json.loads(options_to_json(options)),
+    )
+
+
+@app.post("/api/v1/auth/device/passkey/verify")
+async def verify_device_passkey(
+    body: PasskeyDeviceVerifyRequest,
+    request: Request,
+    principal: Principal = Depends(current_principal),
+    db: AsyncSession = Depends(get_db),
+):
+    user = await require_session_user(principal, db)
+    rp_id, origins = require_webauthn_configuration()
+    challenge, expected_challenge = await consume_webauthn_challenge(
+        db,
+        challenge_id=body.challenge_id,
+        purpose="device_approval",
+        user_id=user.id,
+        session_id=principal.session_id,
+    )
+    raw_credential_id = body.credential.get("id")
+    if not isinstance(raw_credential_id, str) or not raw_credential_id or len(raw_credential_id) > 2048:
+        raise HTTPException(status_code=400, detail="Passkey approval could not be verified")
+    credential_result = await db.execute(
+        select(WebAuthnCredential).where(
+            WebAuthnCredential.user_id == user.id,
+            WebAuthnCredential.credential_id_hash == token_hash(raw_credential_id),
+            WebAuthnCredential.credential_id.is_not(None),
+            WebAuthnCredential.revoked_at.is_(None),
+        )
+    )
+    credential = credential_result.scalar_one_or_none()
+    if not credential or not credential.credential_id:
+        raise HTTPException(status_code=401, detail="Passkey approval failed")
+    try:
+        verified = verify_authentication_response(
+            credential=body.credential,
+            expected_challenge=expected_challenge,
+            expected_rp_id=rp_id,
+            expected_origin=origins,
+            credential_public_key=base64url_to_bytes(credential.public_key),
+            credential_current_sign_count=credential.sign_count,
+            require_user_verification=True,
+        )
+    except (InvalidAuthenticationResponse, InvalidJSONStructure, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Passkey approval failed") from exc
+    if not secrets.compare_digest(bytes_to_base64url(verified.credential_id), credential.credential_id):
+        raise HTTPException(status_code=401, detail="Passkey approval failed")
+
+    context = challenge.context or {}
+    grant_id = context.get("device_grant_id")
+    if not isinstance(grant_id, str):
+        raise HTTPException(status_code=400, detail="Passkey approval could not be verified")
+    grant = await db.get(DeviceGrant, grant_id)
+    if (
+        not grant
+        or grant.expires_at <= now_utc()
+        or grant.used_at
+        or grant.approved_at
+        or grant.denied_at
+    ):
+        raise HTTPException(status_code=404, detail="Device grant not found")
+    requested_org_id = context.get("org_id") if isinstance(context.get("org_id"), str) else None
+    amr = principal_amr(principal)
+    if "webauthn" not in amr:
+        amr.append("webauthn")
+    await apply_device_grant_approval(
+        db,
+        grant=grant,
+        principal=principal,
+        user=user,
+        org_id=requested_org_id,
+        amr=amr,
+    )
+    credential.sign_count = verified.new_sign_count
+    credential.credential_device_type = verified.credential_device_type.value
+    credential.backed_up = verified.credential_backed_up
+    credential.last_used_at = now_utc()
+    challenge.used_at = now_utc()
+    await audit(
+        db,
+        "auth.device.passkey.approve",
+        actor_user_id=user.id,
+        target_type="device_grant",
+        target_id=grant.id,
+        details={"credential_id": credential.id, "client_id": grant.client_id},
+        request=request,
+    )
+    await db.commit()
+    return {"status": "approved"}
+
+
 @app.post("/api/v1/auth/device/approve")
 async def approve_device(
     body: DeviceAuthorizeApprove,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    if not principal.user_id:
-        raise HTTPException(status_code=403, detail="User-bound token required")
-    result = await db.execute(
-        select(DeviceGrant).where(DeviceGrant.user_code_hash == token_hash(body.user_code.strip().upper()))
-    )
-    grant = result.scalar_one_or_none()
-    if not grant or grant.expires_at <= now_utc() or grant.used_at:
-        raise HTTPException(status_code=404, detail="Device grant not found")
+    user = await require_session_user(principal, db)
+    grant = await active_device_grant(db, body.user_code)
     if body.approve:
-        client = await db.get(AuthClient, grant.client_id)
-        user = await db.get(User, principal.user_id)
-        if not client or not user:
-            raise HTTPException(status_code=404, detail="Device grant not found")
         amr = principal_amr(principal)
-        selected_org_id = body.org_id or principal.org_id or client.org_id
-        if client.require_org_membership and client.org_id:
-            if body.org_id and body.org_id != client.org_id:
-                raise HTTPException(status_code=403, detail="Client is bound to another organization")
-            selected_org_id = client.org_id
-        if selected_org_id:
-            await ensure_user_org_membership(db, user_id=user.id, org_id=selected_org_id)
-        elif client.require_org_membership:
-            raise HTTPException(status_code=403, detail="Organization membership required")
         if user.mfa_totp_enabled_at:
             if body.totp_code:
                 verify_user_totp(user, body.totp_code)
@@ -5723,18 +5932,14 @@ async def approve_device(
                 await verify_user_recovery_code(db, user, body.recovery_code)
                 if "recovery" not in amr:
                     amr.append("recovery")
-        await enforce_client_and_org_mfa_policy(
+        await apply_device_grant_approval(
             db,
-            client=client,
-            org_id=selected_org_id,
+            grant=grant,
+            principal=principal,
             user=user,
+            org_id=body.org_id,
             amr=amr,
-            trusted_device=await principal_trusted_device_active(db, principal),
         )
-        grant.approved_at = now_utc()
-        grant.user_id = principal.user_id
-        grant.org_id = selected_org_id
-        grant.amr = amr
     else:
         grant.denied_at = now_utc()
     await db.commit()
