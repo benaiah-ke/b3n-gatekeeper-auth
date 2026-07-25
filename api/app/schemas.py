@@ -373,7 +373,49 @@ class MfaStatusRead(BaseModel):
     totp_enabled: bool
     totp_enabled_at: datetime | None = None
     totp_pending: bool = False
+    passkey_count: int = 0
     recovery_codes_remaining: int = 0
+
+
+class PasskeyCredentialRead(BaseModel):
+    id: str
+    name: str
+    transports: list[str] = []
+    credential_device_type: str
+    backed_up: bool
+    created_at: datetime
+    last_used_at: datetime | None = None
+
+
+class PasskeyRegistrationOptionsRead(BaseModel):
+    challenge_id: str
+    public_key: dict[str, Any]
+
+
+class PasskeyRegistrationVerifyRequest(BaseModel):
+    challenge_id: str
+    credential: dict[str, Any]
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+
+
+class PasskeyAuthenticationOptionsRequest(BaseModel):
+    client_id: str | None = None
+    scope: str | None = None
+    audience: str | None = None
+
+
+class PasskeyAuthenticationOptionsRead(BaseModel):
+    challenge_id: str
+    public_key: dict[str, Any]
+
+
+class PasskeyAuthenticationVerifyRequest(BaseModel):
+    challenge_id: str
+    credential: dict[str, Any]
+
+
+class PasskeyCredentialUpdate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=160)
 
 
 class TotpSetupRead(BaseModel):

@@ -8,7 +8,7 @@ from email.message import EmailMessage
 from typing import Any
 
 from fastapi import HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -24,6 +24,7 @@ from app.models import (
     Role,
     Session,
     User,
+    WebAuthnCredential,
 )
 from app.schemas import OrgRead, UserRead
 from app.security import (
@@ -38,7 +39,7 @@ from app.security import (
     verify_password,
 )
 
-MFA_AMR_VALUES = {"otp", "recovery"}
+MFA_AMR_VALUES = {"otp", "recovery", "webauthn"}
 TRUSTED_DEVICE_AMR = "trusted_device"
 DEFAULT_ORG_ROLES = [
     ("owner", ["*"]),
@@ -50,6 +51,21 @@ DEFAULT_ORG_ROLES = [
 
 def amr_satisfies_mfa(amr: list[str] | None) -> bool:
     return bool(set(amr or []).intersection(MFA_AMR_VALUES))
+
+
+async def active_passkey_count(db: AsyncSession, user_id: str) -> int:
+    result = await db.execute(
+        select(func.count(WebAuthnCredential.id)).where(
+            WebAuthnCredential.user_id == user_id,
+            WebAuthnCredential.credential_id.is_not(None),
+            WebAuthnCredential.revoked_at.is_(None),
+        )
+    )
+    return int(result.scalar_one() or 0)
+
+
+async def user_has_mfa(db: AsyncSession, user: User) -> bool:
+    return bool(user.mfa_totp_enabled_at) or await active_passkey_count(db, user.id) > 0
 
 
 def session_trusted_device_active(session: Session) -> bool:
@@ -422,6 +438,7 @@ async def create_session_tokens(
         "email_verified": user.email_verified,
         "session_id": session.id,
         "mfa_totp_enabled": bool(user.mfa_totp_enabled_at),
+        "mfa_passkey_enabled": await active_passkey_count(db, user.id) > 0,
     }
     if amr:
         extra_claims["amr"] = amr
@@ -541,7 +558,9 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
             and session_trusted_device_active(session)
             and trusted_device_mfa_bypass_allowed(client, policy_org)
         )
-        if not user.mfa_totp_enabled_at or (not amr_satisfies_mfa(session.amr) and not trusted_device_ok):
+        if not await user_has_mfa(db, user) or (
+            not amr_satisfies_mfa(session.amr) and not trusted_device_ok
+        ):
             session.revoked_at = session.revoked_at or now_utc()
             refresh.revoked_at = refresh.revoked_at or session.revoked_at
             await db.commit()
@@ -572,6 +591,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         "email_verified": user.email_verified,
         "session_id": session.id,
         "mfa_totp_enabled": bool(user.mfa_totp_enabled_at),
+        "mfa_passkey_enabled": await active_passkey_count(db, user.id) > 0,
     }
     if session.amr:
         extra_claims["amr"] = session.amr

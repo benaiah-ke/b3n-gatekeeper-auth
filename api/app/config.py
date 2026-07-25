@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field
 from pydantic_settings import BaseSettings
@@ -56,6 +57,10 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
     device_code_ttl_seconds: int = 600
     email_code_ttl_seconds: int = 900
+    webauthn_rp_id: str = ""
+    webauthn_rp_name: str = "GateKeeper"
+    webauthn_origins: str = ""
+    webauthn_challenge_ttl_seconds: int = 300
 
     bootstrap_admin_email: EmailStr = "admin@example.com"
     bootstrap_org_name: str = "Example Org"
@@ -94,6 +99,23 @@ class Settings(BaseSettings):
     @property
     def mcp_default_scope_list(self) -> list[str]:
         return [scope.strip() for scope in self.mcp_default_scopes.split(",") if scope.strip()]
+
+    @property
+    def webauthn_origin_list(self) -> list[str]:
+        configured = [origin.strip().rstrip("/") for origin in self.webauthn_origins.split(",") if origin.strip()]
+        if configured:
+            return configured
+        parsed = urlparse(self.ui_url)
+        if not parsed.scheme or not parsed.netloc:
+            return []
+        return [f"{parsed.scheme}://{parsed.netloc}"]
+
+    @property
+    def webauthn_rp_id_value(self) -> str:
+        if self.webauthn_rp_id.strip():
+            return self.webauthn_rp_id.strip().lower()
+        origins = self.webauthn_origin_list
+        return (urlparse(origins[0]).hostname or "").lower() if origins else ""
 
     def oauth_provider_configs(self) -> dict[str, OAuthProviderConfig]:
         providers: dict[str, OAuthProviderConfig] = {}

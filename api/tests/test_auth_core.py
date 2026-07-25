@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
 
 os.environ.setdefault("APP_ENV", "test")
@@ -10,13 +11,15 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
+from webauthn.helpers import bytes_to_base64url
+from webauthn.helpers.structs import CredentialDeviceType
 
 from app import main as main_module
 from app import security, services
 from app.config import settings
 from app.database import Base, async_session_factory, engine
 from app.main import app
-from app.models import AuditEvent, Identity, Session, User
+from app.models import AuditEvent, Identity, Session, User, WebAuthnChallenge, WebAuthnCredential
 from app.security import create_access_token, decode_access_token, public_jwk, totp_code
 
 
@@ -2321,6 +2324,7 @@ async def test_totp_mfa_setup_login_enforcement_and_disable():
             "totp_enabled": False,
             "totp_enabled_at": None,
             "totp_pending": False,
+            "passkey_count": 0,
             "recovery_codes_remaining": 0,
         }
 
@@ -2450,6 +2454,176 @@ async def test_totp_mfa_setup_login_enforcement_and_disable():
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert password_only_login.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_passkey_registration_login_management_and_replay_protection(monkeypatch):
+    credential_id_bytes = b"gatekeeper-passkey-credential"
+    credential_id = bytes_to_base64url(credential_id_bytes)
+    registration_verification: dict[str, object] = {}
+    authentication_verification: dict[str, object] = {}
+
+    def fake_verify_registration_response(**kwargs):
+        registration_verification.update(kwargs)
+        return SimpleNamespace(
+            credential_id=credential_id_bytes,
+            credential_public_key=b"credential-public-key",
+            sign_count=3,
+            aaguid="00000000-0000-0000-0000-000000000000",
+            credential_device_type=CredentialDeviceType.MULTI_DEVICE,
+            credential_backed_up=True,
+        )
+
+    def fake_verify_authentication_response(**kwargs):
+        authentication_verification.update(kwargs)
+        return SimpleNamespace(
+            credential_id=credential_id_bytes,
+            new_sign_count=4,
+            credential_device_type=CredentialDeviceType.MULTI_DEVICE,
+            credential_backed_up=True,
+        )
+
+    monkeypatch.setattr(main_module, "verify_registration_response", fake_verify_registration_response)
+    monkeypatch.setattr(main_module, "verify_authentication_response", fake_verify_authentication_response)
+
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "passkey@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        access = signup.json()["access_token"]
+        headers = {"Authorization": f"Bearer {access}"}
+
+        options = await ac.post(
+            "/api/v1/auth/passkeys/registration/options",
+            headers=headers,
+        )
+        assert options.status_code == 200
+        assert options.json()["public_key"]["rp"]["id"] == "localhost"
+        assert options.json()["public_key"]["authenticatorSelection"] == {
+            "requireResidentKey": True,
+            "residentKey": "required",
+            "userVerification": "required",
+        }
+        registration_challenge_id = options.json()["challenge_id"]
+        async with async_session_factory() as db:
+            challenge = await db.get(WebAuthnChallenge, registration_challenge_id)
+            assert challenge is not None
+            assert challenge.challenge_encrypted != options.json()["public_key"]["challenge"]
+
+        registration_payload = {
+            "id": credential_id,
+            "rawId": credential_id,
+            "type": "public-key",
+            "response": {
+                "clientDataJSON": "client-data",
+                "attestationObject": "attestation",
+                "transports": ["internal", "not-a-real-transport"],
+            },
+        }
+        registered = await ac.post(
+            "/api/v1/auth/passkeys/registration/verify",
+            headers=headers,
+            json={
+                "challenge_id": registration_challenge_id,
+                "credential": registration_payload,
+                "name": "Work passkey",
+            },
+        )
+        assert registered.status_code == 200
+        assert registered.json()["name"] == "Work passkey"
+        assert registered.json()["transports"] == ["internal"]
+        assert registered.json()["credential_device_type"] == "multi_device"
+        assert registered.json()["backed_up"] is True
+        passkey_id = registered.json()["id"]
+        assert registration_verification["expected_rp_id"] == "localhost"
+        assert registration_verification["expected_origin"] == ["http://localhost:5173"]
+        assert registration_verification["require_user_verification"] is True
+
+        replay = await ac.post(
+            "/api/v1/auth/passkeys/registration/verify",
+            headers=headers,
+            json={
+                "challenge_id": registration_challenge_id,
+                "credential": registration_payload,
+            },
+        )
+        assert replay.status_code == 400
+        assert replay.json()["detail"] == "Passkey ceremony expired or already used"
+
+        status = await ac.get("/api/v1/auth/mfa/status", headers=headers)
+        assert status.status_code == 200
+        assert status.json()["passkey_count"] == 1
+
+        renamed = await ac.patch(
+            f"/api/v1/auth/passkeys/{passkey_id}",
+            headers=headers,
+            json={"name": "Laptop passkey"},
+        )
+        assert renamed.status_code == 200
+        assert renamed.json()["name"] == "Laptop passkey"
+
+        password_login = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "passkey@example.com", "password": "correct horse battery"},
+        )
+        assert password_login.status_code == 401
+        assert password_login.json()["detail"] == "Passkey verification required"
+
+        auth_options = await ac.post("/api/v1/auth/passkeys/authentication/options", json={})
+        assert auth_options.status_code == 200
+        assert auth_options.json()["public_key"]["rpId"] == "localhost"
+        assert auth_options.json()["public_key"]["userVerification"] == "required"
+        authentication_challenge_id = auth_options.json()["challenge_id"]
+
+        authenticated = await ac.post(
+            "/api/v1/auth/passkeys/authentication/verify",
+            json={
+                "challenge_id": authentication_challenge_id,
+                "credential": {
+                    "id": credential_id,
+                    "rawId": credential_id,
+                    "type": "public-key",
+                    "response": {
+                        "authenticatorData": "authenticator-data",
+                        "clientDataJSON": "client-data",
+                        "signature": "signature",
+                        "userHandle": None,
+                    },
+                },
+            },
+        )
+        assert authenticated.status_code == 200
+        claims = decode_access_token(authenticated.json()["access_token"])
+        assert claims["amr"] == ["webauthn"]
+        assert claims["mfa_passkey_enabled"] is True
+        assert authentication_verification["expected_rp_id"] == "localhost"
+        assert authentication_verification["expected_origin"] == ["http://localhost:5173"]
+        assert authentication_verification["require_user_verification"] is True
+
+        async with async_session_factory() as db:
+            credential = await db.get(WebAuthnCredential, passkey_id)
+            assert credential is not None
+            assert credential.sign_count == 4
+            assert credential.last_used_at is not None
+
+        revoked = await ac.delete(
+            f"/api/v1/auth/passkeys/{passkey_id}",
+            headers={"Authorization": f"Bearer {authenticated.json()['access_token']}"},
+        )
+        assert revoked.status_code == 200
+
+        revoked_login_options = await ac.post("/api/v1/auth/passkeys/authentication/options", json={})
+        revoked_login = await ac.post(
+            "/api/v1/auth/passkeys/authentication/verify",
+            json={
+                "challenge_id": revoked_login_options.json()["challenge_id"],
+                "credential": {"id": credential_id},
+            },
+        )
+        assert revoked_login.status_code == 401
+        assert revoked_login.json()["detail"] == "Passkey authentication failed"
 
 
 @pytest.mark.asyncio

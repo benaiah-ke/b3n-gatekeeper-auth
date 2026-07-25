@@ -320,11 +320,41 @@ class WebAuthnCredential(Base, TimestampMixin):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    credential_id: Mapped[str | None] = mapped_column(String(1024), unique=True, index=True, nullable=True)
     credential_id_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
     public_key: Mapped[str] = mapped_column(Text, nullable=False)
     transports: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
     sign_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    name: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    aaguid: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    credential_device_type: Mapped[str] = mapped_column(String(40), default="single_device", nullable=False)
+    backed_up: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class WebAuthnChallenge(Base, TimestampMixin):
+    __tablename__ = "webauthn_challenges"
+    __table_args__ = (
+        Index("ix_webauthn_challenges_purpose_user_used", "purpose", "user_id", "used_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
+    purpose: Mapped[str] = mapped_column(String(40), index=True, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    challenge_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    context: Mapped[dict[str, Any]] = mapped_column(MutableDict.as_mutable(json_type()), default=dict)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class OneTimeCode(Base, TimestampMixin):

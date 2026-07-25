@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "20260608_0019"
@@ -19,20 +20,20 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.alter_column(
-        "auth_clients",
-        "client_secret_hash",
-        existing_type=sa.String(length=80),
-        type_=sa.String(length=255),
-        existing_nullable=True,
-    )
+    with op.batch_alter_table("auth_clients") as batch_op:
+        batch_op.alter_column(
+            "client_secret_hash",
+            existing_type=sa.String(length=80),
+            type_=sa.String(length=255),
+            existing_nullable=True,
+        )
 
 
 def downgrade() -> None:
-    op.alter_column(
-        "auth_clients",
-        "client_secret_hash",
-        existing_type=sa.String(length=255),
-        type_=sa.String(length=80),
-        existing_nullable=True,
-    )
+    with op.batch_alter_table("auth_clients") as batch_op:
+        batch_op.alter_column(
+            "client_secret_hash",
+            existing_type=sa.String(length=255),
+            type_=sa.String(length=80),
+            existing_nullable=True,
+        )
