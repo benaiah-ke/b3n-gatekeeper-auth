@@ -2728,6 +2728,30 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
 
 
 @pytest.mark.asyncio
+async def test_failed_login_attempts_persist_rate_limit_counters():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "limited@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+
+        for _attempt in range(10):
+            failed = await ac.post(
+                "/api/v1/auth/login",
+                json={"email": "limited@example.com", "password": "wrong password value"},
+            )
+            assert failed.status_code == 401
+
+        limited = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "limited@example.com", "password": "correct horse battery"},
+        )
+        assert limited.status_code == 429
+        assert limited.json()["detail"] == "Rate limit exceeded"
+
+
+@pytest.mark.asyncio
 async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows():
     async with await client() as ac:
         signup = await ac.post(

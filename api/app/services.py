@@ -128,15 +128,19 @@ async def enforce_rate_limit(
     bucket = result.scalar_one_or_none()
     if not bucket:
         db.add(RateLimitBucket(key=key, count=1, window_start=now))
+        await db.commit()
         return
     age = (now - bucket.window_start).total_seconds()
     if age > window_seconds:
         bucket.count = 1
         bucket.window_start = now
+        await db.commit()
         return
     bucket.count += 1
     if bucket.count > limit:
+        await db.commit()
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    await db.commit()
 
 
 def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
