@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -2725,6 +2726,15 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         )
         assert revoked_login.status_code == 401
         assert revoked_login.json()["detail"] == "Passkey authentication failed"
+        revoked_login_replay = await ac.post(
+            "/api/v1/auth/passkeys/authentication/verify",
+            json={
+                "challenge_id": revoked_login_options.json()["challenge_id"],
+                "credential": {"id": credential_id},
+            },
+        )
+        assert revoked_login_replay.status_code == 400
+        assert revoked_login_replay.json()["detail"] == "Passkey ceremony expired or already used"
 
 
 @pytest.mark.asyncio
@@ -2749,6 +2759,41 @@ async def test_failed_login_attempts_persist_rate_limit_counters():
         )
         assert limited.status_code == 429
         assert limited.json()["detail"] == "Rate limit exceeded"
+
+
+@pytest.mark.asyncio
+async def test_passkey_management_requires_a_recent_session():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "reauth@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        stale_access = signup.json()["access_token"]
+        session_id = decode_access_token(stale_access)["session_id"]
+        async with async_session_factory() as db:
+            session = await db.get(Session, session_id)
+            assert session is not None
+            session.created_at = security.now_utc() - timedelta(minutes=16)
+            await db.commit()
+
+        stale_options = await ac.post(
+            "/api/v1/auth/passkeys/registration/options",
+            headers={"Authorization": f"Bearer {stale_access}"},
+        )
+        assert stale_options.status_code == 401
+        assert stale_options.json()["detail"] == "Sign in again before changing passkeys"
+
+        login = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "reauth@example.com", "password": "correct horse battery"},
+        )
+        assert login.status_code == 200
+        fresh_options = await ac.post(
+            "/api/v1/auth/passkeys/registration/options",
+            headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+        )
+        assert fresh_options.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -4494,6 +4539,64 @@ async def test_device_flow_and_api_token_revocation():
         assert revoked.status_code == 200
         introspected_again = await ac.post("/oauth/introspect", data={"token": raw_token})
         assert introspected_again.json()["active"] is False
+
+
+@pytest.mark.asyncio
+async def test_device_grant_accepts_only_one_concurrent_decision():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "device-race@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
+        device = await ac.post(
+            "/oauth/device_authorization",
+            json={"client_id": "gatekeeper-cli", "scope": "auth:read", "audience": "gatekeeper-api"},
+        )
+        assert device.status_code == 200
+        user_code = device.json()["user_code"]
+
+        approved, denied = await asyncio.gather(
+            ac.post(
+                "/api/v1/auth/device/approve",
+                headers=headers,
+                json={"user_code": user_code, "approve": True},
+            ),
+            ac.post(
+                "/api/v1/auth/device/approve",
+                headers=headers,
+                json={"user_code": user_code, "approve": False},
+            ),
+        )
+        assert sorted([approved.status_code, denied.status_code]) == [200, 404]
+
+
+@pytest.mark.asyncio
+async def test_device_approval_rate_limit_counts_invalid_user_codes():
+    async with await client() as ac:
+        signup = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "device-limited@example.com", "password": "correct horse battery"},
+        )
+        assert signup.status_code == 200
+        headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
+
+        for _attempt in range(20):
+            missing = await ac.post(
+                "/api/v1/auth/device/approve",
+                headers=headers,
+                json={"user_code": "INVALID1", "approve": True},
+            )
+            assert missing.status_code == 404
+
+        limited = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=headers,
+            json={"user_code": "INVALID1", "approve": True},
+        )
+        assert limited.status_code == 429
+        assert limited.json()["detail"] == "Rate limit exceeded"
 
 
 @pytest.mark.asyncio

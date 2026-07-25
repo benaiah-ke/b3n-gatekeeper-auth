@@ -99,7 +99,9 @@ async function submit() {
     if (message.includes('TOTP code required') || message.includes('MFA required')) {
       error.value = 'Enter an authenticator code or recovery code to finish this sign in.'
     } else if (message.includes('Passkey verification required')) {
-      error.value = 'This account uses a passkey. Choose “Sign in with a passkey” above.'
+      error.value = passkeysSupported.value
+        ? 'This account uses a passkey. Choose “Sign in with a passkey” above.'
+        : 'This account uses a passkey. Open GateKeeper from a secure browser that supports passkeys.'
     } else {
       error.value = message
     }

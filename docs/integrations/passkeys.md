@@ -62,7 +62,9 @@ const passkey = await gatekeeper.registerPasskey(accessToken, {
 Use `GET /api/v1/auth/passkeys` to list active credentials,
 `PATCH /api/v1/auth/passkeys/{credential_id}` to rename one, and
 `DELETE /api/v1/auth/passkeys/{credential_id}` to remove one. GateKeeper
-refuses to remove the last remaining sign-in method.
+refuses to remove the last remaining sign-in method. Registration, rename, and
+removal require a session created within the last 15 minutes; sign in again
+before changing credentials when the session is older.
 
 ## Passwordless Sign-In
 
@@ -116,7 +118,8 @@ GateKeeper:
 - requires user verification and discoverable credentials;
 - validates the exact configured origin and RP ID;
 - generates random challenges, encrypts them at rest, binds them to their
-  purpose and session where applicable, and accepts each challenge once;
+  purpose and session where applicable, and atomically consumes each challenge
+  on the first verification attempt;
 - expires challenges after the configured short lifetime;
 - stores credential public keys, transports, counters, device type, and backup
   state, but never stores private key material;
@@ -128,4 +131,5 @@ GateKeeper:
 See the [WebAuthn Level 3 specification](https://www.w3.org/TR/webauthn-3/)
 for the browser security model and the
 [`@simplewebauthn/browser` documentation](https://simplewebauthn.dev/docs/packages/browser/)
-for browser ceremony helpers.
+for browser ceremony helpers. GateKeeper's repeatable security and UX gates are
+listed in the [passkey acceptance contract](../reference/passkey-acceptance.md).

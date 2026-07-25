@@ -2,11 +2,12 @@
 import { browserSupportsWebAuthn, startAuthentication } from '@simplewebauthn/browser'
 import { AlertTriangle, CheckCircle2, KeyRound, RefreshCw, ShieldCheck, Terminal } from 'lucide-vue-next'
 import { computed, onMounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 
-import { api } from '@/services/api'
+import { api, GateKeeperApiError } from '@/services/api'
 
 const route = useRoute()
+const router = useRouter()
 const userCode = ref('')
 const totpCode = ref('')
 const recoveryCode = ref('')
@@ -51,6 +52,14 @@ const errorDetail = computed(() => {
   return error.value
 })
 
+async function redirectForExpiredSession(err: unknown) {
+  if (!(err instanceof GateKeeperApiError) || err.status !== 401) {
+    return false
+  }
+  await router.replace({ path: '/login', query: { redirect: route.fullPath } })
+  return true
+}
+
 onMounted(async () => {
   userCode.value = String(route.query.user_code || '')
   if (!browserSupportsWebAuthn()) {
@@ -58,7 +67,10 @@ onMounted(async () => {
   }
   try {
     passkeyAvailable.value = (await api.mfaStatus()).passkey_count > 0
-  } catch {
+  } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
     passkeyAvailable.value = false
   }
 })
@@ -73,6 +85,9 @@ async function approveWithPasskey() {
     const result = await api.verifyDevicePasskey(options.challenge_id, credential)
     status.value = result.status
   } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
     error.value = err instanceof Error ? err.message : 'Passkey approval failed'
   } finally {
     passkeyLoading.value = false
@@ -89,6 +104,9 @@ async function approve() {
     totpCode.value = ''
     recoveryCode.value = ''
   } catch (err) {
+    if (await redirectForExpiredSession(err)) {
+      return
+    }
     error.value = err instanceof Error ? err.message : 'Device approval failed'
   } finally {
     loading.value = false

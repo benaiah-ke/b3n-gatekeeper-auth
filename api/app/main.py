@@ -602,6 +602,7 @@ async def create_webauthn_challenge(
     session_id: str | None = None,
     context: dict[str, Any] | None = None,
 ) -> WebAuthnChallenge:
+    await db.execute(delete(WebAuthnChallenge).where(WebAuthnChallenge.expires_at <= now_utc()))
     row = WebAuthnChallenge(
         purpose=purpose,
         user_id=user_id,
@@ -638,6 +639,22 @@ async def consume_webauthn_challenge(
         expected_challenge = base64url_to_bytes(decrypt_secret(row.challenge_encrypted))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Passkey ceremony could not be verified") from exc
+    consumed_at = now_utc()
+    result = await db.execute(
+        update(WebAuthnChallenge)
+        .where(
+            WebAuthnChallenge.id == challenge_id,
+            WebAuthnChallenge.purpose == purpose,
+            WebAuthnChallenge.used_at.is_(None),
+            WebAuthnChallenge.expires_at > consumed_at,
+        )
+        .values(used_at=consumed_at)
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Passkey ceremony expired or already used")
+    await db.commit()
+    row.used_at = consumed_at
     return row, expected_challenge
 
 
@@ -1254,6 +1271,17 @@ async def require_session_user(principal: Principal, db: AsyncSession) -> User:
     return user
 
 
+async def require_recent_passkey_management_session(
+    principal: Principal,
+    db: AsyncSession,
+) -> User:
+    user = await require_session_user(principal, db)
+    session = await db.get(Session, principal.session_id)
+    if not session or not session.created_at or session.created_at < now_utc() - timedelta(minutes=15):
+        raise HTTPException(status_code=401, detail="Sign in again before changing passkeys")
+    return user
+
+
 async def revoke_other_user_sessions(db: AsyncSession, *, user_id: str, current_session_id: str) -> int:
     revoked_at = now_utc()
     result = await db.execute(
@@ -1711,7 +1739,7 @@ async def passkey_registration_options(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_recent_passkey_management_session(principal, db)
     rp_id, _origins = require_webauthn_configuration()
     await enforce_rate_limit(
         db,
@@ -1764,7 +1792,7 @@ async def verify_passkey_registration(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_recent_passkey_management_session(principal, db)
     rp_id, origins = require_webauthn_configuration()
     challenge, expected_challenge = await consume_webauthn_challenge(
         db,
@@ -1817,7 +1845,6 @@ async def verify_passkey_registration(
         backed_up=verified.credential_backed_up,
     )
     db.add(credential)
-    challenge.used_at = now_utc()
     await audit(
         db,
         "mfa.passkey.register",
@@ -1969,7 +1996,6 @@ async def verify_passkey_authentication(
     credential.credential_device_type = verified.credential_device_type.value
     credential.backed_up = verified.credential_backed_up
     credential.last_used_at = now_utc()
-    challenge.used_at = now_utc()
     await audit(
         db,
         "auth.passkey.login",
@@ -2005,7 +2031,7 @@ async def update_passkey(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_recent_passkey_management_session(principal, db)
     credential = await db.get(WebAuthnCredential, credential_id)
     if not credential or credential.user_id != user.id or credential.revoked_at:
         raise HTTPException(status_code=404, detail="Passkey not found")
@@ -2030,7 +2056,7 @@ async def revoke_passkey(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_recent_passkey_management_session(principal, db)
     credential = await db.get(WebAuthnCredential, credential_id)
     if not credential or credential.user_id != user.id or credential.revoked_at:
         raise HTTPException(status_code=404, detail="Passkey not found")
@@ -5787,10 +5813,58 @@ async def apply_device_grant_approval(
         amr=amr,
         trusted_device=await principal_trusted_device_active(db, principal),
     )
-    grant.approved_at = now_utc()
-    grant.user_id = user.id
-    grant.org_id = selected_org_id
-    grant.amr = amr
+    decided_at = now_utc()
+    result = await db.execute(
+        update(DeviceGrant)
+        .where(
+            DeviceGrant.id == grant.id,
+            DeviceGrant.approved_at.is_(None),
+            DeviceGrant.denied_at.is_(None),
+            DeviceGrant.used_at.is_(None),
+            DeviceGrant.expires_at > decided_at,
+        )
+        .values(
+            approved_at=decided_at,
+            user_id=user.id,
+            org_id=selected_org_id,
+            amr=amr,
+        )
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Device grant not found")
+
+
+async def apply_device_grant_denial(db: AsyncSession, grant: DeviceGrant) -> None:
+    decided_at = now_utc()
+    result = await db.execute(
+        update(DeviceGrant)
+        .where(
+            DeviceGrant.id == grant.id,
+            DeviceGrant.approved_at.is_(None),
+            DeviceGrant.denied_at.is_(None),
+            DeviceGrant.used_at.is_(None),
+            DeviceGrant.expires_at > decided_at,
+        )
+        .values(denied_at=decided_at)
+    )
+    if result.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Device grant not found")
+
+
+async def enforce_device_approval_rate_limit(
+    db: AsyncSession,
+    *,
+    user: User,
+    request: Request,
+) -> None:
+    await enforce_rate_limit(
+        db,
+        key=f"device-approval:{user.id}:{request.client.host if request.client else 'unknown'}",
+        limit=20,
+        window_seconds=300,
+    )
 
 
 @app.post(
@@ -5805,6 +5879,7 @@ async def device_passkey_options(
 ):
     user = await require_session_user(principal, db)
     rp_id, _origins = require_webauthn_configuration()
+    await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
     descriptors = [
         descriptor
@@ -5813,12 +5888,6 @@ async def device_passkey_options(
     ]
     if not descriptors:
         raise HTTPException(status_code=400, detail="No passkey is registered for this account")
-    await enforce_rate_limit(
-        db,
-        key=f"device-passkey:{user.id}:{request.client.host if request.client else 'unknown'}",
-        limit=20,
-        window_seconds=300,
-    )
     challenge_bytes = secrets.token_bytes(32)
     options = generate_authentication_options(
         rp_id=rp_id,
@@ -5916,7 +5985,6 @@ async def verify_device_passkey(
     credential.credential_device_type = verified.credential_device_type.value
     credential.backed_up = verified.credential_backed_up
     credential.last_used_at = now_utc()
-    challenge.used_at = now_utc()
     await audit(
         db,
         "auth.device.passkey.approve",
@@ -5933,10 +6001,12 @@ async def verify_device_passkey(
 @app.post("/api/v1/auth/device/approve")
 async def approve_device(
     body: DeviceAuthorizeApprove,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     user = await require_session_user(principal, db)
+    await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
     if body.approve:
         amr = principal_amr(principal)
@@ -5958,7 +6028,7 @@ async def approve_device(
             amr=amr,
         )
     else:
-        grant.denied_at = now_utc()
+        await apply_device_grant_denial(db, grant)
     await db.commit()
     return {"status": "approved" if body.approve else "denied"}
 

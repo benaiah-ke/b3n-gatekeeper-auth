@@ -8,7 +8,8 @@ from email.message import EmailMessage
 from typing import Any
 
 from fastapi import HTTPException, Request
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -124,23 +125,45 @@ async def enforce_rate_limit(
     window_seconds: int,
 ) -> None:
     now = now_utc()
-    result = await db.execute(select(RateLimitBucket).where(RateLimitBucket.key == key))
-    bucket = result.scalar_one_or_none()
-    if not bucket:
+    cutoff = now - timedelta(seconds=window_seconds)
+    active = await db.execute(
+        update(RateLimitBucket)
+        .where(
+            RateLimitBucket.key == key,
+            RateLimitBucket.window_start > cutoff,
+        )
+        .values(count=RateLimitBucket.count + 1)
+        .returning(RateLimitBucket.count)
+    )
+    count = active.scalar_one_or_none()
+    if count is None:
+        reset = await db.execute(
+            update(RateLimitBucket)
+            .where(
+                RateLimitBucket.key == key,
+                RateLimitBucket.window_start <= cutoff,
+            )
+            .values(count=1, window_start=now)
+            .returning(RateLimitBucket.count)
+        )
+        count = reset.scalar_one_or_none()
+    if count is None:
         db.add(RateLimitBucket(key=key, count=1, window_start=now))
-        await db.commit()
-        return
-    age = (now - bucket.window_start).total_seconds()
-    if age > window_seconds:
-        bucket.count = 1
-        bucket.window_start = now
-        await db.commit()
-        return
-    bucket.count += 1
-    if bucket.count > limit:
-        await db.commit()
-        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+        try:
+            await db.commit()
+            return
+        except IntegrityError:
+            await db.rollback()
+            await enforce_rate_limit(
+                db,
+                key=key,
+                limit=limit,
+                window_seconds=window_seconds,
+            )
+            return
     await db.commit()
+    if count > limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
 def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
