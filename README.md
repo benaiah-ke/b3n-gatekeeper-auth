@@ -19,9 +19,9 @@ APIs, with hosted auth UI and SDKs available when a product needs them.
 - API-product auth for bearer JWTs, personal access tokens, service keys,
   project keys, admin tokens, API-key validation, scopes, and audiences tied to
   the same account and project model.
-- Authenticator MFA with recovery codes, org/client MFA policy,
-  trusted-device MFA reuse policy, admin step-up MFA policy, and session/device
-  management.
+- Passwordless passkeys and authenticator MFA with recovery codes, org/client
+  MFA policy, trusted-device MFA reuse policy, admin step-up MFA policy, and
+  session/device management.
 - Hosted auth pages for sign in, sign up, verification, reset, device login,
   org selection, account/session management, client management, token
   management, and audit logs.
@@ -57,6 +57,7 @@ provider primitives.
 - [Getting started](docs/getting-started.md)
 - [Concepts](docs/concepts.md)
 - [API-only integration](docs/integrations/api-only.md)
+- [Passkey integration](docs/integrations/passkeys.md)
 - [Product backend proxy pattern](docs/integrations/product-backend-proxy.md)
 - [Backend verification](docs/integrations/backend.md)
 - [Hosted web app integration](docs/integrations/web-app.md)
@@ -99,11 +100,14 @@ After the API and UI are running:
 2. Open `/account` and follow the setup console. A viewer account can inspect
    state, but an owner is required to create clients, projects, roles, and
    tokens.
-3. Register OAuth clients for your web app, backend/API resource, CLI/device
+3. Add a passkey or authenticator in the Security section before enabling MFA
+   policies. Passkeys require the deployed RP ID and exact UI origin to match
+   the public HTTPS URL.
+4. Register OAuth clients for your web app, backend/API resource, CLI/device
    login, MCP resources, and local development callback URLs.
-4. Create scoped API tokens or keys for services, projects, API products, CLIs,
+5. Create scoped API tokens or keys for services, projects, API products, CLIs,
    or MCP servers.
-5. Verify discovery and signing keys before cutover:
+6. Verify discovery and signing keys before cutover:
 
 ```bash
 curl -sf http://localhost:8000/.well-known/openid-configuration

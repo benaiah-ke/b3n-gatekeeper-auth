@@ -19,8 +19,8 @@ manager, API-key manager, token issuer, and verification toolkit.
 
 GateKeeper separates identity from authorization policy:
 
-- Users own identities, credentials, sessions, devices, refresh-token families,
-  and personal tokens.
+- Users own federated identities, passkey public credentials, password and TOTP
+  state, sessions, devices, refresh-token families, and personal tokens.
 - Organizations contain workspaces, projects, memberships, roles, permissions,
   auth clients, MCP resources, service keys, and audit events.
 - Auth clients define allowed origins, redirect URIs, allowed audiences,
@@ -36,6 +36,9 @@ GateKeeper separates identity from authorization policy:
   in plaintext.
 - Refresh token replay revokes the entire token family.
 - OAuth authorization codes are single-use and PKCE-bound.
+- WebAuthn challenges are random, encrypted at rest, purpose/session-bound
+  where applicable, short-lived, and single-use. Passkey assertions require
+  user verification and exact RP ID/origin matching.
 - Client credentials tokens are service-bound and never create browser
   sessions.
 

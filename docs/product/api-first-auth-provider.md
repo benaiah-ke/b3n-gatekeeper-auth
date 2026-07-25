@@ -27,12 +27,13 @@ across:
 GateKeeper should expose clear APIs and SDK helpers for:
 
 - Signup and account creation.
-- Signin with password, social identity, passkey, or passwordless factors as the
-  product matures.
+- Signin with password, social identity, or a discoverable passkey.
 - Email and phone verification.
 - Password reset and password change.
 - Authenticator TOTP enrollment, challenge, recovery codes, and enforcement
   policy.
+- Passkey registration, passwordless authentication, credential management,
+  device approval, and exact RP ID/origin verification.
 - Profile, account, organization, workspace, and project membership.
 - Roles, permissions, scopes, and organization selection.
 - Admin user management, invitations, suspension, deletion, and audit.
@@ -160,11 +161,11 @@ instead of the auth-provider model.
   operator setup, direct signup/signin/reset, self-service profile/password
   management, account/session APIs, self-service personal API keys,
   operator-managed service/project/admin/machine token lifecycle, account
-  export/deactivation, authenticator TOTP, client/org-level MFA policy,
-  trusted-device MFA reuse policy, admin step-up MFA policy, org/client
-  idle-timeout policy, client credentials, introspection, backend verification,
-  API-token validation with scope/audience checks, invitations, and MFA
-  recovery codes.
+  export/deactivation, passkeys, authenticator TOTP, client/org-level MFA
+  policy, trusted-device MFA reuse policy, admin step-up MFA policy, org/client
+  idle-timeout policy, client credentials, introspection, backend
+  verification, API-token validation with scope/audience checks, invitations,
+  and MFA recovery codes.
   They now include install-owner social provider setup by API and control-plane
   UI, SCIM-style user provisioning, and SCIM v2 Users/Groups compatibility
   endpoints with pagination, common sorting, write-only password operations, and
@@ -173,10 +174,10 @@ instead of the auth-provider model.
   enrollment remediation exist.
 - The `/account` control plane now has a first-pass API-first setup workbench
   with live copy blocks for API backend, hosted auth, Vue/Nuxt, API keys,
-  CLI/MCP surfaces, self-service profile/password controls, and authenticator
-  2FA, plus setup completion, production-readiness health signals, and
-  operator shortcuts into users, invitations, sessions, policy, providers, and
-  audit; `/policy` now exposes org MFA, trusted-device MFA reuse, admin step-up
+  CLI/MCP surfaces, self-service profile/password controls, passkeys, and
+  authenticator 2FA, plus setup completion, production-readiness health
+  signals, and operator shortcuts into users, invitations, sessions, policy,
+  providers, and audit; `/policy` now exposes org MFA, trusted-device MFA reuse, admin step-up
   MFA, idle-timeout controls, user hard-delete policy, and a recommended
   baseline checklist/action that applies org MFA, trusted-device reuse, safe
   idle timeout, and MFA-aware admin step-up remediation. `/users` exposes
@@ -187,8 +188,8 @@ instead of the auth-provider model.
 - User administration now covers SCIM-style user provisioning, SCIM v2
   Users/Groups compatibility, listing users, profile/verification state,
   suspension, role/status assignment, last-owner protection, per-user session
-  revocation, MFA state, admin TOTP reset, and invitations. Self-service
-  account export, deactivation, linked identity listing/unlinking, and explicit
+  revocation, passkey/TOTP MFA state, admin TOTP reset, and invitations.
+  Self-service account export, deactivation, linked identity listing/unlinking, and explicit
   session-bound provider linking now have last-owner/sign-in-method protection,
   revocation cleanup where applicable, and UI/API/SDK coverage; policy-gated
   admin hard delete now has API/UI/JS helper coverage; configured OIDC/social
@@ -199,9 +200,9 @@ instead of the auth-provider model.
   and custom account-linking policy.
 - JS/Vue SDKs now cover the core hosted OAuth browser loop, token storage,
   direct product-owned signup/signin/invitation/email-code/password-reset
-  helpers, refresh, `/me`, password change, sessions, session device
-  labeling/trust controls, social provider discovery/start/admin-management
-  helpers, connected-app grants, API-token validation and
+  helpers, passkey ceremony endpoints, refresh, `/me`, password change,
+  sessions, session device labeling/trust controls, social provider
+  discovery/start/admin-management helpers, connected-app grants, API-token validation and
   list/create/rotate/revoke helpers, server-runtime JWKS verification helpers,
   and Nuxt runtime-config wiring. The Vue package now includes account,
   session/device, connected-app grant, admin grant-review, and API-token

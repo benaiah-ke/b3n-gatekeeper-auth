@@ -37,8 +37,9 @@ threads.
 
 At minimum, replace:
 
-- `ISSUER_URL` and public UI/API URLs with your auth domain.
-- `PUBLIC_BASE_URL` or equivalent UI runtime URL settings.
+- `GATEKEEPER_URL`, `UI_URL`, and `CORS_ORIGINS` with the public auth domain.
+- `WEBAUTHN_RP_ID` with the auth hostname and `WEBAUTHN_ORIGINS` with the
+  exact hosted UI HTTPS origin.
 - `GATEKEEPER_API_IMAGE`, `GATEKEEPER_UI_IMAGE`, and `GATEKEEPER_IMAGE_TAG`
   for the images you publish or build.
 - `SECRET_KEY`.
@@ -158,9 +159,12 @@ After `/version` returns 200:
    `example-api`.
 5. Create your first web app client with exact redirect URIs and allowed
    origins. Store confidential client secrets outside chat, logs, and tests.
-6. Create scoped API keys or service tokens only for the audiences each caller
+6. Confirm `WEBAUTHN_RP_ID` is the public auth hostname and
+   `WEBAUTHN_ORIGINS` contains the exact HTTPS hosted UI origin, then add a
+   passkey or authenticator from `/account`.
+7. Create scoped API keys or service tokens only for the audiences each caller
    needs. Token values are displayed once.
-7. Add CLI/device and MCP resources only when those product surfaces exist.
+8. Add CLI/device and MCP resources only when those product surfaces exist.
 
 If `/account` redirects to login, check whether `GATEKEEPER_URL`, `UI_URL`,
 `CORS_ORIGINS`, `COOKIE_SECURE`, and `COOKIE_DOMAIN` match the public origin
@@ -181,7 +185,10 @@ admin account; do not work around this by sharing tokens.
 - `/audit` shows client, token, user, and session events, and the organization
   retention policy is set before pruning old events.
 - SMTP is configured before relying on email verification, reset, invitation, or
-  email-code login flows. Authenticator TOTP does not require SMTP.
+  email-code login flows. Passkeys and authenticator TOTP do not require SMTP.
+- `WEBAUTHN_RP_ID` has no scheme or port, `WEBAUTHN_ORIGINS` exactly matches
+  the public browser origin, and the public route uses HTTPS. Changing the RP
+  ID after enrollment makes existing passkeys unusable on the new RP.
 - JWKS and OIDC discovery are reachable from every product backend that will
   verify GateKeeper tokens.
 

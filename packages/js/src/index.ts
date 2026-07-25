@@ -468,6 +468,7 @@ export interface GateKeeperJwtClaims {
   display_name?: string | null
   email_verified?: boolean
   mfa_totp_enabled?: boolean
+  mfa_passkey_enabled?: boolean
   org_id?: string | null
   org_slug?: string | null
   org_role?: string | null
@@ -488,6 +489,7 @@ export interface GateKeeperPrincipal {
   displayName?: string | null
   emailVerified?: boolean
   mfaTotpEnabled?: boolean
+  mfaPasskeyEnabled?: boolean
   permissions: string[]
   amr: string[]
   authorizedParty?: string | null
@@ -901,6 +903,7 @@ export class GateKeeperJwtVerifier {
       displayName: claims.display_name,
       emailVerified: claims.email_verified,
       mfaTotpEnabled: claims.mfa_totp_enabled,
+      mfaPasskeyEnabled: claims.mfa_passkey_enabled,
       permissions: stringListClaim(claims.permissions),
       amr: stringListClaim(claims.amr),
       authorizedParty: claims.azp,
