@@ -2378,7 +2378,7 @@ async def test_configured_oauth_provider_metadata_and_start_url(monkeypatch):
                 "start_url": f"{settings.issuer}/api/v1/auth/oauth/example/start",
                 "authorization_url": "https://login.example.com/oauth/authorize",
                 "require_verified_email": True,
-                "allow_email_linking": True,
+                "allow_email_linking": False,
             }
         ]
 
@@ -6566,3 +6566,49 @@ async def test_api_tokens_bind_only_projects_clients_and_audiences_of_their_own_
         ):
             created = await ac.post("/api/v1/tokens", headers=admin_headers, json={**token, **binding})
             assert created.status_code == expected, binding
+
+
+@pytest.mark.asyncio
+async def test_federated_login_never_bypasses_mfa_or_links_by_email(monkeypatch):
+    monkeypatch.setattr(settings, "google_client_id", "")
+    monkeypatch.setattr(settings, "google_client_secret", "")
+    monkeypatch.setattr(
+        settings,
+        "oauth_providers_json",
+        """[{"id":"example","name":"Example","client_id":"c","client_secret":"s",
+        "authorization_url":"https://login.example.com/authorize","token_url":"https://login.example.com/token",
+        "userinfo_url":"https://login.example.com/userinfo",
+        "redirect_uri":"https://auth.example.com/api/v1/auth/oauth/example/callback"}]""",
+    )
+
+    async def fake_profile(provider, code):
+        return {"sub": "ext-owner", "email": "owner@example.com", "name": "Owner", "email_verified": True}
+
+    monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
+
+    async def federated_login(ac: AsyncClient):
+        ac.cookies.clear()
+        started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/account"})
+        return await ac.get(
+            "/api/v1/auth/oauth/example/callback", params={"code": "c", "state": started.json()["state"]}
+        )
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_id = owner.json()["user"]["id"]
+        assert (await federated_login(ac)).status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(Identity.id))).first() is None
+            user = await db.get(User, owner_id)
+            user.mfa_totp_enabled_at = services.now_utc()
+            db.add(Identity(user_id=owner_id, provider="example", provider_subject="ext-owner", email=user.email))
+            await db.commit()
+        refused = await federated_login(ac)
+        assert refused.status_code == 401
+        assert (await ac.get("/api/v1/auth/me")).status_code == 401
+
+        async with async_session_factory() as db:
+            user = await db.get(User, owner_id)
+            user.mfa_totp_enabled_at = None
+            await db.commit()
+        assert (await federated_login(ac)).status_code == 302

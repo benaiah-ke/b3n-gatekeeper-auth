@@ -5416,6 +5416,11 @@ async def complete_oauth_provider_callback(
         )
     if user.disabled:
         raise HTTPException(status_code=401, detail="User is disabled")
+    # Same gate as password login without a client: a provider sign-in cannot stand in for the account's own MFA.
+    if await user_has_mfa(db, user):
+        raise HTTPException(
+            status_code=401, detail="This account uses MFA; sign in with your password and second factor"
+        )
     if identity:
         identity.email = email
     else:

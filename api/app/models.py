@@ -76,7 +76,7 @@ class OAuthProvider(Base, TimestampMixin):
     email_claim: Mapped[str] = mapped_column(String(120), default="email", nullable=False)
     name_claim: Mapped[str] = mapped_column(String(120), default="name", nullable=False)
     email_verified_claim: Mapped[str] = mapped_column(String(120), default="email_verified", nullable=False)
-    allow_email_linking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    allow_email_linking: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     require_verified_email: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 

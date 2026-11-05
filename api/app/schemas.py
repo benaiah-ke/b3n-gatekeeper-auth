@@ -80,7 +80,7 @@ class OAuthProviderAdminCreate(BaseModel):
     email_claim: str = Field(default="email", max_length=120)
     name_claim: str = Field(default="name", max_length=120)
     email_verified_claim: str = Field(default="email_verified", max_length=120)
-    allow_email_linking: bool = True
+    allow_email_linking: bool = False
     require_verified_email: bool = True
 
 

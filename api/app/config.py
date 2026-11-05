@@ -24,7 +24,8 @@ class OAuthProviderConfig(BaseModel):
     email_claim: str = "email"
     name_claim: str = "name"
     email_verified_claim: str = "email_verified"
-    allow_email_linking: bool = True
+    # Linking a federated login to an existing account by email alone lets the provider vouch for that account.
+    allow_email_linking: bool = False
     require_verified_email: bool = True
 
     @property
