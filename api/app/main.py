@@ -2441,6 +2441,22 @@ async def ensure_user_admin_visible(
     return visible_org_ids
 
 
+async def ensure_account_wide_change_allowed(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    principal: Principal,
+    visible_org_ids: list[str] | None,
+) -> None:
+    """Passwords, MFA and suspension are account-wide, so an org admin may change them only for
+    accounts that belong to no organization outside the admin's own."""
+    if await is_platform_admin(db, principal.user_id):
+        return
+    membership_org_ids = set(await user_membership_org_ids(db, user_id=user_id))
+    if visible_org_ids is None or membership_org_ids - set(visible_org_ids):
+        raise HTTPException(status_code=403, detail="User belongs to another organization")
+
+
 async def resolve_org_role(
     db: AsyncSession,
     *,
@@ -2991,6 +3007,8 @@ async def scim_apply_user_state(
             await ensure_other_active_owner(db, org_id=org.id, user_id=user.id)
 
     previous_disabled = user.disabled
+    if password is not SCIM_UNSET:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     if display_name is not SCIM_UNSET:
         user.display_name = str(display_name).strip() or None if display_name is not None else None
     password_changed = False
@@ -3833,6 +3851,10 @@ async def provision_user(
         db.add(user)
         await db.flush()
     else:
+        if (body.disabled is not None and body.disabled != user.disabled) or (
+            body.email_verified is not None and body.email_verified != user.email_verified
+        ):
+            await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org_id])
         if "display_name" in body.model_fields_set:
             user.display_name = body.display_name.strip() or None if body.display_name else None
         if body.email_verified is not None:
@@ -3924,6 +3946,7 @@ async def update_user_admin(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     if body.disabled is True and not user.disabled:
         owner_memberships = await db.execute(
             select(Membership)
@@ -4052,6 +4075,7 @@ async def reset_admin_user_totp(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     had_enabled_totp = bool(user.mfa_totp_enabled_at)
     had_pending_totp = bool(user.mfa_totp_secret_encrypted and not user.mfa_totp_enabled_at)
     user.mfa_totp_secret_encrypted = None

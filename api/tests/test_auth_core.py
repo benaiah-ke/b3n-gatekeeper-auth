@@ -1397,6 +1397,52 @@ async def test_platform_admin_lists_new_accounts_newest_first():
 
 
 @pytest.mark.asyncio
+async def test_org_admin_cannot_change_credentials_of_accounts_in_other_orgs(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_id = owner.json()["user"]["id"]
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        tenant = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Tenant", "slug": "tenant"})
+        tenant_id = tenant.json()["id"]
+        switched = await ac.post("/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": tenant_id})
+        tenant_owner_headers = {"Authorization": f"Bearer {switched.json()['access_token']}"}
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers=tenant_owner_headers,
+            json={"email": "tenant-admin@example.com", "org_id": tenant_id, "role": "admin"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant_admin = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "tenant-admin@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        admin_headers = {"Authorization": f"Bearer {tenant_admin.json()['access_token']}"}
+
+        takeover = await ac.patch(
+            f"/scim/v2/Users/{owner_id}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "password", "value": "attacker chosen secret"}]},
+        )
+        assert takeover.status_code == 403
+        reset = await ac.post(f"/api/v1/users/{owner_id}/mfa/totp/reset", headers=admin_headers)
+        assert reset.status_code == 403
+        suspend = await ac.patch(f"/api/v1/users/{owner_id}", headers=admin_headers, json={"disabled": True})
+        assert suspend.status_code == 403
+        owner_login = await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": password})
+        assert owner_login.status_code == 200
+
+        local = await ac.post(
+            "/api/v1/users/provision",
+            headers=admin_headers,
+            json={"org_id": tenant_id, "email": "local@example.com", "role": "viewer"},
+        )
+        local_id = local.json()["user"]["id"]
+        local_suspend = await ac.patch(f"/api/v1/users/{local_id}", headers=admin_headers, json={"disabled": True})
+        assert local_suspend.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_admin_user_provisioning_creates_and_updates_org_memberships():
     async with await client() as ac:
         owner = await register(
