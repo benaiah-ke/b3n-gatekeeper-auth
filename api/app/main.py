@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -69,6 +71,7 @@ from app.models import (
 from app.schemas import (
     AccountDeactivateRequest,
     AccountDeactivateResponse,
+    AdminAccountRead,
     AuditPruneRequest,
     AuditPruneResponse,
     AuditRead,
@@ -169,15 +172,21 @@ from app.security import (
     verify_totp_code,
 )
 from app.services import (
+    BASELINE_PERMISSIONS,
+    SIGNUP_CLOSED_DETAIL,
     active_passkey_count,
     add_default_org_roles,
     audit,
     authenticate_password,
+    cap_scopes,
+    client_default_audience,
+    client_ip,
     create_api_token,
     create_one_time_code,
     create_session_tokens,
     create_user,
     derive_membership_scopes,
+    effective_api_token_scopes,
     enforce_rate_limit,
     enforce_session_idle_timeout,
     ensure_bootstrap,
@@ -289,11 +298,6 @@ def oauth_authorize_query(request: Request, *, approve: bool | None = None) -> s
     else:
         params["approve"] = "true" if approve else "false"
     return urlencode(params)
-
-
-def oauth_authorize_path(request: Request) -> str:
-    query = oauth_authorize_query(request)
-    return f"{request.url.path}?{query}" if query else request.url.path
 
 
 async def resolve_authorize_org(
@@ -424,6 +428,16 @@ async def issue_oauth_authorization_code(
     if state:
         query["state"] = state
     return RedirectResponse(f"{redirect_uri}?{urlencode(query)}", status_code=302)
+
+
+def login_audience(client: AuthClient | None, requested: str | None) -> str:
+    """Direct logins may always ask for a GateKeeper session; other audiences must belong to the client."""
+    if requested and requested in settings.gatekeeper_audience_set:
+        return requested
+    if not client:
+        return settings.issuer
+    default = client_default_audience(client)
+    return validate_audience(client, requested) or (default[0] if isinstance(default, list) else default)
 
 
 def has_capability(values: list[str], *accepted: str) -> bool:
@@ -992,8 +1006,45 @@ async def oauth_protected_resource_path(resource_path: str, db: AsyncSession = D
     return await mcp_metadata_for(resource_path, db)
 
 
+async def refuse_registration(
+    db: AsyncSession,
+    action: str,
+    *,
+    email: str,
+    request: Request | None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    await audit(
+        db,
+        action,
+        target_type="email",
+        details={"email": email.strip().lower(), "signup_mode": settings.signup_mode, **(details or {})},
+        request=request,
+    )
+    await db.commit()
+
+
+async def pending_invitation_exists(db: AsyncSession, email: str) -> bool:
+    result = await db.execute(
+        select(Invitation.id)
+        .where(
+            Invitation.email == email.strip().lower(),
+            Invitation.accepted_at.is_(None),
+            Invitation.revoked_at.is_(None),
+            Invitation.expires_at > now_utc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 @app.post("/api/v1/auth/signup", response_model=TokenResponse)
 async def signup(body: SignupRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit(db, key=f"signup:{client_ip(request) or 'unknown'}", limit=5, window_seconds=3600)
+    # Self-service signup only bootstraps the first owner of an empty install.
+    if (await db.execute(select(User.id).limit(1))).scalar_one_or_none():
+        await refuse_registration(db, "auth.signup.refused", email=str(body.email), request=request)
+        raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL)
     user = await create_user(
         db,
         email=str(body.email),
@@ -1002,7 +1053,7 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
         verified=False,
     )
     device_id = current_or_new_device_id(request)
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1018,7 +1069,7 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
         access_token=access,
         refresh_token=refresh,
         expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join(derive_membership_scopes(orgs)),
+        scope=" ".join(scopes),
         user=user_read(user),
         orgs=orgs,
     )
@@ -1028,13 +1079,29 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
 async def login(body: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     await enforce_rate_limit(
         db,
-        key=f"login:{str(body.email).lower()}:{request.client.host if request.client else 'unknown'}",
+        key=f"login:{str(body.email).lower()}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=300,
     )
     user = await authenticate_password(db, str(body.email), body.password)
+    return await complete_login(
+        db, request=request, response=response, user=user, body=body, first_factor="pwd", audit_action="auth.login"
+    )
+
+
+async def complete_login(
+    db: AsyncSession,
+    *,
+    request: Request,
+    response: Response,
+    user: User,
+    body: LoginRequest | EmailCodeVerify,
+    first_factor: str,
+    audit_action: str,
+) -> TokenResponse:
+    """MFA, client/org policy and session issue shared by every first factor (password, email code)."""
     client = await get_client_by_client_id(db, body.client_id) if body.client_id else None
-    amr = ["pwd"]
+    amr = [first_factor]
     effective_org_id = await effective_client_org_id(db, client=client, user=user)
     policy_org = await db.get(Organization, effective_org_id) if effective_org_id else None
     device_id = current_or_new_device_id(request)
@@ -1067,9 +1134,8 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
     )
     orgs = await org_roles(db, user.id)
     scopes = validate_scopes(client, body.scope or "") if client else derive_membership_scopes(orgs, effective_org_id)
-    selected_audience = validate_audience(client, body.audience) if client else None
-    audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    audience = login_audience(client, body.audience)
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1082,7 +1148,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
         trusted_at=trusted_session.trusted_at if TRUSTED_DEVICE_AMR in amr and trusted_session else None,
         trusted_until=trusted_session.trusted_until if TRUSTED_DEVICE_AMR in amr and trusted_session else None,
     )
-    await audit(db, "auth.login", actor_user_id=user.id, request=request)
+    await audit(db, audit_action, actor_user_id=user.id, request=request)
     await db.commit()
     set_session_cookie(response, access)
     set_refresh_cookie(response, refresh)
@@ -1130,31 +1196,20 @@ async def switch_session_org(
     db: AsyncSession = Depends(get_db),
 ):
     user = await require_session_user(principal, db)
+    # Only hosted GateKeeper sessions switch orgs. They always carry their full role, so re-deriving the role in the
+    # target org widens nothing; CLI, client-bound and narrowed tokens would be widened, so they sign in again.
+    current = await db.get(Session, principal.session_id)
+    if not current or current.client_id or (principal.claims or {}).get("aud") != settings.issuer:
+        raise HTTPException(status_code=403, detail="Organization switching is limited to hosted sessions")
+    if body.client_id or body.scope or (body.audience and body.audience != settings.issuer):
+        raise HTTPException(status_code=400, detail="Organization switching keeps the session's client and scopes")
     memberships = await org_roles(db, user.id)
     selected_org = next((org for org in memberships if org.id == body.org_id), None)
     if not selected_org:
         raise HTTPException(status_code=403, detail="Organization membership required")
-
-    client = await get_client_by_client_id(db, body.client_id) if body.client_id else None
-    if client and client.org_id and client.org_id != selected_org.id:
-        raise HTTPException(status_code=403, detail="Client is bound to another organization")
-
-    if client:
-        scopes = validate_scopes(client, body.scope or "")
-        audience = validate_audience(client, body.audience) or (
-            client.audiences[0] if client.audiences else settings.issuer
-        )
-    else:
-        if body.audience and body.audience != settings.issuer:
-            raise HTTPException(status_code=400, detail="client_id is required for custom audience")
-        if body.scope:
-            scopes = [item for item in body.scope.split() if item]
-            allowed_scopes = set(selected_org.permissions or [])
-            if "*" not in allowed_scopes and not set(scopes).issubset(allowed_scopes):
-                raise HTTPException(status_code=400, detail="Invalid scope")
-        else:
-            scopes = derive_membership_scopes(memberships, selected_org.id)
-        audience = settings.issuer
+    client = None
+    scopes = derive_membership_scopes(memberships, selected_org.id)
+    audience = settings.issuer
 
     amr = principal_amr(principal)
     await enforce_client_and_org_mfa_policy(
@@ -1166,7 +1221,7 @@ async def switch_session_org(
         trusted_device=await principal_trusted_device_active(db, principal),
     )
     device_id = current_or_new_device_id(request)
-    access, refresh_token, session, _refresh_model = await create_session_tokens(
+    access, refresh_token, session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1260,6 +1315,13 @@ async def me(principal: Principal = Depends(current_principal), db: AsyncSession
         "org_id": principal.org_id,
         "user": user_read(user) if user else None,
     }
+
+
+async def require_hosted_session_user(principal: Principal, db: AsyncSession) -> User:
+    """Device approval hands a client the approver's account, so only a hosted GateKeeper session may do it."""
+    if not hosted_session_principal(principal):
+        raise HTTPException(status_code=401, detail="Sign in to GateKeeper to approve this device")
+    return await require_session_user(principal, db)
 
 
 async def require_session_user(principal: Principal, db: AsyncSession) -> User:
@@ -1419,9 +1481,10 @@ async def change_password(
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid current password")
     user.password_hash = hash_password(body.new_password)
-    revoked_count = 0
+    revoked = {}
     if body.revoke_other_sessions and principal.session_id:
-        revoked_count = await revoke_other_user_sessions(db, user_id=user.id, current_session_id=principal.session_id)
+        revoked = await revoke_user_credentials(db, user_id=user.id, keep_session_id=principal.session_id)
+    revoked_count = revoked.get("revoked_sessions", 0)
     await audit(
         db,
         "auth.password.change",
@@ -1429,6 +1492,7 @@ async def change_password(
         target_type="user",
         target_id=user.id,
         details={
+            **revoked,
             "revoked_count": revoked_count,
             "revoke_other_sessions": body.revoke_other_sessions,
             "current_session_kept": True,
@@ -1743,7 +1807,7 @@ async def passkey_registration_options(
     rp_id, _origins = require_webauthn_configuration()
     await enforce_rate_limit(
         db,
-        key=f"passkey-register:{user.id}:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-register:{user.id}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=3600,
     )
@@ -1876,10 +1940,10 @@ async def passkey_authentication_options(
     if payload.client_id:
         client = await get_client_by_client_id(db, payload.client_id)
         validate_scopes(client, payload.scope or "")
-        validate_audience(client, payload.audience)
+        login_audience(client, payload.audience)
     await enforce_rate_limit(
         db,
-        key=f"passkey-auth:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-auth:{client_ip(request) or 'unknown'}",
         limit=30,
         window_seconds=300,
     )
@@ -1920,7 +1984,7 @@ async def verify_passkey_authentication(
     rp_id, origins = require_webauthn_configuration()
     await enforce_rate_limit(
         db,
-        key=f"passkey-auth-verify:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-auth-verify:{client_ip(request) or 'unknown'}",
         limit=30,
         window_seconds=300,
     )
@@ -1978,10 +2042,9 @@ async def verify_passkey_authentication(
     )
     orgs = await org_roles(db, user.id)
     scopes = validate_scopes(client, requested_scope) if client else derive_membership_scopes(orgs, effective_org_id)
-    selected_audience = validate_audience(client, requested_audience) if client else None
-    audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
+    audience = login_audience(client, requested_audience)
     device_id = current_or_new_device_id(request)
-    access, refresh_token, _session, _refresh_model = await create_session_tokens(
+    access, refresh_token, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -2113,6 +2176,7 @@ async def setup_totp(principal: Principal = Depends(current_principal), db: Asyn
 @app.post("/api/v1/auth/mfa/totp/enable", response_model=TotpEnableRead)
 async def enable_totp(
     body: TotpVerifyRequest,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2133,6 +2197,7 @@ async def enable_totp(
         target_type="user",
         target_id=user.id,
         details={"recovery_codes_issued": len(recovery_codes)},
+        request=request,
     )
     await db.commit()
     return TotpEnableRead(
@@ -2175,6 +2240,7 @@ async def regenerate_recovery_codes(
 @app.post("/api/v1/auth/mfa/totp/disable", response_model=MfaStatusRead)
 async def disable_totp(
     body: TotpVerifyRequest,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2204,6 +2270,7 @@ async def disable_totp(
         actor_user_id=user.id,
         target_type="user",
         target_id=user.id,
+        request=request,
     )
     await db.commit()
     return MfaStatusRead(
@@ -2317,6 +2384,35 @@ async def revoke_user_sessions(db: AsyncSession, *, user_id: str) -> int:
     return revoked_count
 
 
+async def revoke_user_credentials(db: AsyncSession, *, user_id: str, keep_session_id: str | None = None) -> dict:
+    """After a password reset or change, close everything the old password could have opened: sessions (except the
+    one making the change), refresh tokens, API tokens, unused authorization codes and approved device grants."""
+    now = now_utc()
+    if keep_session_id:
+        sessions = await revoke_other_user_sessions(db, user_id=user_id, current_session_id=keep_session_id)
+    else:
+        sessions = await revoke_user_sessions(db, user_id=user_id)
+    tokens = await db.execute(
+        update(ApiToken).where(ApiToken.user_id == user_id, ApiToken.revoked_at.is_(None)).values(revoked_at=now)
+    )
+    codes = await db.execute(
+        update(OAuthAuthorizationCode)
+        .where(OAuthAuthorizationCode.user_id == user_id, OAuthAuthorizationCode.used_at.is_(None))
+        .values(used_at=now)
+    )
+    grants = await db.execute(
+        update(DeviceGrant)
+        .where(DeviceGrant.user_id == user_id, DeviceGrant.used_at.is_(None), DeviceGrant.denied_at.is_(None))
+        .values(denied_at=now)
+    )
+    return {
+        "revoked_sessions": sessions,
+        "revoked_tokens": tokens.rowcount or 0,
+        "revoked_codes": codes.rowcount or 0,
+        "denied_device_grants": grants.rowcount or 0,
+    }
+
+
 async def count_user_delete_artifacts(db: AsyncSession, *, user_id: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     queries = {
@@ -2392,6 +2488,73 @@ async def ensure_user_admin_visible(
     if not result.scalar_one_or_none():
         raise HTTPException(status_code=404, detail="User not found")
     return visible_org_ids
+
+
+async def ensure_target_not_above_caller(db: AsyncSession, *, user_id: str, principal: Principal) -> None:
+    """Changing an owner's or platform admin's account would let a lesser admin take it over or lock it out."""
+    if await is_platform_admin(db, principal.user_id):
+        return
+    if await is_platform_admin(db, user_id):
+        raise HTTPException(status_code=403, detail="Only a platform admin can change this account")
+    for org in await org_roles(db, user_id):
+        if org.role == "owner":
+            await require_org_owner(db, principal, org.id)
+
+
+async def ensure_account_wide_change_allowed(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    principal: Principal,
+    visible_org_ids: list[str] | None,
+) -> None:
+    """Passwords, MFA and suspension are account-wide, so an org admin may change them only for
+    accounts that belong to no organization outside the admin's own, and never for an account above them."""
+    if await is_platform_admin(db, principal.user_id):
+        return
+    await ensure_target_not_above_caller(db, user_id=user_id, principal=principal)
+    membership_org_ids = set(await user_membership_org_ids(db, user_id=user_id))
+    if visible_org_ids is None or membership_org_ids - set(visible_org_ids):
+        raise HTTPException(status_code=403, detail="User belongs to another organization")
+
+
+RESERVED_ROLE_NAMES = {"owner", "admin", "operator"}
+
+
+def ensure_custom_role_name(name: str) -> None:
+    # Resource servers and the platform-admin check read role names, so look-alikes of the built-in roles are refused.
+    if re.sub(r"[^a-z]", "", name.lower()) in RESERVED_ROLE_NAMES:
+        raise HTTPException(status_code=400, detail="Role name is reserved")
+
+
+async def require_org_owner(db: AsyncSession, principal: Principal, org_id: str) -> None:
+    if await is_platform_admin(db, principal.user_id):
+        return
+    caller_orgs = await org_roles(db, principal.user_id) if principal.user_id else []
+    if not any(org.id == org_id and org.role == "owner" for org in caller_orgs):
+        raise HTTPException(status_code=403, detail="Organization owner required")
+
+
+async def ensure_role_assignable(
+    db: AsyncSession, *, principal: Principal, org_id: str, role: Role, current_role: Role | None = None
+) -> None:
+    """Callers hand out only roles their own permissions cover, and only owners or platform admins touch owners."""
+    if await is_platform_admin(db, principal.user_id):
+        return
+    if role.name == "owner" or (current_role is not None and current_role.name == "owner"):
+        await require_org_owner(db, principal, org_id)
+    try:
+        await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=role.permissions or [])
+    except HTTPException as exc:
+        raise HTTPException(status_code=403, detail="Role grants more than your own permissions") from exc
+
+
+async def ensure_attach_allowed(db: AsyncSession, *, user_id: str, principal: Principal, org_id: str) -> None:
+    """An existing account joins another org only by accepting an invitation. Pulling it in through membership
+    updates, provisioning or SCIM would give that org's admins account-wide powers over it (an account with no
+    memberships at all included), so only platform admins may."""
+    if not await is_platform_admin(db, principal.user_id):
+        raise HTTPException(status_code=403, detail="This account already exists; send an invitation instead")
 
 
 async def resolve_org_role(
@@ -2854,13 +3017,20 @@ async def scim_group_role(db: AsyncSession, *, role_id: str, org_id: str) -> Rol
     return role
 
 
-async def scim_assign_group_member(db: AsyncSession, *, org: Organization, role: Role, user_id: str) -> bool:
+async def scim_assign_group_member(
+    db: AsyncSession, *, org: Organization, role: Role, user_id: str, principal: Principal
+) -> bool:
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="SCIM member not found")
     result = await db.execute(select(Membership).where(Membership.user_id == user.id, Membership.org_id == org.id))
     membership = result.scalar_one_or_none()
+    if membership is None:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
+    if user.disabled:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role, current_role=current_role)
     changed = (
         membership is None
         or membership.role_id != role.id
@@ -2878,11 +3048,14 @@ async def scim_assign_group_member(db: AsyncSession, *, org: Organization, role:
         db.add(membership)
     user.disabled = False
     if changed:
+        await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
         await revoke_user_sessions(db, user_id=user.id)
     return changed
 
 
-async def scim_remove_group_member(db: AsyncSession, *, org: Organization, role: Role, user_id: str) -> bool:
+async def scim_remove_group_member(
+    db: AsyncSession, *, org: Organization, role: Role, user_id: str, principal: Principal
+) -> bool:
     result = await db.execute(
         select(User, Membership)
         .join(Membership, Membership.user_id == User.id)
@@ -2896,6 +3069,7 @@ async def scim_remove_group_member(db: AsyncSession, *, org: Organization, role:
         return False
     if role.name == "owner":
         await ensure_other_active_owner(db, org_id=org.id, user_id=user.id)
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     membership.status = "revoked"
     await revoke_user_sessions(db, user_id=user.id)
     return True
@@ -2939,13 +3113,20 @@ async def scim_apply_user_state(
         if membership and active is SCIM_UNSET
         else ("active" if scim_bool(active) else "revoked")
     )
+    if membership is None or role.id != membership.role_id or target_status != membership.status:
+        await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if target_status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org.id, user_id=user.id)
 
     previous_disabled = user.disabled
+    if password is not SCIM_UNSET:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     if display_name is not SCIM_UNSET:
-        user.display_name = str(display_name).strip() or None if display_name is not None else None
+        new_display_name = str(display_name).strip() or None if display_name is not None else None
+        if new_display_name != user.display_name:
+            await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
+        user.display_name = new_display_name
     password_changed = False
     if password is not SCIM_UNSET:
         user.password_hash = hash_password(str(password))
@@ -2970,19 +3151,24 @@ async def scim_apply_user_state(
                 current_profile[key] = value
         membership.scim_enterprise_profile = current_profile
 
-    if active is not SCIM_UNSET and scim_bool(active):
+    if active is not SCIM_UNSET and scim_bool(active) and user.disabled:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
         user.disabled = False
     await db.flush()
     if active is not SCIM_UNSET and not scim_bool(active):
         active_count_result = await db.execute(
             select(func.count(Membership.id)).where(Membership.user_id == user.id, Membership.status == "active")
         )
-        if int(active_count_result.scalar_one() or 0) == 0:
+        if int(active_count_result.scalar_one() or 0) == 0 and not user.disabled:
+            await ensure_account_wide_change_allowed(
+                db, user_id=user.id, principal=principal, visible_org_ids=[org.id]
+            )
             user.disabled = True
 
     disabled_changed = previous_disabled != user.disabled
     revoked_sessions = 0
     if membership_changed or disabled_changed or password_changed:
+        await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
         revoked_sessions = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
@@ -2995,6 +3181,7 @@ async def scim_apply_user_state(
             "email": user.email,
             "role": role.name,
             "status": membership.status,
+            "membership_changed": membership_changed,
             "active": not user.disabled and membership.status == "active",
             "password_updated": password_changed,
             "external_id_updated": external_id is not SCIM_UNSET,
@@ -3308,6 +3495,7 @@ async def scim_create_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     display_name = scim_group_display_name(body)
+    ensure_custom_role_name(display_name)
     existing = await db.execute(select(Role).where(Role.org_id == org.id, Role.name == display_name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3316,7 +3504,7 @@ async def scim_create_group(
     await db.flush()
     changed_members = 0
     for member_id in scim_member_ids(body.get("members")):
-        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     await audit(
         db,
@@ -3358,8 +3546,11 @@ async def scim_replace_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     role = await scim_group_role(db, role_id=group_id, org_id=org.id)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     display_name = scim_group_display_name(body)
     if display_name != role.name:
+        ensure_custom_role_name(role.name)
+        ensure_custom_role_name(display_name)
         duplicate = await db.execute(select(Role.id).where(Role.org_id == org.id, Role.name == display_name))
         if duplicate.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3375,10 +3566,10 @@ async def scim_replace_group(
     current_member_ids = set(current_result.scalars())
     changed_members = 0
     for member_id in sorted(current_member_ids - desired_member_ids):
-        if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     for member_id in sorted(desired_member_ids - current_member_ids):
-        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     await audit(
         db,
@@ -3407,6 +3598,7 @@ async def scim_patch_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     role = await scim_group_role(db, role_id=group_id, org_id=org.id)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     operations = body.get("Operations") or body.get("operations")
     if not isinstance(operations, list):
         raise HTTPException(status_code=422, detail="SCIM PatchOp Operations array is required")
@@ -3429,6 +3621,8 @@ async def scim_patch_group(
                 raise HTTPException(status_code=400, detail="SCIM group displayName is required")
             display_name = scim_group_display_name({"displayName": value})
             if display_name != role.name:
+                ensure_custom_role_name(role.name)
+                ensure_custom_role_name(display_name)
                 duplicate = await db.execute(select(Role.id).where(Role.org_id == org.id, Role.name == display_name))
                 if duplicate.scalar_one_or_none():
                     raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3453,10 +3647,10 @@ async def scim_patch_group(
             )
             current_member_ids = set(current_result.scalars())
             for member_id in sorted(current_member_ids - desired_member_ids):
-                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
             for member_id in sorted(desired_member_ids - current_member_ids):
-                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
         elif op_name == "remove":
             if not member_ids:
@@ -3469,11 +3663,11 @@ async def scim_patch_group(
                 )
                 member_ids = list(current_result.scalars())
             for member_id in member_ids:
-                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
         else:
             for member_id in member_ids:
-                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
     await audit(
         db,
@@ -3559,6 +3753,10 @@ async def scim_create_user(
     password = scim_password(body)
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
+    if user and not await db.scalar(
+        select(Membership.id).where(Membership.user_id == user.id, Membership.org_id == org.id)
+    ):
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
     if not user:
         user = User(
             email=email,
@@ -3569,6 +3767,16 @@ async def scim_create_user(
         )
         db.add(user)
         await db.flush()
+        await audit(
+            db,
+            "user.create",
+            org_id=org.id,
+            actor_user_id=principal.user_id,
+            target_type="user",
+            target_id=user.id,
+            details={"email": email, "via": "scim"},
+            request=request,
+        )
     membership, role, _revoked_sessions = await scim_apply_user_state(
         db,
         user=user,
@@ -3711,6 +3919,39 @@ async def list_users(
     return [await user_admin_read(db, user, visible_org_ids) for user in users]
 
 
+@app.get("/api/v1/admin/accounts", response_model=list[AdminAccountRead])
+async def list_new_accounts(
+    created_after: datetime | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    principal: Principal = Depends(require_scopes(["admin:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    await require_platform_admin(db, principal)
+    query = select(User).order_by(User.created_at.desc()).limit(limit)
+    if created_after:
+        if created_after.tzinfo:
+            created_after = created_after.astimezone(UTC).replace(tzinfo=None)
+        query = query.where(User.created_at > created_after)
+    accounts: list[AdminAccountRead] = []
+    for user in (await db.execute(query)).scalars():
+        last_session = (
+            await db.execute(
+                select(Session.ip_address, Session.created_at)
+                .where(Session.user_id == user.id)
+                .order_by(Session.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+        accounts.append(
+            AdminAccountRead(
+                **(await user_admin_read(db, user)).model_dump(),
+                last_session_ip=last_session[0] if last_session else None,
+                last_session_at=last_session[1] if last_session else None,
+            )
+        )
+    return accounts
+
+
 @app.post("/api/v1/users/provision", response_model=UserProvisionResponse)
 async def provision_user(
     body: UserProvisionRequest,
@@ -3742,6 +3983,10 @@ async def provision_user(
         db.add(user)
         await db.flush()
     else:
+        if (body.disabled is not None and body.disabled != user.disabled) or (
+            body.email_verified is not None and body.email_verified != user.email_verified
+        ):
+            await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org_id])
         if "display_name" in body.model_fields_set:
             user.display_name = body.display_name.strip() or None if body.display_name else None
         if body.email_verified is not None:
@@ -3752,7 +3997,10 @@ async def provision_user(
     )
     membership = membership_result.scalar_one_or_none()
     created_membership = membership is None
+    if created_membership and not created_user:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org_id)
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if body.status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org_id, user_id=user.id)
@@ -3787,6 +4035,7 @@ async def provision_user(
             "status": body.status,
             "created_user": created_user,
             "created_membership": created_membership,
+            "membership_changed": membership_changed,
             "disabled": user.disabled,
             "revoked_sessions": revoked_sessions,
         },
@@ -3832,6 +4081,7 @@ async def update_user_admin(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     if body.disabled is True and not user.disabled:
         owner_memberships = await db.execute(
             select(Membership)
@@ -3869,6 +4119,7 @@ async def update_user_admin(
 async def update_user_membership(
     user_id: str,
     body: UserMembershipUpdate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -3888,7 +4139,10 @@ async def update_user_membership(
         select(Membership).where(Membership.user_id == user_id, Membership.org_id == org_id)
     )
     membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org_id)
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if body.status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org_id, user_id=user.id)
@@ -3898,6 +4152,8 @@ async def update_user_membership(
     else:
         membership = Membership(org_id=org_id, user_id=user.id, role_id=role.id, status=body.status)
         db.add(membership)
+    # Revoking sessions is account-wide, so an account above the caller is left alone.
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     revoked_count = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
@@ -3907,6 +4163,7 @@ async def update_user_membership(
         target_type="membership",
         target_id=membership.id,
         details={"user_id": user.id, "role": role.name, "status": body.status, "revoked_sessions": revoked_count},
+        request=request,
     )
     await db.commit()
     await db.refresh(user)
@@ -3928,6 +4185,7 @@ async def revoke_admin_user_sessions(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     revoked_count = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
@@ -3945,6 +4203,7 @@ async def revoke_admin_user_sessions(
 @app.post("/api/v1/users/{user_id}/mfa/totp/reset", response_model=UserMfaResetResponse)
 async def reset_admin_user_totp(
     user_id: str,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -3957,6 +4216,7 @@ async def reset_admin_user_totp(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     had_enabled_totp = bool(user.mfa_totp_enabled_at)
     had_pending_totp = bool(user.mfa_totp_secret_encrypted and not user.mfa_totp_enabled_at)
     user.mfa_totp_secret_encrypted = None
@@ -3975,6 +4235,7 @@ async def reset_admin_user_totp(
             "totp_was_pending": had_pending_totp,
             "revoked_sessions": revoked_count,
         },
+        request=request,
     )
     await db.commit()
     await db.refresh(user)
@@ -3999,6 +4260,7 @@ async def delete_user_admin(
     if principal.user_id == user.id:
         raise HTTPException(status_code=400, detail="Use self-service account deactivation for the current user")
     visible_org_ids = await ensure_user_admin_visible(db, user_id=user.id, principal=principal)
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     policy_org_ids = await ensure_user_hard_delete_policy(db, user_id=user.id, visible_org_ids=visible_org_ids)
     await require_admin_step_up_for_orgs(
         db,
@@ -4139,6 +4401,7 @@ async def create_invitation(
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     role = await invitation_role(db, org_id=org.id, role_id=body.role_id, role_name=body.role)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     email = str(body.email).lower()
     revoked_at = now_utc()
     existing_result = await db.execute(
@@ -4218,7 +4481,7 @@ async def accept_invitation(
     email = str(body.email).lower()
     await enforce_rate_limit(
         db,
-        key=f"invitation-accept:{email}:{request.client.host if request.client else 'unknown'}",
+        key=f"invitation-accept:{email}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=300,
     )
@@ -4266,6 +4529,14 @@ async def accept_invitation(
                 detail = "TOTP code required" if user.mfa_totp_enabled_at else "Passkey sign-in required"
                 raise HTTPException(status_code=401, detail=detail)
     else:
+        if settings.signup_mode != "invite":
+            await refuse_registration(
+                db, "auth.invitation.refused", email=email, request=request, details={"org_id": invitation.org_id}
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Sign in with an existing account to accept this invitation. Ask an administrator to add you.",
+            )
         if not body.password:
             raise HTTPException(status_code=422, detail="Password is required for a new account")
         user = await create_user(
@@ -4287,7 +4558,7 @@ async def accept_invitation(
         db.add(Membership(org_id=invitation.org_id, user_id=user.id, role_id=role.id, status="active"))
     invitation.accepted_at = now_utc()
     invitation.accepted_user_id = user.id
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -4302,6 +4573,7 @@ async def accept_invitation(
         target_type="invitation",
         target_id=invitation.id,
         details={"email": email, "role": role.name},
+        request=request,
     )
     await db.commit()
     set_session_cookie(response, access)
@@ -4310,14 +4582,20 @@ async def accept_invitation(
         access_token=access,
         refresh_token=refresh,
         expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join((role.permissions or []) or ["auth:read"]),
+        scope=" ".join(scopes),
         user=user_read(user),
         orgs=await org_roles(db, user.id),
     )
 
 
+def require_email_code_login() -> None:
+    if not settings.email_code_login_enabled:
+        raise HTTPException(status_code=403, detail="Email code sign-in is disabled")
+
+
 @app.post("/api/v1/auth/email-code/request")
-async def request_email_code(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+async def request_email_code(body: EmailCodeRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    require_email_code_login()
     await enforce_rate_limit(
         db,
         key=f"email-code:{str(body.email).lower()}:{body.purpose}",
@@ -4326,11 +4604,17 @@ async def request_email_code(body: EmailCodeRequest, db: AsyncSession = Depends(
     )
     user_result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = user_result.scalar_one_or_none()
+    if not user:
+        # Same response as a sent code so the endpoint cannot be used to discover accounts.
+        await refuse_registration(
+            db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
+        )
+        return {"status": "sent"}
     code = await create_one_time_code(
         db,
         email=str(body.email),
         purpose=body.purpose,
-        user_id=user.id if user else None,
+        user_id=user.id,
     )
     send_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
     await db.commit()
@@ -4344,26 +4628,33 @@ async def verify_email_code(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    require_email_code_login()
+    await enforce_rate_limit(
+        db,
+        key=f"email-code-verify:{str(body.email).lower()}:{client_ip(request) or 'unknown'}",
+        limit=10,
+        window_seconds=300,
+    )
     await verify_one_time_code(db, email=str(body.email), purpose=body.purpose, code=body.code)
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = result.scalar_one_or_none()
     if not user:
-        user = await create_user(db, email=str(body.email), password=None, verified=True)
+        await refuse_registration(
+            db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
+        )
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+    if user.disabled:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     if body.purpose == "verify_email":
         user.email_verified = True
-    access, refresh, _session, _refresh_model = await create_session_tokens(db, user, request=request, amr=["email"])
-    orgs = await org_roles(db, user.id)
-    await audit(db, f"auth.email_code.{body.purpose}", actor_user_id=user.id, request=request)
-    await db.commit()
-    set_session_cookie(response, access)
-    set_refresh_cookie(response, refresh)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join(derive_membership_scopes(orgs)),
-        user=user_read(user),
-        orgs=orgs,
+    return await complete_login(
+        db,
+        request=request,
+        response=response,
+        user=user,
+        body=body,
+        first_factor="email",
+        audit_action=f"auth.email_code.{body.purpose}",
     )
 
 
@@ -4406,7 +4697,9 @@ async def confirm_password_reset(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.password_hash = hash_password(body.new_password)
-    await audit(db, "auth.password.reset", actor_user_id=user.id, request=request)
+    # A reset means the old password may be known to someone else, so everything it opened is closed.
+    revoked = await revoke_user_credentials(db, user_id=user.id)
+    await audit(db, "auth.password.reset", actor_user_id=user.id, details=revoked, request=request)
     await db.commit()
     return {"status": "updated"}
 
@@ -4577,6 +4870,10 @@ async def revoke_session(
         raise HTTPException(status_code=404, detail="Session not found")
     if "*" not in principal.scopes and principal.user_id != session.user_id:
         raise HTTPException(status_code=403, detail="Session ownership required")
+    if principal.user_id != session.user_id:
+        # The * scope only reaches users of the caller's own org.
+        await ensure_user_admin_visible(db, user_id=session.user_id, principal=principal)
+        await ensure_target_not_above_caller(db, user_id=session.user_id, principal=principal)
     session.revoked_at = now_utc()
     result = await db.execute(
         select(RefreshToken).where(
@@ -4663,13 +4960,64 @@ async def get_db_oauth_provider(db: AsyncSession, provider_id: str) -> OAuthProv
     return result.scalar_one_or_none()
 
 
+async def is_platform_admin(db: AsyncSession, user_id: str | None) -> bool:
+    if not user_id:
+        return False
+    if user_id in settings.platform_admin_user_id_set:
+        return True
+    result = await db.execute(
+        select(Membership.id)
+        .join(Organization, Organization.id == Membership.org_id)
+        .join(Role, Role.id == Membership.role_id)
+        .where(
+            Membership.user_id == user_id,
+            Membership.status == "active",
+            Organization.slug == settings.bootstrap_org_slug,
+            Role.name == "owner",
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def require_platform_admin(db: AsyncSession, principal: Principal) -> None:
+    # Scopes alone (even admin:* or *) are not enough: the caller must be a platform admin user.
+    if not await is_platform_admin(db, principal.user_id):
+        raise HTTPException(status_code=403, detail="Platform admin required")
+
+
+async def ensure_client_scopes_allowed(
+    db: AsyncSession, *, principal: Principal, org_id: str | None, scopes: list[str]
+) -> None:
+    """A client can only carry scopes its creator holds; * and admin:* need a platform admin."""
+    if {"*", "admin:*"}.intersection(scopes):
+        await require_platform_admin(db, principal)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=scopes)
+
+
+def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
+    # GateKeeper's own audiences (the issuer included) are always reserved: tokens for them act on GateKeeper.
+    # A client without audiences (MCP-only included) falls back to GateKeeper's own API audience, so it is reserved.
+    if not audiences:
+        return True
+    reserved = settings.reserved_audience_set | settings.gatekeeper_audience_set
+    return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
+
+
+def reserved_token_audience(audiences: list[str] | None) -> bool:
+    # An API token bound to GateKeeper itself is worth no more than an unbound one, so only other first-party
+    # audiences (sentinel-api, knowhere-api, ...) need a platform admin.
+    return bool(settings.reserved_audience_set.intersection(audiences or []) - settings.gatekeeper_audience_set)
+
+
 async def require_install_owner(db: AsyncSession, principal: Principal) -> Organization:
-    if "*" not in principal.scopes or not principal.org_id:
+    if not has_capability(principal.scopes, "admin:*") or not principal.org_id:
         raise HTTPException(status_code=403, detail="Install owner required")
     result = await db.execute(select(Organization).where(Organization.slug == settings.bootstrap_org_slug))
     bootstrap_org = result.scalar_one_or_none()
     if not bootstrap_org or principal.org_id != bootstrap_org.id:
         raise HTTPException(status_code=403, detail="Install owner required")
+    await require_platform_admin(db, principal)
     return bootstrap_org
 
 
@@ -5132,6 +5480,11 @@ async def complete_oauth_provider_callback(
     if not user:
         if provider.require_verified_email and not email_verified:
             raise HTTPException(status_code=403, detail="OAuth provider email must be verified before signup")
+        if settings.signup_mode != "invite" or not email_verified or not await pending_invitation_exists(db, email):
+            await refuse_registration(
+                db, "auth.oauth.signup.refused", email=email, request=request, details={"provider": provider.id}
+            )
+            raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL)
         user = await create_user(
             db,
             email=email,
@@ -5141,6 +5494,11 @@ async def complete_oauth_provider_callback(
         )
     if user.disabled:
         raise HTTPException(status_code=401, detail="User is disabled")
+    # Same gate as password login without a client: a provider sign-in cannot stand in for the account's own MFA.
+    if await user_has_mfa(db, user):
+        raise HTTPException(
+            status_code=401, detail="This account uses MFA; sign in with your password and second factor"
+        )
     if identity:
         identity.email = email
     else:
@@ -5152,7 +5510,7 @@ async def complete_oauth_provider_callback(
                 email=email,
             )
         )
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, _scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -5212,6 +5570,34 @@ async def oauth_provider_callback(
     return await complete_oauth_provider_callback(provider_id, code, state, request, db, principal=principal)
 
 
+def hosted_session_principal(principal: Principal | None) -> Principal | None:
+    """Only a hosted GateKeeper session may authorize apps. API, CLI and product tokens are treated as signed out,
+    because a code for a client can carry far wider scopes than the token that asked for it."""
+    if (
+        principal
+        and principal.auth_type == "user"
+        and principal.session_id
+        and (principal.claims or {}).get("aud") == settings.issuer
+    ):
+        return principal
+    return None
+
+
+def consent_nonce(principal: Principal, client: AuthClient, redirect_uri: str, code_challenge: str) -> str:
+    """Proof that the hosted consent page for this exact request was shown to this session."""
+    message = "|".join(
+        [
+            "oauth-consent",
+            principal.user_id or "",
+            principal.session_id or "",
+            client.client_id,
+            redirect_uri,
+            code_challenge,
+        ]
+    )
+    return hmac.new(settings.secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 @app.get("/oauth/authorize")
 async def oauth_authorize_get(
     request: Request,
@@ -5224,18 +5610,57 @@ async def oauth_authorize_get(
     state: str | None = None,
     audience: str | None = None,
     org_id: str | None = None,
-    approve: bool = False,
     principal: Principal | None = Depends(optional_principal),
     db: AsyncSession = Depends(get_db),
 ):
+    # A GET never approves consent, so a link or image on another site cannot grant an app access.
+    return await oauth_authorize(
+        request,
+        response_type,
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        state,
+        audience,
+        org_id,
+        False,
+        None,
+        principal,
+        db,
+        oauth_authorize_query(request),
+    )
+
+
+async def oauth_authorize(
+    request: Request,
+    response_type: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    state: str | None,
+    audience: str | None,
+    org_id: str | None,
+    approve: bool,
+    submitted_nonce: str | None,
+    principal: Principal | None,
+    db: AsyncSession,
+    authorize_query: str,
+):
+    """authorize_query is the request without approve or consent_nonce, used to come back here after login."""
+    authorize_path = f"/oauth/authorize?{authorize_query}"
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Unsupported response_type")
     client = await get_client_by_client_id(db, client_id)
     validate_redirect(client, redirect_uri)
     selected_audience = validate_audience(client, audience)
     scopes = validate_scopes(client, scope)
+    principal = hosted_session_principal(principal)
     if not principal:
-        login_url = f"{settings.ui_url.rstrip('/')}/login?{urlencode({'redirect': oauth_authorize_path(request)})}"
+        login_url = f"{settings.ui_url.rstrip('/')}/login?{urlencode({'redirect': authorize_path})}"
         return RedirectResponse(login_url, status_code=302)
     if not principal.user_id:
         raise HTTPException(status_code=403, detail="User-bound authorization required")
@@ -5258,10 +5683,14 @@ async def oauth_authorize_get(
         if exc.status_code == 403 and str(exc.detail).startswith("MFA required"):
             login_url = "{ui}/login?{query}".format(
                 ui=settings.ui_url.rstrip("/"),
-                query=urlencode({"redirect": oauth_authorize_path(request), "step_up": "mfa"}),
+                query=urlencode({"redirect": authorize_path, "step_up": "mfa"}),
             )
             return RedirectResponse(login_url, status_code=302)
         raise
+    if approve and not hmac.compare_digest(
+        submitted_nonce or "", consent_nonce(principal, client, redirect_uri, code_challenge)
+    ):
+        raise HTTPException(status_code=403, detail="Consent confirmation is missing or expired")
     if not approve:
         grant = await find_oauth_grant(
             db,
@@ -5286,7 +5715,7 @@ async def oauth_authorize_get(
                 amr=amr,
                 state=state,
             )
-        consent_url = f"{settings.ui_url.rstrip('/')}/authorize?{oauth_authorize_query(request)}"
+        consent_url = f"{settings.ui_url.rstrip('/')}/authorize?{authorize_query}"
         return RedirectResponse(consent_url, status_code=302)
     grant = await remember_oauth_grant(
         db,
@@ -5329,7 +5758,7 @@ async def oauth_authorize_post(
     principal: Principal | None = Depends(optional_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    return await oauth_authorize_get(
+    result = await oauth_authorize(
         request,
         body.response_type,
         body.client_id,
@@ -5341,9 +5770,19 @@ async def oauth_authorize_post(
         body.audience,
         body.org_id,
         body.approve,
+        body.consent_nonce,
         principal,
         db,
+        urlencode(
+            {
+                key: value
+                for key, value in body.model_dump(exclude={"approve", "consent_nonce"}).items()
+                if value not in (None, "")
+            }
+        ),
     )
+    # The hosted consent page posts with fetch, so it gets the redirect target as JSON and navigates itself.
+    return {"redirect_to": result.headers["location"]}
 
 
 @app.get("/api/v1/oauth/authorize/context")
@@ -5362,8 +5801,8 @@ async def oauth_authorize_context(
 ):
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Unsupported response_type")
-    if not principal.user_id:
-        raise HTTPException(status_code=403, detail="User-bound authorization required")
+    if not hosted_session_principal(principal):
+        raise HTTPException(status_code=401, detail="Sign in to GateKeeper to review this app")
     client = await get_client_by_client_id(db, client_id)
     validate_redirect(client, redirect_uri)
     selected_audience = validate_audience(client, audience)
@@ -5395,6 +5834,7 @@ async def oauth_authorize_context(
         "orgs": [org.model_dump() for org in orgs],
         "selected_org_id": selected_org.id if selected_org else None,
         "code_challenge_method": code_challenge_method,
+        "consent_nonce": consent_nonce(principal, client, redirect_uri, code_challenge),
     }
 
 
@@ -5632,13 +6072,13 @@ async def oauth_token(
             trusted_device=TRUSTED_DEVICE_AMR in (auth_code.amr or []),
         )
         auth_code.used_at = now_utc()
-        access, refresh, _session, _refresh_model = await create_session_tokens(
+        access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
             db,
             user,
             client=client,
             org_id=auth_code.org_id,
             scopes=auth_code.scope.split(),
-            audience=auth_code.audience or client.audiences or settings.issuer,
+            audience=auth_code.audience or client_default_audience(client),
             bind_default_org=False,
             amr=auth_code.amr or [],
         )
@@ -5648,7 +6088,7 @@ async def oauth_token(
             "refresh_token": refresh,
             "token_type": "Bearer",
             "expires_in": settings.access_token_ttl_seconds,
-            "scope": auth_code.scope,
+            "scope": " ".join(scopes),
         }
 
     if grant_type == "refresh_token":
@@ -5674,7 +6114,8 @@ async def oauth_token(
         ):
             raise HTTPException(status_code=401, detail="Invalid client credentials")
         scopes = validate_scopes(client, scope)
-        aud = validate_audience(client, audience) or (client.audiences[0] if client.audiences else settings.issuer)
+        default = client_default_audience(client)
+        aud = validate_audience(client, audience) or (default[0] if isinstance(default, list) else default)
         access = create_access_token(
             subject=client.client_id,
             audience=aud,
@@ -5694,6 +6135,12 @@ async def oauth_token(
         if not device_code or not client_id:
             raise HTTPException(status_code=400, detail="Missing device_code fields")
         client = await get_client_by_client_id(db, client_id)
+        if not client.public and (
+            not client_secret
+            or not client.client_secret_hash
+            or not verify_password(client_secret, client.client_secret_hash)
+        ):
+            raise HTTPException(status_code=401, detail="Invalid client credentials")
         result = await db.execute(
             select(DeviceGrant).where(DeviceGrant.device_code_hash == token_hash(device_code))
         )
@@ -5718,13 +6165,13 @@ async def oauth_token(
             amr=grant.amr or [],
             trusted_device=TRUSTED_DEVICE_AMR in (grant.amr or []),
         )
-        access, refresh, _session, _refresh_model = await create_session_tokens(
+        access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
             db,
             user,
             client=client,
             org_id=grant.org_id,
             scopes=grant.scope.split(),
-            audience=grant.audience or client.audiences or settings.issuer,
+            audience=grant.audience or client_default_audience(client),
             amr=grant.amr or [],
         )
         await db.commit()
@@ -5733,7 +6180,7 @@ async def oauth_token(
             "refresh_token": refresh,
             "token_type": "Bearer",
             "expires_in": settings.access_token_ttl_seconds,
-            "scope": grant.scope,
+            "scope": " ".join(scopes),
         }
 
     raise HTTPException(status_code=400, detail="Unsupported grant_type")
@@ -5742,6 +6189,8 @@ async def oauth_token(
 @app.post("/oauth/device_authorization")
 async def device_authorization(body: DeviceAuthorizationRequest, db: AsyncSession = Depends(get_db)):
     client = await get_client_by_client_id(db, body.client_id)
+    if not client.public:
+        raise HTTPException(status_code=400, detail="Device authorization is only for public clients")
     scopes = validate_scopes(client, body.scope)
     validate_audience(client, body.audience)
     device_code = new_opaque_token("gkd")
@@ -5861,7 +6310,7 @@ async def enforce_device_approval_rate_limit(
 ) -> None:
     await enforce_rate_limit(
         db,
-        key=f"device-approval:{user.id}:{request.client.host if request.client else 'unknown'}",
+        key=f"device-approval:{user.id}:{client_ip(request) or 'unknown'}",
         limit=20,
         window_seconds=300,
     )
@@ -5877,7 +6326,7 @@ async def device_passkey_options(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     rp_id, _origins = require_webauthn_configuration()
     await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
@@ -5918,7 +6367,7 @@ async def verify_device_passkey(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     rp_id, origins = require_webauthn_configuration()
     challenge, expected_challenge = await consume_webauthn_challenge(
         db,
@@ -6005,7 +6454,7 @@ async def approve_device(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
     if body.approve:
@@ -6161,6 +6610,7 @@ async def introspect(token: str = Form(...), db: AsyncSession = Depends(get_db))
         "org_id": claims.get("org_id"),
         "org_slug": claims.get("org_slug"),
         "org_role": claims.get("org_role"),
+        "roles": claims.get("roles", []),
         "permissions": claims.get("permissions", []),
         "amr": claims.get("amr", []),
     }
@@ -6205,8 +6655,9 @@ def client_read(client: AuthClient) -> ClientRead:
 async def list_orgs(principal: Principal = Depends(current_principal), db: AsyncSession = Depends(get_db)):
     if principal.user_id:
         return await org_roles(db, principal.user_id)
-    result = await db.execute(select(Organization).order_by(Organization.name))
-    return [org_read(o) for o in result.scalars()]
+    # Service principals see only the organization their credential belongs to.
+    org = await db.get(Organization, principal.org_id) if principal.org_id else None
+    return [org_read(org)] if org else []
 
 
 def org_read(org: Organization) -> OrgRead:
@@ -6226,9 +6677,11 @@ def org_read(org: Organization) -> OrgRead:
 @app.post("/api/v1/orgs", response_model=OrgRead)
 async def create_org(
     body: OrgCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_platform_admin(db, principal)
     org = Organization(
         name=body.name,
         slug=body.slug,
@@ -6252,6 +6705,7 @@ async def create_org(
         target_type="organization",
         target_id=org.id,
         details={"creator_owner": bool(principal.user_id)},
+        request=request,
     )
     await db.commit()
     if principal.user_id:
@@ -6273,7 +6727,13 @@ async def update_org(
     org = await db.get(Organization, org_id)
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+    await setup_resource_org_id(db, principal, org.id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
+    # Everything but the name is security policy (MFA, trust, idle timeout, audit retention, hard delete).
+    if any(
+        field != "name" and getattr(body, field) != getattr(org, field) for field in body.model_fields_set
+    ):
+        await require_org_owner(db, principal, org.id)
     revoked_sessions = 0
     if body.name is not None:
         org.name = body.name
@@ -6400,6 +6860,7 @@ async def list_projects(
 @app.post("/api/v1/roles")
 async def create_role(
     body: RoleCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6407,8 +6868,21 @@ async def create_role(
     if not org_id:
         raise HTTPException(status_code=400, detail="Organization is required")
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    ensure_custom_role_name(body.name)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.permissions)
     role = Role(org_id=org_id, name=body.name, permissions=body.permissions)
     db.add(role)
+    await db.flush()
+    await audit(
+        db,
+        "role.create",
+        org_id=org_id,
+        actor_user_id=principal.user_id,
+        target_type="role",
+        target_id=role.id,
+        details={"role": role.name, "scopes": role.permissions},
+        request=request,
+    )
     await db.commit()
     return {"id": role.id, "org_id": role.org_id, "name": role.name, "permissions": role.permissions}
 
@@ -6453,11 +6927,14 @@ async def list_clients(
 @app.post("/api/v1/clients")
 async def create_client(
     body: ClientCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
     redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
     allowed_origins = validate_url_list(body.allowed_origins, field_name="allowed_origins", origin_only=True)
+    if body.verified or uses_reserved_audience(body.audiences, body.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     client_id = validate_operator_client_id(body.client_id)
     if client_id:
         existing = await db.execute(select(AuthClient.id).where(AuthClient.client_id == client_id))
@@ -6465,6 +6942,7 @@ async def create_client(
             raise HTTPException(status_code=409, detail="client_id already exists")
     org_id = await client_create_org_id(db, principal, body.org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    await ensure_client_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
     secret = None
     secret_hash = None
     if not body.public:
@@ -6512,6 +6990,7 @@ async def create_client(
             "scopes": client.scopes,
             "require_mfa": client.require_mfa,
         },
+        request=request,
     )
     await db.commit()
     payload = client_read(client).model_dump()
@@ -6524,6 +7003,7 @@ async def create_client(
 async def update_client(
     client_id: str,
     body: ClientUpdate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6532,6 +7012,13 @@ async def update_client(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri) or uses_reserved_audience(
+        client.audiences if body.audiences is None else body.audiences,
+        client.mcp_resource_uri if body.mcp_resource_uri is None else body.mcp_resource_uri,
+    ) or (body.verified is not None and body.verified != bool(client.verified_at)):
+        await require_platform_admin(db, principal)
+    if body.scopes is not None:
+        await ensure_client_scopes_allowed(db, principal=principal, org_id=client.org_id, scopes=body.scopes)
     if body.name is not None:
         client.name = body.name
     if "description" in body.model_fields_set:
@@ -6577,6 +7064,7 @@ async def update_client(
         actor_user_id=principal.user_id,
         target_type="client",
         target_id=client.id,
+        request=request,
     )
     await db.commit()
     await db.refresh(client)
@@ -6586,6 +7074,7 @@ async def update_client(
 @app.post("/api/v1/clients/{client_id}/rotate-secret")
 async def rotate_client_secret(
     client_id: str,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6594,6 +7083,8 @@ async def rotate_client_secret(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     if client.public:
         raise HTTPException(status_code=400, detail="Public clients do not have secrets")
     secret = new_opaque_token("gkcs")
@@ -6607,6 +7098,7 @@ async def rotate_client_secret(
         actor_user_id=principal.user_id,
         target_type="client",
         target_id=client.id,
+        request=request,
     )
     await db.commit()
     payload = client_read(client).model_dump()
@@ -6625,6 +7117,8 @@ async def delete_client(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     if client.client_id == "gatekeeper-cli":
         raise HTTPException(status_code=400, detail="The default CLI client can be disabled but not deleted")
     dependent_queries = [
@@ -6686,20 +7180,45 @@ async def ensure_user_org_membership(db: AsyncSession, *, user_id: str, org_id: 
         raise HTTPException(status_code=403, detail="Organization membership required")
 
 
-def ensure_personal_token_scopes(principal: Principal, scopes: list[str]) -> list[str]:
-    requested = scopes or ["auth:read"]
-    if "*" in principal.scopes or "token:*" in principal.scopes:
-        return requested
-    allowed = set(principal.scopes)
-    if not set(requested).issubset(allowed):
-        raise HTTPException(status_code=403, detail="Requested token scope is not allowed for this account")
-    return requested
+async def ensure_token_scopes_allowed(
+    db: AsyncSession,
+    *,
+    principal: Principal,
+    org_id: str | None,
+    scopes: list[str],
+) -> list[str]:
+    # token:* lets a caller manage tokens; it never lets the caller mint scopes it does not hold.
+    allowed = cap_scopes(scopes, principal.scopes)
+    if principal.user_id:
+        permissions = BASELINE_PERMISSIONS
+        if org_id:
+            result = await db.execute(
+                select(Role.permissions)
+                .join(Membership, Membership.role_id == Role.id)
+                .where(
+                    Membership.user_id == principal.user_id,
+                    Membership.org_id == org_id,
+                    Membership.status == "active",
+                )
+            )
+            permissions = result.scalar_one_or_none() or []
+        allowed = cap_scopes(allowed, permissions)
+    if len(allowed) != len(set(scopes)):
+        raise HTTPException(status_code=403, detail="Requested scope is not allowed for this account")
+    return scopes
+
+
+async def token_admin_org_allowed(db: AsyncSession, principal: Principal, org_id: str | None) -> bool:
+    """Token administration stays inside the caller's current org; anything else needs a platform admin."""
+    if principal.org_id and org_id == principal.org_id:
+        return True
+    return await is_platform_admin(db, principal.user_id)
 
 
 async def ensure_token_mutation_allowed(db: AsyncSession, *, token: ApiToken, principal: Principal) -> None:
-    if can_admin_tokens(principal):
-        if token.org_id and principal.org_id:
-            await ensure_user_org_membership(db, user_id=principal.user_id, org_id=token.org_id)
+    if token.user_id and token.user_id != principal.user_id:
+        await ensure_target_not_above_caller(db, user_id=token.user_id, principal=principal)
+    if can_admin_tokens(principal) and await token_admin_org_allowed(db, principal, token.org_id):
         return
     if (
         principal.auth_type == "user"
@@ -6740,7 +7259,7 @@ async def token_validation_response(
     org = await db.get(Organization, token.org_id) if token.org_id else None
     project = await db.get(Project, token.project_id) if token.project_id else None
     client = await db.get(AuthClient, token.client_id) if token.client_id else None
-    scopes = token.scopes or []
+    scopes = await effective_api_token_scopes(db, token) or []
     audiences = token.audiences or []
     missing_scopes = missing_token_scopes(scopes, request_body.required_scopes)
     audience_ok = not request_body.audience or request_body.audience in audiences
@@ -6821,9 +7340,9 @@ async def list_tokens(
     if can_admin_tokens(principal):
         query = select(ApiToken)
         selected_org_id = org_id or principal.org_id
+        if not await token_admin_org_allowed(db, principal, selected_org_id):
+            raise HTTPException(status_code=403, detail="Token administration is limited to the current organization")
         if selected_org_id:
-            if principal.user_id:
-                await ensure_user_org_membership(db, user_id=principal.user_id, org_id=selected_org_id)
             query = query.where(ApiToken.org_id == selected_org_id)
         result = await db.execute(query.order_by(ApiToken.created_at.desc()))
         return [token_read(token) for token in result.scalars()]
@@ -6837,9 +7356,29 @@ async def list_tokens(
     return [token_read(token) for token in result.scalars()]
 
 
+async def ensure_token_bindings_allowed(
+    db: AsyncSession, *, org_id: str | None, project_id: str | None, client_id: str | None, audiences: list[str]
+) -> None:
+    """A token binds only a project and client of its own org, and only audiences they serve."""
+    allowed_audiences: set[str] = set()
+    if project_id:
+        project = await db.get(Project, project_id)
+        if not project or project.org_id != org_id:
+            raise HTTPException(status_code=403, detail="Project belongs to another organization")
+        allowed_audiences.add(project.audience)
+    if client_id:
+        client = await db.get(AuthClient, client_id)
+        if not client or client.org_id != org_id:
+            raise HTTPException(status_code=403, detail="Client belongs to another organization")
+        allowed_audiences.update(client.audiences or [])
+    if (project_id or client_id) and not set(audiences or []).issubset(allowed_audiences):
+        raise HTTPException(status_code=400, detail="Token audiences must belong to its project or client")
+
+
 @app.post("/api/v1/tokens", response_model=TokenRead)
 async def create_token(
     body: TokenCreate,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6850,16 +7389,23 @@ async def create_token(
             await ensure_user_org_membership(db, user_id=user.id, org_id=org_id)
             await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = user.id
-        scopes = ensure_personal_token_scopes(principal, body.scopes)
+        scopes = await ensure_token_scopes_allowed(
+            db, principal=principal, org_id=org_id, scopes=body.scopes or ["auth:read"]
+        )
     else:
         if not can_admin_tokens(principal):
             raise HTTPException(status_code=403, detail="Token administration scope required")
         org_id = body.org_id or principal.org_id
-        if org_id and principal.user_id:
-            await ensure_user_org_membership(db, user_id=principal.user_id, org_id=org_id)
+        if not await token_admin_org_allowed(db, principal, org_id):
+            raise HTTPException(status_code=403, detail="Token administration is limited to the current organization")
         await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = principal.user_id if body.token_type == "admin" else None
-        scopes = body.scopes
+        scopes = await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
+    if reserved_token_audience(body.audiences):
+        await require_platform_admin(db, principal)
+    await ensure_token_bindings_allowed(
+        db, org_id=org_id, project_id=body.project_id, client_id=body.client_id, audiences=body.audiences
+    )
     token, raw = await create_api_token(
         db,
         name=body.name,
@@ -6879,6 +7425,8 @@ async def create_token(
         actor_user_id=principal.user_id,
         target_type="token",
         target_id=token.id,
+        details={"token_type": token.token_type, "scopes": token.scopes or []},
+        request=request,
     )
     await db.commit()
     await db.refresh(token)
@@ -6921,6 +7469,7 @@ async def revoke_api_token(
 @app.post("/api/v1/tokens/{token_id}/rotate", response_model=TokenRead)
 async def rotate_api_token(
     token_id: str,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6931,6 +7480,16 @@ async def rotate_api_token(
         raise HTTPException(status_code=400, detail="Token is already revoked")
     await ensure_token_mutation_allowed(db, token=existing, principal=principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=existing.org_id)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=existing.org_id, scopes=existing.scopes or [])
+    if reserved_token_audience(existing.audiences):
+        await require_platform_admin(db, principal)
+    await ensure_token_bindings_allowed(
+        db,
+        org_id=existing.org_id,
+        project_id=existing.project_id,
+        client_id=existing.client_id,
+        audiences=existing.audiences or [],
+    )
     existing.revoked_at = now_utc()
     token, raw = await create_api_token(
         db,
@@ -6951,7 +7510,13 @@ async def rotate_api_token(
         actor_user_id=principal.user_id,
         target_type="token",
         target_id=token.id,
-        details={"replaces": existing.id, "previous_hint": existing.token_hint},
+        details={
+            "replaces": existing.id,
+            "previous_hint": existing.token_hint,
+            "token_type": token.token_type,
+            "scopes": token.scopes or [],
+        },
+        request=request,
     )
     await db.commit()
     await db.refresh(token)
@@ -7042,6 +7607,7 @@ async def prune_audit(
     if not org_id:
         raise HTTPException(status_code=400, detail="Organization is required")
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    await require_org_owner(db, principal, org_id)
     org = await db.get(Organization, org_id)
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")

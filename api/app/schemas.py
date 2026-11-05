@@ -35,6 +35,11 @@ class UserAdminRead(UserRead):
     memberships: list[MembershipRead] = []
 
 
+class AdminAccountRead(UserAdminRead):
+    last_session_ip: str | None = None
+    last_session_at: datetime | None = None
+
+
 class UserAdminUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=160)
     email_verified: bool | None = None
@@ -75,7 +80,7 @@ class OAuthProviderAdminCreate(BaseModel):
     email_claim: str = Field(default="email", max_length=120)
     name_claim: str = Field(default="name", max_length=120)
     email_verified_claim: str = Field(default="email_verified", max_length=120)
-    allow_email_linking: bool = True
+    allow_email_linking: bool = False
     require_verified_email: bool = True
 
 
@@ -362,6 +367,11 @@ class EmailCodeVerify(BaseModel):
     email: EmailStr
     code: str
     purpose: Literal["login", "verify_email", "reset_password"] = "login"
+    client_id: str | None = None
+    scope: str | None = None
+    audience: str | None = None
+    totp_code: str | None = None
+    recovery_code: str | None = None
 
 
 class PasswordResetConfirm(BaseModel):
@@ -692,6 +702,7 @@ class OAuthAuthorizeRequest(BaseModel):
     audience: str | None = None
     org_id: str | None = None
     approve: bool = False
+    consent_nonce: str | None = None
 
 
 class OAuthGrantRead(BaseModel):

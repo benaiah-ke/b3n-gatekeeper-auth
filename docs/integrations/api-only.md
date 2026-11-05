@@ -200,19 +200,16 @@ NEW_ORG_ID=$(printf '%s' "$NEW_ORG" | jq -r '.id')
 ```
 
 Switch the active organization context by requesting a fresh token response.
-For product APIs, include the product client, scope, and audience you want the
-new access token to carry.
+Only hosted GateKeeper sessions (no client, issuer audience) can switch. The new
+token carries your full role in the selected org and keeps the issuer audience.
+CLI, client-bound and API tokens get 403; sign in again for another org instead.
+For product tokens, run the OAuth flow with the `org_id` you want.
 
 ```bash
 SWITCHED=$(curl -s -X POST "$GATEKEEPER_ISSUER/api/v1/auth/session/switch-org" \
-  -H "authorization: Bearer <access-token>" \
+  -H "authorization: Bearer <hosted-session-access-token>" \
   -H 'content-type: application/json' \
-  -d '{
-    "org_id":"'"$NEW_ORG_ID"'",
-    "client_id":"<client-id>",
-    "scope":"api:read",
-    "audience":"example-api"
-  }')
+  -d '{"org_id":"'"$NEW_ORG_ID"'"}')
 
 ACCESS_TOKEN=$(printf '%s' "$SWITCHED" | jq -r '.access_token')
 ```

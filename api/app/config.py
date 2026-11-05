@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -23,7 +24,8 @@ class OAuthProviderConfig(BaseModel):
     email_claim: str = "email"
     name_claim: str = "name"
     email_verified_claim: str = "email_verified"
-    allow_email_linking: bool = True
+    # Linking a federated login to an existing account by email alone lets the provider vouch for that account.
+    allow_email_linking: bool = False
     require_verified_email: bool = True
 
     @property
@@ -57,10 +59,23 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
     device_code_ttl_seconds: int = 600
     email_code_ttl_seconds: int = 900
+    # Email-code sign-in stays off unless set; when on it applies the same MFA and client/org policy as passwords.
+    email_code_login_enabled: bool = False
     webauthn_rp_id: str = ""
     webauthn_rp_name: str = "GateKeeper"
     webauthn_origins: str = ""
     webauthn_challenge_ttl_seconds: int = Field(default=300, ge=60, le=600)
+
+    # closed: only admin provisioning or SCIM creates accounts. invite: a valid invitation may also create one.
+    # Neither mode allows open self-service signup after the first owner of an empty install.
+    signup_mode: Literal["closed", "invite"] = "closed"
+
+    # GateKeeper's own API accepts only tokens for this audience or the issuer.
+    gatekeeper_api_audience: str = "gatekeeper-api"
+    # Platform admins are active owners of the bootstrap org plus these comma-separated user IDs.
+    platform_admin_user_ids: str = ""
+    # Only platform admins may create or change OAuth clients that target these audiences.
+    reserved_audiences: str = "gatekeeper-api,sentinel-api,knowhere-api,devsync,woodpecker"
 
     bootstrap_admin_email: EmailStr = "admin@example.com"
     bootstrap_org_name: str = "Example Org"
@@ -74,6 +89,12 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     email_dev_mode: bool = True
 
+    # Security alert emails through Sendy. Alerts are off until both the key and the recipient are set.
+    sendy_api_key: str = ""
+    sendy_api_url: str = "https://usesendy.com"
+    alert_email_from: str = "B3n Alerts <alerts@notification.b3n.in>"
+    alert_email_to: str = ""
+
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/api/v1/auth/oauth/google/callback"
@@ -82,11 +103,27 @@ class Settings(BaseSettings):
     enable_dynamic_client_registration: bool = False
     mcp_default_scopes: str = "mcp:tools,mcp:resources"
 
+    # Comma-separated proxy CIDRs whose X-Forwarded-For header is trusted. Empty trusts nothing.
+    trusted_proxy_cidrs: str = ""
+
     cookie_name: str = "gk_session"
     refresh_cookie_name: str = "gk_refresh"
     device_cookie_name: str = "gk_device"
     cookie_secure: bool = False
     cookie_domain: str = ""
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        for item in value.split(","):
+            if item.strip():
+                ipaddress.ip_network(item.strip(), strict=False)
+        return value
+
+    @property
+    def trusted_proxy_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        items = [item.strip() for item in self.trusted_proxy_cidrs.split(",") if item.strip()]
+        return [ipaddress.ip_network(item, strict=False) for item in items]
 
     @property
     def issuer(self) -> str:
@@ -95,6 +132,18 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def gatekeeper_audience_set(self) -> set[str]:
+        return {self.issuer, self.gatekeeper_api_audience}
+
+    @property
+    def platform_admin_user_id_set(self) -> set[str]:
+        return {item.strip() for item in self.platform_admin_user_ids.split(",") if item.strip()}
+
+    @property
+    def reserved_audience_set(self) -> set[str]:
+        return {item.strip() for item in self.reserved_audiences.split(",") if item.strip()}
 
     @property
     def mcp_default_scope_list(self) -> list[str]:

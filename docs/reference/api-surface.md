@@ -27,10 +27,10 @@ product wants to own its own auth screens, use the provider APIs directly.
 
 | Endpoint | Surface | Use |
 | --- | --- | --- |
-| `POST /api/v1/auth/signup` | Provider API | Product-owned signup. |
+| `POST /api/v1/auth/signup` | Provider API | Creates the first owner of an empty install. Returns 403 after that; accounts come from provisioning, SCIM, or invitations in `SIGNUP_MODE=invite`. |
 | `POST /api/v1/auth/login` | Provider API | Product-owned password signin. Accepts optional `client_id`, `totp_code`, and recovery code; passkey-enrolled accounts cannot downgrade to password-only signin. |
 | `POST /api/v1/auth/refresh` | Provider API | Rotate a refresh token and issue a new access token. |
-| `POST /api/v1/auth/session/switch-org` | Provider API | Issue a fresh session token for a selected organization, optional client, scope, and audience. |
+| `POST /api/v1/auth/session/switch-org` | Provider API | Issue a fresh hosted session token for a selected organization. Hosted sessions only; no client, scope, or audience changes. |
 | `POST /api/v1/auth/logout` | Provider API | Revoke the current session/refresh family when called with a session-bound token. |
 | `GET /api/v1/auth/me` | Provider API | Current user, memberships, and claims. |
 | `PATCH /api/v1/auth/me` | Provider API | Self-service profile update. |
@@ -42,8 +42,8 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `DELETE /api/v1/auth/identities/{identity_id}` | Provider API | Unlink a social/federated identity when another sign-in method remains. |
 | `GET /api/v1/auth/account/export` | Provider API | Export current account profile, memberships, passkey metadata, sessions, grants, token metadata, identities, and recent audit events. |
 | `POST /api/v1/auth/account/deactivate` | Provider API | Deactivate the current account with proof, last-owner protection, and revocation cleanup. |
-| `POST /api/v1/auth/email-code/request` | Provider API | Request email code for login, verification, or password reset. |
-| `POST /api/v1/auth/email-code/verify` | Provider API | Verify an email code and issue tokens where applicable. |
+| `POST /api/v1/auth/email-code/request` | Provider API | Request email code for login, verification, or password reset. Returns 403 unless `EMAIL_CODE_LOGIN_ENABLED=true`. |
+| `POST /api/v1/auth/email-code/verify` | Provider API | Verify an email code and issue tokens for an existing account, applying the same MFA and client/org policy as password login (`totp_code`, `recovery_code`, `client_id`, `scope`, `audience`). Never creates an account. Returns 403 unless `EMAIL_CODE_LOGIN_ENABLED=true`. |
 | `POST /api/v1/auth/password/reset/request` | Provider API | Start password reset. |
 | `POST /api/v1/auth/password/reset/confirm` | Provider API | Complete password reset. |
 | `GET /api/v1/auth/oauth/providers` | Provider API | List configured OIDC/social providers without secrets. |
@@ -52,7 +52,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `PATCH /api/v1/auth/oauth/providers/admin/{provider_id}` | Install Owner API | Update, enable/disable, rotate, or clear a database-managed provider secret. |
 | `DELETE /api/v1/auth/oauth/providers/admin/{provider_id}` | Install Owner API | Delete a database-managed provider. Env-managed providers are read-only. |
 | `GET /api/v1/auth/oauth/{provider_id}/start` | Provider API | Start configured OIDC/social auth with signed callback state. |
-| `GET /api/v1/auth/oauth/{provider_id}/callback` | Provider API | Complete configured OIDC/social auth and link or create a federated account. |
+| `GET /api/v1/auth/oauth/{provider_id}/callback` | Provider API | Complete configured OIDC/social auth for an existing or linked account. Creates an account only in `SIGNUP_MODE=invite` for a verified email with a pending invitation. |
 | `GET /api/v1/auth/oauth/google/start` | Provider API | Backward-compatible Google social auth alias. |
 | `GET /api/v1/auth/oauth/google/callback` | Provider API | Backward-compatible Google social auth callback alias. |
 
@@ -99,9 +99,9 @@ product wants to own its own auth screens, use the provider APIs directly.
 
 | Endpoint | Surface | Use |
 | --- | --- | --- |
-| `GET /oauth/authorize` | OAuth/OIDC | Authorization-code + PKCE request. |
-| `POST /oauth/authorize` | OAuth/OIDC | Hosted approval/consent submission. |
-| `GET /api/v1/oauth/authorize/context` | Hosted UI backing API | Context for the hosted authorize page. |
+| `GET /oauth/authorize` | OAuth/OIDC | Authorization-code + PKCE request. Never approves consent; without a remembered grant it redirects to the hosted consent page. |
+| `POST /oauth/authorize` | OAuth/OIDC | Hosted consent submission. `approve: true` needs the `consent_nonce` from the context endpoint (bound to the session, client, redirect URI and code challenge). Returns `{"redirect_to": ...}`. |
+| `GET /api/v1/oauth/authorize/context` | Hosted UI backing API | Context for the hosted authorize page, including `consent_nonce`. |
 | `POST /oauth/token` | OAuth/OIDC | Authorization-code, refresh-token, device-code, and client-credentials exchange. |
 | `POST /oauth/device_authorization` | OAuth/OIDC | Start CLI/device authorization. |
 | `POST /api/v1/auth/device/approve` | Provider API | Approve or deny a device flow from an active session, with TOTP/recovery input when required. |
@@ -138,7 +138,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | --- | --- | --- |
 | `GET /api/v1/setup/status` | Operator API | Issuer, JWKS, SMTP, owner, and setup capability status. |
 | `GET /api/v1/orgs` | Provider/Operator API | List organizations visible to the current principal. |
-| `POST /api/v1/orgs` | Operator API | Create an organization, seed default roles, and make the session user owner. |
+| `POST /api/v1/orgs` | Platform Admin API | Create an organization, seed default roles, and make the session user owner. |
 | `PATCH /api/v1/orgs/{org_id}` | Operator API | Update name, org-wide MFA policy, trusted-device MFA reuse policy, admin step-up MFA policy, org idle-timeout policy, audit retention policy, and user hard-delete policy. |
 | `GET /api/v1/workspaces` | Operator API | List workspaces visible to the current organization/operator. |
 | `POST /api/v1/workspaces` | Operator API | Create a current-organization workspace. |
@@ -170,6 +170,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | --- | --- | --- |
 | `POST /api/v1/users/provision` | Operator API | SCIM-style upsert for a current-organization user: create passwordless account by email, assign role/status, update profile/disabled state, and revoke stale sessions when access changes. |
 | `GET /api/v1/users` | Operator API | List users with current-organization membership/MFA/session status. |
+| `GET /api/v1/admin/accounts` | Platform Admin API | List accounts newest first with verification, suspension, MFA state, memberships and last session IP. Filter with `created_after`. |
 | `GET /api/v1/users/{user_id}` | Operator API | Inspect a current-organization user. |
 | `PATCH /api/v1/users/{user_id}` | Operator API | Update current-organization user profile, verification, or suspension state. |
 | `PUT /api/v1/users/{user_id}/membership` | Operator API | Assign or suspend current-organization membership. |

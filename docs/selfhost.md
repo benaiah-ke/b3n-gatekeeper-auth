@@ -46,6 +46,19 @@ At minimum, replace:
 - `POSTGRES_PASSWORD` or the external `DATABASE_URL`.
 - `BOOTSTRAP_ADMIN_EMAIL`.
 - SMTP settings before relying on email verification, reset, or invitations.
+- `TRUSTED_PROXY_CIDRS` with your reverse proxy network so audit logs, sessions
+  and rate limits see the real client IP. GateKeeper reads only
+  `X-Forwarded-For`, and only when the connection comes from a trusted proxy; it
+  takes the rightmost address that is not a trusted proxy. `CF-Connecting-IP` is
+  ignored. Caddy must set `X-Forwarded-For` to `{client_ip}` (Caddy 2.5+ replaces
+  untrusted incoming values by default; if Caddy itself sits behind Cloudflare,
+  configure Caddy's `trusted_proxies` so `{client_ip}` is the real visitor).
+- `SENDY_API_KEY` and `ALERT_EMAIL_TO` to receive security alert emails.
+
+Security defaults: `SIGNUP_MODE=closed` (no open signup mode exists),
+`PLATFORM_ADMIN_USER_IDS` empty (bootstrap org owners only), and
+`RESERVED_AUDIENCES` listing first-party audiences that only platform admins may
+put on OAuth clients.
 
 By default, `JWT_KEY_DIR=/data/keys` makes the API generate and persist an RSA
 signing keypair in the `gatekeeper-api-data` Docker volume. Operators who manage
@@ -148,11 +161,11 @@ curl -sf https://auth.example.com/oauth/jwks.json
 After `/version` returns 200:
 
 1. Open `https://auth.example.com/signup` and create the first account. On a
-   fresh install, the first successful signup becomes owner because no active
-   owner exists yet.
-2. Sign in as the configured `BOOTSTRAP_ADMIN_EMAIL` as well if you want that
-   address to be an owner. Later non-admin signups join the bootstrap org as
-   viewers until an owner grants broader access.
+   fresh install, the first successful signup becomes owner. Signup is closed
+   for everyone after that.
+2. Add people with `/users` provisioning or SCIM. With `SIGNUP_MODE=invite`,
+   invitations can also create accounts. New accounts join only the
+   organization they were added to.
 3. Open `https://auth.example.com/account` and confirm the owner state, issuer,
    JWKS URL, SMTP mode, and setup checklist.
 4. Create your first protected API resource with an audience such as
@@ -173,6 +186,45 @@ cookies, so a mismatched domain or scheme can make a valid signup look logged
 out. If `/account` loads but shows `viewer`, signup succeeded but the account
 cannot perform setup actions. Use an owner account or the configured bootstrap
 admin account; do not work around this by sharing tokens.
+
+## Operator Commands
+
+GateKeeper never promotes anyone to bootstrap org owner on its own. If the
+bootstrap org has members but no active owner, the API logs a warning, writes an
+`org.owner.missing` audit event and sends a security alert. Fix it from a shell
+on the host:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops bootstrap-owner --email owner@example.com
+```
+
+List API tokens whose stored scopes exceed what their owner's role allows today,
+then revoke the owned ones. Tokens without an owner that hold `*`, `admin:*` or
+`token:*` are listed as `review` and left for you to decide:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops overscoped-tokens
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops overscoped-tokens --revoke
+```
+
+Narrow a revoke run with `--id <token id>` (repeatable) or keep a person's
+tokens with `--exclude-user <email or user id>` (repeatable). The filters apply
+to the listing too.
+
+After an incident, list what accounts created since a date can reach. The
+command only reads: accounts and their memberships, orgs they own, clients in
+those orgs or with reserved audiences, `*`, `admin:*`, `token:*` or a verified
+badge, their API tokens, pending invitations, OAuth grants, non-default roles,
+and live sessions with their live refresh token counts. It prints ids, hints
+and emails, never secrets or hashes:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops incident-sweep --since 2026-11-03
+```
 
 ## Setup Checklist
 

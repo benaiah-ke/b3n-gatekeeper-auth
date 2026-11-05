@@ -20,9 +20,10 @@ curl -sf https://auth.example.com/oauth/jwks.json
 ## 2. Create The First Owner
 
 Open `https://auth.example.com/signup` and create the first account. On a fresh
-database, the first successful signup becomes owner because no active owner
-exists yet. Later signups join the bootstrap organization as viewers until an
-owner grants broader access.
+database, the first successful signup becomes owner. After that, signup is
+closed: add people with admin provisioning or SCIM, or set `SIGNUP_MODE=invite`
+so invitations can create accounts. New accounts join only the organization
+they are provisioned or invited into.
 
 If `/account` loads but shows `viewer`, signup worked. The account simply does
 not have setup privileges.

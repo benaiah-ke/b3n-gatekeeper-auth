@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -9,18 +10,32 @@ from urllib.parse import parse_qs, urlparse
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from webauthn.helpers import bytes_to_base64url
 from webauthn.helpers.structs import CredentialDeviceType
 
+from app import alerts, ops, security, services
 from app import main as main_module
-from app import security, services
 from app.config import settings
 from app.database import Base, async_session_factory, engine
 from app.main import app
-from app.models import AuditEvent, Identity, Session, User, WebAuthnChallenge, WebAuthnCredential
+from app.models import (
+    AuditEvent,
+    Identity,
+    InstallClaim,
+    Membership,
+    OneTimeCode,
+    Organization,
+    RateLimitBucket,
+    Role,
+    Session,
+    User,
+    WebAuthnChallenge,
+    WebAuthnCredential,
+)
 from app.security import create_access_token, decode_access_token, public_jwk, totp_code
 
 
@@ -33,6 +48,7 @@ def reset_jwt_key_cache():
 
 @pytest.fixture(autouse=True)
 async def reset_db():
+    alerts._recent.clear()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -42,6 +58,24 @@ async def reset_db():
 async def client():
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://testserver")
+
+
+async def register(ac: AsyncClient, json: dict):
+    """Sign up the first owner; later accounts are created directly because signup is closed."""
+    async with async_session_factory() as db:
+        if not (await db.execute(select(User.id).limit(1))).scalar_one_or_none():
+            return await ac.post("/api/v1/auth/signup", json=json)
+        user = await services.create_user(
+            db, email=json["email"], password=json["password"], display_name=json.get("display_name")
+        )
+        if not await services.org_roles(db, user.id):
+            org = await services.ensure_bootstrap(db)
+            viewer = (
+                await db.execute(select(Role).where(Role.org_id == org.id, Role.name == "viewer"))
+            ).scalar_one()
+            db.add(Membership(org_id=org.id, user_id=user.id, role_id=viewer.id, status="active"))
+            await db.commit()
+    return await ac.post("/api/v1/auth/login", json={"email": json["email"], "password": json["password"]})
 
 
 @pytest.mark.asyncio
@@ -66,8 +100,8 @@ async def test_version_reports_release_metadata_when_configured(monkeypatch):
 @pytest.mark.asyncio
 async def test_signup_login_refresh_and_replay_detection():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery", "display_name": "Admin"},
         )
         assert signup.status_code == 200
@@ -92,10 +126,177 @@ async def test_signup_login_refresh_and_replay_detection():
 
 
 @pytest.mark.asyncio
+async def test_signup_is_closed_after_the_first_owner():
+    async with await client() as ac:
+        first = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "first@example.com", "password": "correct horse battery"},
+        )
+        assert first.status_code == 200
+        assert first.json()["orgs"][0]["role"] == "owner"
+        for email in ("outsider@example.com", str(settings.bootstrap_admin_email)):
+            refused = await ac.post("/api/v1/auth/signup", json={"email": email, "password": "correct horse battery"})
+            assert refused.status_code == 403
+
+    async with async_session_factory() as db:
+        assert set((await db.execute(select(User.email))).scalars()) == {"first@example.com"}
+        refusals = await db.execute(select(AuditEvent).where(AuditEvent.action == "auth.signup.refused"))
+        assert len(refusals.scalars().all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_first_signup_race_is_closed_by_a_database_claim():
+    async with async_session_factory() as db:
+        db.add(InstallClaim(name="first-owner", user_id="concurrent-signup"))
+        await db.commit()
+    async with await client() as ac:
+        late = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "late@example.com", "password": "correct horse battery"},
+        )
+        assert late.status_code == 403
+    async with async_session_factory() as db:
+        assert (await db.execute(select(User.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_email_code_never_creates_accounts(monkeypatch):
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    async with await client() as ac:
+        requested = await ac.post("/api/v1/auth/email-code/request", json={"email": "stranger@example.com"})
+        assert requested.status_code == 200
+        assert requested.json() == {"status": "sent"}
+        async with async_session_factory() as db:
+            assert (await db.execute(select(OneTimeCode.id))).first() is None
+            stale_code = await services.create_one_time_code(db, email="stranger@example.com", purpose="login")
+            await db.commit()
+
+        for code in (stale_code, "WRONGCODE"):
+            verified = await ac.post(
+                "/api/v1/auth/email-code/verify",
+                json={"email": "stranger@example.com", "code": code},
+            )
+            assert verified.status_code == 401
+            assert verified.json()["detail"] == "Invalid or expired code"
+
+    async with async_session_factory() as db:
+        assert (await db.execute(select(User.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_email_code_routes_are_off_by_default():
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        requested = await ac.post("/api/v1/auth/email-code/request", json={"email": "owner@example.com"})
+        assert requested.status_code == 403
+        async with async_session_factory() as db:
+            code = await services.create_one_time_code(db, email="owner@example.com", purpose="login")
+            await db.commit()
+        verified = await ac.post("/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": code})
+        assert verified.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_email_code_login_enforces_mfa_and_client_policy(monkeypatch):
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    password = "correct horse battery"
+
+    async def email_code(email: str) -> str:
+        async with async_session_factory() as db:
+            code = await services.create_one_time_code(db, email=email, purpose="login")
+            await db.commit()
+        return code
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        secret = (await ac.post("/api/v1/auth/mfa/totp/setup", headers=owner_headers)).json()["secret"]
+        enabled = await ac.post(
+            "/api/v1/auth/mfa/totp/enable", headers=owner_headers, json={"code": totp_code(secret)}
+        )
+        assert enabled.status_code == 200
+
+        code = await email_code("owner@example.com")
+        without_totp = await ac.post(
+            "/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": code}
+        )
+        assert without_totp.status_code == 401
+        assert without_totp.json()["detail"] == "TOTP code required"
+        with_totp = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={"email": "owner@example.com", "code": code, "totp_code": totp_code(secret)},
+        )
+        assert with_totp.status_code == 200
+        assert decode_access_token(with_totp.json()["access_token"])["amr"] == ["email", "otp"]
+
+        strict = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={"name": "Strict", "public": True, "audiences": ["strict-api"], "require_mfa": True},
+        )
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        no_mfa = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={
+                "email": "member@example.com",
+                "code": await email_code("member@example.com"),
+                "client_id": strict.json()["client_id"],
+            },
+        )
+        assert no_mfa.status_code == 403
+        assert no_mfa.json()["detail"] == "MFA enrollment required for this client"
+
+        async with async_session_factory() as db:
+            (await db.get(User, member.json()["user"]["id"])).disabled = True
+            await db.commit()
+        disabled = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={"email": "member@example.com", "code": await email_code("member@example.com")},
+        )
+        assert disabled.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_refresh_keeps_the_scopes_and_audience_granted_at_login():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        product = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={
+                "name": "Product",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["product-api"],
+                "scopes": ["auth:read", "mcp:tools", "mcp:resources"],
+            },
+        )
+        login = {"email": "owner@example.com", "password": password, "client_id": product.json()["client_id"]}
+
+        narrow = await ac.post("/api/v1/auth/login", json={**login, "scope": "mcp:tools"})
+        assert narrow.json()["scope"] == "mcp:tools"
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": narrow.json()["refresh_token"]})
+        assert refreshed.json()["scope"] == "mcp:tools"
+        assert decode_access_token(refreshed.json()["access_token"], audience="product-api")["scope"] == "mcp:tools"
+        oauth_refreshed = await ac.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": refreshed.json()["refresh_token"]},
+        )
+        assert oauth_refreshed.json()["scope"] == "mcp:tools"
+
+        hosted_ui = await ac.post("/api/v1/auth/login", json={**login, "audience": settings.issuer})
+        ui_refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": hosted_ui.json()["refresh_token"]})
+        assert decode_access_token(ui_refreshed.json()["access_token"])["aud"] == settings.issuer
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {ui_refreshed.json()['access_token']}"})
+        assert me.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_refresh_can_rotate_from_browser_refresh_cookie():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -119,8 +320,8 @@ async def test_refresh_can_rotate_from_browser_refresh_cookie():
 @pytest.mark.asyncio
 async def test_first_signup_without_bootstrap_email_becomes_owner():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "operator@example.com",
                 "password": "correct horse battery",
@@ -163,6 +364,7 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
                 "email": "operator@example.com",
                 "password": "correct horse battery",
                 "client_id": created_client["client_id"],
+                "audience": settings.issuer,
             },
         )
         assert app_login.status_code == 200
@@ -181,8 +383,8 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
 @pytest.mark.asyncio
 async def test_client_create_accepts_operator_stable_client_id_and_rejects_duplicates():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -240,8 +442,8 @@ async def test_client_create_accepts_operator_stable_client_id_and_rejects_dupli
 @pytest.mark.asyncio
 async def test_client_create_rejects_reserved_or_non_normalized_stable_client_ids():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -267,8 +469,8 @@ async def test_client_create_rejects_reserved_or_non_normalized_stable_client_id
 @pytest.mark.asyncio
 async def test_org_creation_seeds_owner_membership_and_session_switching():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -347,9 +549,8 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
                 "audience": "second-product-api",
             },
         )
-        assert switched.status_code == 200
-        assert switched.json()["scope"] == "api:read"
-        switched_claims = decode_access_token(switched.json()["access_token"], audience="second-product-api")
+        assert switched.status_code == 400
+        switched_claims = decode_access_token(second_access)
         assert switched_claims["org_id"] == second_org["id"]
         assert switched_claims["org_slug"] == "second-product"
         assert switched_claims["org_role"] == "owner"
@@ -357,14 +558,14 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
 
         setup = await ac.get(
             "/api/v1/setup/status",
-            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            headers={"Authorization": f"Bearer {second_access}"},
         )
         assert setup.status_code == 200
         assert setup.json()["org"]["id"] == second_org["id"]
         assert setup.json()["can_manage_clients"] is True
 
-        other_signup = await ac.post(
-            "/api/v1/auth/signup",
+        other_signup = await register(
+            ac,
             json={"email": "other@example.com", "password": "correct horse battery"},
         )
         assert other_signup.status_code == 200
@@ -378,10 +579,188 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
 
 
 @pytest.mark.asyncio
+async def test_platform_admin_gates_orgs_reserved_audience_clients_and_providers(monkeypatch):
+    password = "correct horse battery"
+    client_body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+        admin_id = admin.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "admin", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        admin_login = await ac.post(
+            "/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password}
+        )
+        assert "admin:*" in admin_login.json()["scope"].split()
+        admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+
+        denied_org = await ac.post("/api/v1/orgs", headers=admin_headers, json={"name": "X", "slug": "x"})
+        assert denied_org.status_code == 403
+        for extra in ({"audiences": ["sentinel-api"]}, {"audiences": ["my-api"], "mcp_resource_uri": "knowhere-api"}):
+            denied = await ac.post("/api/v1/clients", headers=admin_headers, json={**client_body, **extra})
+            assert denied.status_code == 403
+        own_client = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**client_body, "audiences": ["my-api"]}
+        )
+        assert own_client.status_code == 200
+        retarget = await ac.patch(
+            f"/api/v1/clients/{own_client.json()['id']}",
+            headers=admin_headers,
+            json={"audiences": ["gatekeeper-api"]},
+        )
+        assert retarget.status_code == 403
+        first_party = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "public": False, "audiences": ["sentinel-api"]},
+        )
+        assert first_party.status_code == 200
+        first_party_id = first_party.json()["id"]
+        rename = await ac.patch(f"/api/v1/clients/{first_party_id}", headers=admin_headers, json={"name": "Mine"})
+        assert rename.status_code == 403
+        rotate = await ac.post(f"/api/v1/clients/{first_party_id}/rotate-secret", headers=admin_headers)
+        assert rotate.status_code == 403
+        assert (await ac.get("/api/v1/auth/oauth/providers/admin", headers=admin_headers)).status_code == 403
+
+        service = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "owner service", "token_type": "service", "org_id": org_id, "scopes": ["*"]},
+        )
+        service_headers = {"Authorization": f"Bearer {service.json()['token']}"}
+        service_org = await ac.post("/api/v1/orgs", headers=service_headers, json={"name": "S", "slug": "s"})
+        assert service_org.status_code == 403
+        assert (await ac.get("/api/v1/auth/oauth/providers/admin", headers=service_headers)).status_code == 403
+
+        owner_org = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "O", "slug": "o"})
+        assert owner_org.status_code == 200
+        monkeypatch.setattr(settings, "platform_admin_user_ids", admin_id)
+        allowed = await ac.post("/api/v1/orgs", headers=admin_headers, json={"name": "A", "slug": "a"})
+        assert allowed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_org_admin_cannot_update_another_organization(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        second = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": second.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"email": "tenant@example.com", "org_id": second.json()["id"], "role": "owner"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "tenant@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        tenant_headers = {"Authorization": f"Bearer {tenant.json()['access_token']}"}
+
+        denied = await ac.patch(f"/api/v1/orgs/{bootstrap_id}", headers=tenant_headers, json={"name": "Taken"})
+        assert denied.status_code == 403
+        own = await ac.patch(f"/api/v1/orgs/{second.json()['id']}", headers=tenant_headers, json={"name": "Mine"})
+        assert own.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_client_scopes_are_capped_to_the_creators_permissions(monkeypatch):
+    password = "correct horse battery"
+    body = {
+        "name": "Product",
+        "public": True,
+        "redirect_uris": ["https://app.example.com/callback"],
+        "audiences": ["product-api"],
+    }
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+        await ac.put(
+            f"/api/v1/users/{admin.json()['user']['id']}/membership",
+            headers=bearer(owner_token),
+            json={"org_id": bootstrap_id, "role": "admin", "status": "active"},
+        )
+        admin_token = (
+            await ac.post("/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password})
+        ).json()["access_token"]
+
+        for scopes in (["admin:*"], ["*"], ["api:read"], ["token:*"]):
+            denied = await ac.post("/api/v1/clients", headers=bearer(admin_token), json={**body, "scopes": scopes})
+            assert denied.status_code == 403
+        allowed = await ac.post(
+            "/api/v1/clients",
+            headers=bearer(admin_token),
+            json={**body, "scopes": ["openid", "auth:read", "mcp:tools"]},
+        )
+        assert allowed.status_code == 200
+        widened = await ac.patch(
+            f"/api/v1/clients/{allowed.json()['id']}", headers=bearer(admin_token), json={"scopes": ["token:*"]}
+        )
+        assert widened.status_code == 403
+
+        second = await ac.post("/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers=bearer(switched.json()["access_token"]),
+            json={"email": "tenant@example.com", "org_id": second.json()["id"], "role": "owner"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant_token = (
+            await ac.post(
+                "/api/v1/auth/invitations/accept",
+                json={"email": "tenant@example.com", "password": password, "token": invite.json()["token"]},
+            )
+        ).json()["access_token"]
+        for scopes, expected in ((["*"], 403), (["admin:*"], 403), (["api:read"], 200)):
+            created = await ac.post("/api/v1/clients", headers=bearer(tenant_token), json={**body, "scopes": scopes})
+            assert created.status_code == expected
+
+        platform = await ac.post("/api/v1/clients", headers=bearer(owner_token), json={**body, "scopes": ["admin:*"]})
+        assert platform.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_service_principals_list_only_their_own_org():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        service = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "automation", "token_type": "service", "scopes": ["auth:read"]},
+        )
+        listed = await ac.get("/api/v1/orgs", headers={"Authorization": f"Bearer {service.json()['token']}"})
+        assert listed.status_code == 200
+        assert [org["id"] for org in listed.json()] == [bootstrap_id]
+
+
+@pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -497,8 +876,8 @@ async def test_client_management_is_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_setup_resources_are_scoped_to_current_organization():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -644,16 +1023,16 @@ async def test_setup_resources_are_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_admin_visibility_is_scoped_to_current_organization():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
         first_access = owner.json()["access_token"]
         first_org_id = owner.json()["orgs"][0]["id"]
 
-        first_only_user = await ac.post(
-            "/api/v1/auth/signup",
+        first_only_user = await register(
+            ac,
             json={"email": "first-only@example.com", "password": "correct horse battery"},
         )
         assert first_only_user.status_code == 200
@@ -799,8 +1178,8 @@ async def test_admin_visibility_is_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_audit_retention_policy_preview_and_prune():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert signup.status_code == 200
@@ -897,8 +1276,8 @@ async def test_audit_retention_policy_preview_and_prune():
 async def test_self_service_profile_password_and_email_change(monkeypatch):
     monkeypatch.setattr(services, "new_code", lambda length=8: "ABC12345")
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert signup.status_code == 200
@@ -965,8 +1344,8 @@ async def test_self_service_profile_password_and_email_change(monkeypatch):
         other_login_access = new_password_login.json()["access_token"]
         assert new_password_login.json()["user"]["display_name"] == "Renamed Owner"
 
-        duplicate = await ac.post(
-            "/api/v1/auth/signup",
+        duplicate = await register(
+            ac,
             json={"email": "taken@example.com", "password": "correct horse battery"},
         )
         assert duplicate.status_code == 200
@@ -1030,8 +1409,8 @@ async def test_self_service_profile_password_and_email_change(monkeypatch):
 @pytest.mark.asyncio
 async def test_self_service_account_export_and_deactivation_policy():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1045,8 +1424,8 @@ async def test_self_service_account_export_and_deactivation_policy():
         )
         assert sole_owner_deactivate.status_code == 400
 
-        backup_owner = await ac.post(
-            "/api/v1/auth/signup",
+        backup_owner = await register(
+            ac,
             json={"email": "backup@example.com", "password": "correct horse battery"},
         )
         assert backup_owner.status_code == 200
@@ -1119,16 +1498,16 @@ async def test_self_service_account_export_and_deactivation_policy():
 @pytest.mark.asyncio
 async def test_admin_user_hard_delete_requires_org_policy_and_confirmation():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1193,10 +1572,91 @@ async def test_admin_user_hard_delete_requires_org_policy_and_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_platform_admin_lists_new_accounts_newest_first():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        newcomer = await register(ac, json={"email": "newcomer@example.com", "password": password})
+        async with async_session_factory() as db:
+            for user_id, age in ((owner.json()["user"]["id"], 48), (newcomer.json()["user"]["id"], 1)):
+                (await db.get(User, user_id)).created_at = security.now_utc() - timedelta(hours=age)
+            await db.commit()
+
+        listed = await ac.get("/api/v1/admin/accounts", headers=owner_headers)
+        assert listed.status_code == 200
+        assert [item["email"] for item in listed.json()] == ["newcomer@example.com", "owner@example.com"]
+        newest = listed.json()[0]
+        assert newest["last_session_ip"] == "127.0.0.1"
+        assert newest["last_session_at"]
+        assert newest["mfa_totp_enabled"] is False
+        assert newest["passkey_count"] == 0
+        assert newest["disabled"] is False
+        memberships = [(item["org_name"], item["role"]) for item in newest["memberships"]]
+        assert memberships == [(settings.bootstrap_org_name, "viewer")]
+        assert not {"password_hash", "mfa_totp_secret_encrypted"}.intersection(newest)
+
+        cutoff = (security.now_utc() - timedelta(hours=24)).isoformat()
+        recent = await ac.get("/api/v1/admin/accounts", headers=owner_headers, params={"created_after": cutoff})
+        assert [item["email"] for item in recent.json()] == ["newcomer@example.com"]
+
+        denied = await ac.get(
+            "/api/v1/admin/accounts", headers={"Authorization": f"Bearer {newcomer.json()['access_token']}"}
+        )
+        assert denied.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_org_admin_cannot_change_credentials_of_accounts_in_other_orgs(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_id = owner.json()["user"]["id"]
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        tenant = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Tenant", "slug": "tenant"})
+        tenant_id = tenant.json()["id"]
+        switched = await ac.post("/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": tenant_id})
+        tenant_owner_headers = {"Authorization": f"Bearer {switched.json()['access_token']}"}
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers=tenant_owner_headers,
+            json={"email": "tenant-admin@example.com", "org_id": tenant_id, "role": "admin"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant_admin = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "tenant-admin@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        admin_headers = {"Authorization": f"Bearer {tenant_admin.json()['access_token']}"}
+
+        takeover = await ac.patch(
+            f"/scim/v2/Users/{owner_id}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "password", "value": "attacker chosen secret"}]},
+        )
+        assert takeover.status_code == 403
+        reset = await ac.post(f"/api/v1/users/{owner_id}/mfa/totp/reset", headers=admin_headers)
+        assert reset.status_code == 403
+        suspend = await ac.patch(f"/api/v1/users/{owner_id}", headers=admin_headers, json={"disabled": True})
+        assert suspend.status_code == 403
+        owner_login = await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": password})
+        assert owner_login.status_code == 200
+
+        local = await ac.post(
+            "/api/v1/users/provision",
+            headers=admin_headers,
+            json={"org_id": tenant_id, "email": "local@example.com", "role": "viewer"},
+        )
+        local_id = local.json()["user"]["id"]
+        local_suspend = await ac.patch(f"/api/v1/users/{local_id}", headers=admin_headers, json={"disabled": True})
+        assert local_suspend.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_admin_user_provisioning_creates_and_updates_org_memberships():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1231,8 +1691,8 @@ async def test_admin_user_provisioning_creates_and_updates_org_memberships():
         )
         assert password_login.status_code == 401
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1268,8 +1728,8 @@ async def test_admin_user_provisioning_creates_and_updates_org_memberships():
 @pytest.mark.asyncio
 async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1323,8 +1783,8 @@ async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
         assert patched.json()["displayName"] == "SCIM Operator"
         assert patched.json()["roles"][0]["value"] == "operator"
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1349,8 +1809,8 @@ async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
 @pytest.mark.asyncio
 async def test_scim_v2_user_password_operations_rotate_password_and_revoke_sessions():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1438,8 +1898,8 @@ async def test_scim_v2_user_password_operations_rotate_password_and_revoke_sessi
 @pytest.mark.asyncio
 async def test_scim_v2_bulk_supports_common_user_group_provisioning_operations():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1540,8 +2000,8 @@ async def test_scim_v2_bulk_supports_common_user_group_provisioning_operations()
 @pytest.mark.asyncio
 async def test_scim_v2_enterprise_user_mapping_round_trips_membership_scoped_attributes():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1625,16 +2085,16 @@ async def test_scim_v2_enterprise_user_mapping_round_trips_membership_scoped_att
 @pytest.mark.asyncio
 async def test_scim_v2_group_compatibility_assigns_and_removes_role_members():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1721,8 +2181,8 @@ async def test_scim_v2_group_compatibility_assigns_and_removes_role_members():
 @pytest.mark.asyncio
 async def test_scim_v2_lists_support_sorting_and_pagination():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "zz-owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1825,8 +2285,8 @@ async def test_scim_v2_lists_support_sorting_and_pagination():
 @pytest.mark.asyncio
 async def test_linked_identities_can_be_listed_and_safely_unlinked():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -1877,7 +2337,7 @@ async def test_cannot_unlink_only_federated_sign_in_method():
             )
             db.add(identity)
             await db.flush()
-            access, _refresh, _session, _refresh_model = await services.create_session_tokens(
+            access, _refresh, _session, _refresh_model, _scopes = await services.create_session_tokens(
                 db,
                 user,
                 bind_default_org=False,
@@ -1925,7 +2385,7 @@ async def test_configured_oauth_provider_metadata_and_start_url(monkeypatch):
                 "start_url": f"{settings.issuer}/api/v1/auth/oauth/example/start",
                 "authorization_url": "https://login.example.com/oauth/authorize",
                 "require_verified_email": True,
-                "allow_email_linking": True,
+                "allow_email_linking": False,
             }
         ]
 
@@ -1964,8 +2424,8 @@ async def test_install_owner_can_manage_database_oauth_providers(monkeypatch):
     monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
 
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -2015,6 +2475,13 @@ async def test_install_owner_can_manage_database_oauth_providers(monkeypatch):
         assert query["redirect_uri"] == [f"{settings.issuer}/api/v1/auth/oauth/db-login/callback"]
         assert query["scope"] == ["openid email"]
 
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {owner_access}"},
+            json={"email": "db-social@example.com", "org_id": owner.json()["orgs"][0]["id"], "role": "viewer"},
+        )
+        assert invite.status_code == 200
+        monkeypatch.setattr(settings, "signup_mode", "invite")
         callback = await ac.get(
             "/api/v1/auth/oauth/db-login/callback",
             params={"code": "provider-code", "state": started_payload["state"]},
@@ -2087,8 +2554,8 @@ async def test_env_managed_oauth_providers_are_admin_visible_read_only(monkeypat
     )
 
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -2161,6 +2628,25 @@ async def test_generic_oauth_callback_creates_federated_session(monkeypatch):
     async with await client() as ac:
         started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/sessions"})
         assert started.status_code == 200
+        refused = await ac.get(
+            "/api/v1/auth/oauth/example/callback",
+            params={"code": "provider-code", "state": started.json()["state"]},
+        )
+        assert refused.status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(User.id))).first() is None
+
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"email": "social@example.com", "org_id": owner.json()["orgs"][0]["id"], "role": "viewer"},
+        )
+        assert invite.status_code == 200
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        ac.cookies.clear()
+
+        started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/sessions"})
         callback = await ac.get(
             "/api/v1/auth/oauth/example/callback",
             params={"code": "provider-code", "state": started.json()["state"]},
@@ -2213,8 +2699,8 @@ async def test_logged_in_user_can_link_oauth_identity_with_session_bound_state(m
     monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
 
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2255,8 +2741,8 @@ async def test_logged_in_user_can_link_oauth_identity_with_session_bound_state(m
         assert me.json()["user"]["email"] == "owner@example.com"
 
     async with await client() as second_client:
-        second = await second_client.post(
-            "/api/v1/auth/signup",
+        second = await register(
+            second_client,
             json={"email": "second@example.com", "password": "correct horse battery"},
         )
         assert second.status_code == 200
@@ -2312,8 +2798,8 @@ async def test_oauth_callback_requires_verified_email_for_new_links(monkeypatch)
 @pytest.mark.asyncio
 async def test_totp_mfa_setup_login_enforcement_and_disable():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2488,8 +2974,8 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
     monkeypatch.setattr(main_module, "verify_authentication_response", fake_verify_authentication_response)
 
     async with await client() as ac:
-        inviter = await ac.post(
-            "/api/v1/auth/signup",
+        inviter = await register(
+            ac,
             json={"email": "inviter@example.com", "password": "correct horse battery"},
         )
         assert inviter.status_code == 200
@@ -2502,8 +2988,8 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         )
         assert invitation.status_code == 200
 
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "passkey@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2737,11 +3223,51 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         assert revoked_login_replay.json()["detail"] == "Passkey ceremony expired or already used"
 
 
+def test_client_ip_uses_the_rightmost_untrusted_forwarded_address(monkeypatch):
+    def client_ip(peer: str, forwarded: str | None = None, **headers: str) -> str | None:
+        if forwarded is not None:
+            headers["x-forwarded-for"] = forwarded
+        return services.client_ip(SimpleNamespace(client=SimpleNamespace(host=peer), headers=headers))
+
+    assert client_ip("172.18.0.6", "203.0.113.9") == "172.18.0.6"
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "172.18.0.0/16, 10.0.0.0/8")
+    assert client_ip("198.51.100.20", "203.0.113.9") == "198.51.100.20"
+    assert client_ip("172.18.0.6", "203.0.113.9") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "1.2.3.4, 203.0.113.9") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "203.0.113.9, 10.0.0.1") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "203.0.113.9", **{"cf-connecting-ip": "2001:db8::7"}) == "203.0.113.9"
+    assert client_ip("172.18.0.6", **{"cf-connecting-ip": "2001:db8::7"}) == "172.18.0.6"
+    assert client_ip("172.18.0.6", "203.0.113.9, not-an-ip") == "172.18.0.6"
+    assert client_ip("172.18.0.6", "10.0.0.5, 10.0.0.1") == "10.0.0.5"
+    assert services.client_ip(None) is None
+
+
+@pytest.mark.asyncio
+async def test_audit_session_and_rate_limit_record_the_real_client_ip(monkeypatch):
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "127.0.0.0/8")
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        login = await ac.post(
+            "/api/v1/auth/login",
+            headers={"X-Forwarded-For": "203.0.113.9"},
+            json={"email": "owner@example.com", "password": "correct horse battery"},
+        )
+        assert login.status_code == 200
+        session_id = decode_access_token(login.json()["access_token"])["session_id"]
+
+    async with async_session_factory() as db:
+        assert (await db.get(Session, session_id)).ip_address == "203.0.113.9"
+        login_event = (await db.execute(select(AuditEvent).where(AuditEvent.action == "auth.login"))).scalar_one()
+        assert login_event.ip_address == "203.0.113.9"
+        bucket_keys = set((await db.execute(select(RateLimitBucket.key))).scalars())
+        assert "login:owner@example.com:203.0.113.9" in bucket_keys
+
+
 @pytest.mark.asyncio
 async def test_failed_login_attempts_persist_rate_limit_counters():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "limited@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2764,8 +3290,8 @@ async def test_failed_login_attempts_persist_rate_limit_counters():
 @pytest.mark.asyncio
 async def test_passkey_management_requires_a_recent_session():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "reauth@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2810,8 +3336,8 @@ async def test_passkey_options_reject_invalid_origin_configuration(monkeypatch):
 @pytest.mark.asyncio
 async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2895,15 +3421,30 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
         assert mfa_claims["amr"] == ["pwd", "otp"]
         assert set(mfa_claims["scope"].split()) == {"openid", "profile", "email", "api:read"}
 
+        ui_login = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "admin@example.com",
+                "password": "correct horse battery",
+                "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
+                "totp_code": totp_code(secret),
+            },
+        )
+        assert ui_login.status_code == 200
+        ui_access = ui_login.json()["access_token"]
+        product_me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {mfa_payload['access_token']}"})
+        assert product_me.status_code == 401
+
         refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": mfa_payload["refresh_token"]})
         assert refreshed.status_code == 200
         refreshed_claims = decode_access_token(refreshed.json()["access_token"], audience="mfa-api")
         assert refreshed_claims["amr"] == ["pwd", "otp"]
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {mfa_payload['access_token']}"},
-            params={
+        approved = await approve_consent(
+            ac,
+            {"Authorization": f"Bearer {ui_access}"},
+            {
                 "response_type": "code",
                 "client_id": created.json()["client_id"],
                 "redirect_uri": "https://app.example.com/callback",
@@ -2911,11 +3452,9 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
                 "code_challenge_method": "plain",
                 "scope": "openid profile email api:read",
                 "audience": "mfa-api",
-                "approve": "true",
             },
         )
-        assert approved.status_code == 302
-        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        code = parse_qs(urlparse(approved).query)["code"][0]
         token = await ac.post(
             "/oauth/token",
             data={
@@ -2944,7 +3483,7 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
 
         mfa_approve = await ac.post(
             "/api/v1/auth/device/approve",
-            headers={"Authorization": f"Bearer {mfa_payload['access_token']}"},
+            headers={"Authorization": f"Bearer {ui_access}"},
             json={"user_code": device.json()["user_code"], "approve": True},
         )
         assert mfa_approve.status_code == 200
@@ -2991,8 +3530,8 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
 @pytest.mark.asyncio
 async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3041,11 +3580,12 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
                 "email": "owner@example.com",
                 "password": "correct horse battery",
                 "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
                 "totp_code": totp_code(secret),
             },
         )
         assert mfa_login.status_code == 200
-        mfa_claims = decode_access_token(mfa_login.json()["access_token"], audience="trusted-api")
+        mfa_claims = decode_access_token(mfa_login.json()["access_token"])
         trusted = await ac.patch(
             f"/api/v1/sessions/{mfa_claims['session_id']}/device",
             headers={"Authorization": f"Bearer {mfa_login.json()['access_token']}"},
@@ -3079,10 +3619,11 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
                 "email": "owner@example.com",
                 "password": "correct horse battery",
                 "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
             },
         )
         assert trusted_login.status_code == 200
-        trusted_claims = decode_access_token(trusted_login.json()["access_token"], audience="trusted-api")
+        trusted_claims = decode_access_token(trusted_login.json()["access_token"])
         assert trusted_claims["amr"] == ["pwd", "trusted_device"]
         current_session = await ac.get(
             "/api/v1/sessions",
@@ -3093,7 +3634,8 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
 
         refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": trusted_login.json()["refresh_token"]})
         assert refreshed.status_code == 200
-        refreshed_claims = decode_access_token(refreshed.json()["access_token"], audience="trusted-api")
+        refreshed_claims = decode_access_token(refreshed.json()["access_token"])
+        assert refreshed_claims["aud"] == settings.issuer
         assert refreshed_claims["amr"] == ["pwd", "trusted_device"]
 
         disabled_policy = await ac.patch(
@@ -3111,8 +3653,8 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
 @pytest.mark.asyncio
 async def test_admin_step_up_policy_requires_mfa_for_sensitive_org_mutations():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3216,8 +3758,8 @@ async def test_admin_step_up_policy_requires_mfa_for_sensitive_org_mutations():
 @pytest.mark.asyncio
 async def test_org_mfa_policy_enforces_org_clients_and_revokes_stale_sessions():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3331,8 +3873,8 @@ async def test_org_mfa_policy_enforces_org_clients_and_revokes_stale_sessions():
 @pytest.mark.asyncio
 async def test_admin_totp_reset_clears_mfa_and_revokes_sessions():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3388,10 +3930,10 @@ async def test_admin_totp_reset_clears_mfa_and_revokes_sessions():
 
 
 @pytest.mark.asyncio
-async def test_invitation_create_accept_reuse_and_revoke():
+async def test_invitation_create_accept_reuse_and_revoke(monkeypatch):
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -3432,6 +3974,15 @@ async def test_invitation_create_accept_reuse_and_revoke():
         )
         assert mismatch.status_code == 403
 
+        closed_mode = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "invited@example.com", "password": "correct horse battery", "token": invite_token},
+        )
+        assert closed_mode.status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(User).where(User.email == "invited@example.com"))).first() is None
+
+        monkeypatch.setattr(settings, "signup_mode", "invite")
         accepted = await ac.post(
             "/api/v1/auth/invitations/accept",
             json={
@@ -3497,22 +4048,22 @@ async def test_invitation_create_accept_reuse_and_revoke():
 @pytest.mark.asyncio
 async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
     async with await client() as ac:
-        first = await ac.post(
-            "/api/v1/auth/signup",
+        first = await register(
+            ac,
             json={"email": "first@example.com", "password": "correct horse battery"},
         )
         assert first.status_code == 200
         assert first.json()["orgs"][0]["role"] == "owner"
 
-        bootstrap_admin = await ac.post(
-            "/api/v1/auth/signup",
+        bootstrap_admin = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert bootstrap_admin.status_code == 200
-        assert bootstrap_admin.json()["orgs"][0]["role"] == "owner"
+        assert bootstrap_admin.json()["orgs"][0]["role"] == "viewer"
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
@@ -3522,15 +4073,85 @@ async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
             "/api/v1/auth/signup",
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
-        assert duplicate.status_code == 409
+        assert duplicate.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_new_accounts_get_no_default_bootstrap_membership(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        assert [org["role"] for org in owner.json()["orgs"]] == ["owner"]
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        second_org = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        assert second_org.status_code == 200
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": second_org.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"email": "invited@example.com", "org_id": second_org.json()["id"], "role": "operator"},
+        )
+        assert invite.status_code == 200
+
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        accepted = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "invited@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        assert accepted.status_code == 200
+        assert [(org["id"], org["role"]) for org in accepted.json()["orgs"]] == [(second_org.json()["id"], "operator")]
+
+    async with async_session_factory() as db:
+        for email in ("plain@example.com", str(settings.bootstrap_admin_email)):
+            user = await services.create_user(db, email=email, password=password)
+            assert await services.org_roles(db, user.id) == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_org_without_owner_is_never_auto_promoted(monkeypatch):
+    sent: list[str] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["data"]["attributes"]["subject"])
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+
+    async with async_session_factory() as db:
+        owner_membership = (
+            await db.execute(select(Membership).where(Membership.user_id == owner.json()["user"]["id"]))
+        ).scalar_one()
+        owner_membership.status = "revoked"
+        await db.commit()
+        org = await services.ensure_bootstrap(db)
+        assert not await services.org_has_owner(db, org.id)
+        assert [item.role for item in await services.org_roles(db, member.json()["user"]["id"])] == ["viewer"]
+        missing = await db.execute(select(AuditEvent).where(AuditEvent.action == "org.owner.missing"))
+        assert missing.scalars().first() is not None
+    await asyncio.gather(*alerts._pending)
+    assert "[GateKeeper] Bootstrap organization has no owner" in sent
+
+    await ops.set_bootstrap_owner("member@example.com")
+    async with async_session_factory() as db:
+        assert [item.role for item in await services.org_roles(db, member.json()["user"]["id"])] == ["owner"]
+        promoted = await db.execute(select(AuditEvent).where(AuditEvent.action == "org.owner.bootstrap"))
+        assert promoted.scalar_one().details["via"] == "operator"
 
 
 @pytest.mark.asyncio
 async def test_cookie_auth_and_refresh_preserve_owner_scope(monkeypatch):
     monkeypatch.setattr(settings, "cookie_name", "gk_custom_session")
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -3603,8 +4224,8 @@ async def test_cookie_auth_and_refresh_preserve_owner_scope(monkeypatch):
 @pytest.mark.asyncio
 async def test_session_revocation_invalidates_access_and_refresh_tokens():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3633,8 +4254,8 @@ async def test_session_revocation_invalidates_access_and_refresh_tokens():
 @pytest.mark.asyncio
 async def test_org_idle_timeout_revokes_idle_session_and_refresh_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3674,8 +4295,8 @@ async def test_org_idle_timeout_revokes_idle_session_and_refresh_token():
 @pytest.mark.asyncio
 async def test_session_device_label_and_trust_are_self_service():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3711,8 +4332,8 @@ async def test_session_device_label_and_trust_are_self_service():
         assert listed_session["device_label"] == "Work laptop"
         assert listed_session["trusted"] is True
 
-        other = await ac.post(
-            "/api/v1/auth/signup",
+        other = await register(
+            ac,
             json={"email": "other@example.com", "password": "correct horse battery"},
         )
         assert other.status_code == 200
@@ -3738,8 +4359,8 @@ async def test_session_device_label_and_trust_are_self_service():
 @pytest.mark.asyncio
 async def test_logout_revokes_current_session_and_refresh_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3760,8 +4381,8 @@ async def test_logout_revokes_current_session_and_refresh_token():
 @pytest.mark.asyncio
 async def test_bulk_session_revocation_supports_other_devices_and_global_signout():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3813,8 +4434,8 @@ async def test_bulk_session_revocation_supports_other_devices_and_global_signout
 @pytest.mark.asyncio
 async def test_bad_redirect_is_rejected_for_oauth_client():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -3852,8 +4473,8 @@ async def test_bad_redirect_is_rejected_for_oauth_client():
 @pytest.mark.asyncio
 async def test_client_metadata_urls_must_be_absolute_http_urls():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -3876,8 +4497,8 @@ async def test_client_metadata_urls_must_be_absolute_http_urls():
 @pytest.mark.asyncio
 async def test_authorize_redirects_unauthenticated_user_to_hosted_login():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -3923,8 +4544,8 @@ async def test_authorize_redirects_unauthenticated_user_to_hosted_login():
 @pytest.mark.asyncio
 async def test_authorize_requires_consent_before_issuing_code():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4001,20 +4622,22 @@ async def test_authorize_requires_consent_before_issuing_code():
         )
         assert invalid_context.status_code == 403
 
-        invalid_approve = await ac.get(
+        invalid_approve = await ac.post(
             "/oauth/authorize",
             headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": "not-an-org"},
+            json={
+                **params,
+                "approve": True,
+                "org_id": "not-an-org",
+                "consent_nonce": context_payload["consent_nonce"],
+            },
         )
         assert invalid_approve.status_code == 403
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": selected_org_id},
+        approved = await approve_consent(
+            ac, {"Authorization": f"Bearer {access}"}, {**params, "org_id": selected_org_id}
         )
-        assert approved.status_code == 302
-        callback = urlparse(approved.headers["location"])
+        callback = urlparse(approved)
         assert f"{callback.scheme}://{callback.netloc}{callback.path}" == "https://app.example.com/callback"
         callback_query = parse_qs(callback.query)
         assert callback_query["state"] == ["consent-state"]
@@ -4079,8 +4702,8 @@ async def test_authorize_requires_consent_before_issuing_code():
 @pytest.mark.asyncio
 async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4113,13 +4736,10 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
             "audience": "example-api",
         }
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": org_id, "state": "admin-review"},
+        approved = await approve_consent(
+            ac, {"Authorization": f"Bearer {access}"}, {**params, "org_id": org_id, "state": "admin-review"}
         )
-        assert approved.status_code == 302
-        assert parse_qs(urlparse(approved.headers["location"]).query)["code"][0].startswith("gkc_")
+        assert parse_qs(urlparse(approved).query)["code"][0].startswith("gkc_")
 
         admin_grants = await ac.get(
             f"/api/v1/oauth/grants/admin?org_id={org_id}",
@@ -4199,12 +4819,11 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
             "scope": "openid profile api:read",
             "audience": "second-api",
         }
-        second_approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {second_access}"},
-            params={**second_params, "approve": "true", "org_id": second_org_id, "state": "second-admin-review"},
+        await approve_consent(
+            ac,
+            {"Authorization": f"Bearer {second_access}"},
+            {**second_params, "org_id": second_org_id, "state": "second-admin-review"},
         )
-        assert second_approved.status_code == 302
 
         cross_org_list = await ac.get(
             f"/api/v1/oauth/grants/admin?org_id={second_org_id}",
@@ -4227,8 +4846,8 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
 @pytest.mark.asyncio
 async def test_authorize_can_issue_personal_tokens_for_clients_without_required_org_membership():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4263,13 +4882,8 @@ async def test_authorize_can_issue_personal_tokens_for_clients_without_required_
         assert context.status_code == 200
         assert context.json()["selected_org_id"] is None
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true"},
-        )
-        assert approved.status_code == 302
-        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        approved = await approve_consent(ac, {"Authorization": f"Bearer {access}"}, params)
+        code = parse_qs(urlparse(approved).query)["code"][0]
 
         token = await ac.post(
             "/oauth/token",
@@ -4285,14 +4899,130 @@ async def test_authorize_can_issue_personal_tokens_for_clients_without_required_
         claims = decode_access_token(token.json()["access_token"], audience="personal-api")
         assert claims["org_id"] is None
         assert "org_role" not in claims
+        assert claims["roles"] == []
         assert "permissions" not in claims
+
+
+@pytest.mark.asyncio
+async def test_user_access_tokens_carry_role_claims_and_service_tokens_do_not():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_claims = decode_access_token(owner.json()["access_token"])
+        assert owner_claims["roles"] == ["owner"]
+        assert owner_claims["org_role"] == "owner"
+
+        await register(ac, json={"email": "viewer@example.com", "password": password})
+        viewer = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"},
+        )
+        viewer_claims = decode_access_token(viewer.json()["access_token"], audience="gatekeeper-api")
+        assert viewer_claims["roles"] == ["viewer"]
+        assert viewer_claims["org_role"] == "viewer"
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": viewer.json()["refresh_token"]})
+        assert decode_access_token(refreshed.json()["access_token"])["roles"] == ["viewer"]
+        introspected = await ac.post("/oauth/introspect", data={"token": refreshed.json()["access_token"]})
+        assert introspected.json()["roles"] == ["viewer"]
+
+        service_client = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"name": "Worker", "public": False, "audiences": ["worker-api"], "scopes": ["auth:read"]},
+        )
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": service_client.json()["client_id"],
+                "client_secret": service_client.json()["client_secret"],
+            },
+        )
+        assert service.status_code == 200
+        service_claims = decode_access_token(service.json()["access_token"], audience="worker-api")
+        assert service_claims["token_type"] == "service"
+        assert "roles" not in service_claims
+        assert "org_role" not in service_claims
+
+
+@pytest.mark.asyncio
+async def test_gatekeeper_api_accepts_only_its_own_token_audiences():
+    password = "correct horse battery"
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        assert decode_access_token(owner_token)["aud"] == settings.issuer
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(owner_token))).status_code == 200
+
+        sentinel = await ac.post(
+            "/api/v1/clients",
+            headers=bearer(owner_token),
+            json={
+                "name": "Sentinel",
+                "public": False,
+                "redirect_uris": ["https://sentinel.example.com/callback"],
+                "audiences": ["sentinel-api"],
+                "scopes": ["auth:read"],
+            },
+        )
+        assert sentinel.status_code == 200
+        sentinel_client_id = sentinel.json()["client_id"]
+        login = {"email": "owner@example.com", "password": password, "client_id": sentinel_client_id}
+        product = await ac.post("/api/v1/auth/login", json=login)
+        assert decode_access_token(product.json()["access_token"], audience="sentinel-api")
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(product.json()["access_token"]))).status_code == 401
+
+        hosted_ui = await ac.post("/api/v1/auth/login", json={**login, "audience": settings.issuer})
+        assert hosted_ui.status_code == 200
+        assert decode_access_token(hosted_ui.json()["access_token"])["aud"] == settings.issuer
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(hosted_ui.json()["access_token"]))).status_code == 200
+
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": sentinel_client_id,
+                "client_secret": sentinel.json()["client_secret"],
+            },
+        )
+        assert (await ac.get("/api/v1/orgs", headers=bearer(service.json()["access_token"]))).status_code == 401
+
+        device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+        approved = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=bearer(owner_token),
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert decode_access_token(cli.json()["access_token"])["aud"] == ["gatekeeper-api"]
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(cli.json()["access_token"]))).status_code == 200
+
+        for audiences, expected in (([], 200), (["gatekeeper-api"], 200), (["sentinel-api"], 401)):
+            api_token = await ac.post(
+                "/api/v1/tokens",
+                headers=bearer(owner_token),
+                json={"name": "bound token", "token_type": "personal", "audiences": audiences},
+            )
+            assert (await ac.get("/api/v1/auth/me", headers=bearer(api_token.json()["token"]))).status_code == expected
 
 
 @pytest.mark.asyncio
 async def test_introspection_validates_jwts_and_rejects_invalid_tokens():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -4321,8 +5051,8 @@ async def test_introspection_validates_jwts_and_rejects_invalid_tokens():
 @pytest.mark.asyncio
 async def test_introspection_honors_disabled_clients_for_opaque_and_service_jwts():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4433,8 +5163,8 @@ def test_jwt_key_dir_persists_signing_key(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_client_credentials_and_bad_audience():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4480,8 +5210,8 @@ async def test_client_credentials_and_bad_audience():
 @pytest.mark.asyncio
 async def test_device_flow_and_api_token_revocation():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4544,8 +5274,8 @@ async def test_device_flow_and_api_token_revocation():
 @pytest.mark.asyncio
 async def test_device_grant_accepts_only_one_concurrent_decision():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "device-race@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4575,8 +5305,8 @@ async def test_device_grant_accepts_only_one_concurrent_decision():
 @pytest.mark.asyncio
 async def test_device_approval_rate_limit_counts_invalid_user_codes():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "device-limited@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4602,8 +5332,8 @@ async def test_device_approval_rate_limit_counts_invalid_user_codes():
 @pytest.mark.asyncio
 async def test_user_jwt_is_session_bound_and_revocation_updates_introspection():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4636,8 +5366,8 @@ async def test_user_jwt_is_session_bound_and_revocation_updates_introspection():
 @pytest.mark.asyncio
 async def test_logout_revokes_current_session_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4656,8 +5386,8 @@ async def test_logout_revokes_current_session_token():
 @pytest.mark.asyncio
 async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -4668,8 +5398,8 @@ async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
@@ -4764,10 +5494,194 @@ async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
 
 
 @pytest.mark.asyncio
+async def test_token_scopes_are_capped_to_role_permissions_on_every_issuance_path():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        assert owner.status_code == 200
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        viewer = await register(ac, json={"email": "viewer@example.com", "password": password})
+        assert viewer.status_code == 200
+        viewer_id = viewer.json()["user"]["id"]
+
+        for scope in (None, "auth:read token:* mcp:*", "token:*"):
+            payload = {"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"}
+            if scope:
+                payload["scope"] = scope
+            login = await ac.post("/api/v1/auth/login", json=payload)
+            assert login.status_code == 200
+            assert login.json()["scope"] == "auth:read"
+            claims = decode_access_token(login.json()["access_token"], audience="gatekeeper-api")
+            assert claims["scope"] == "auth:read"
+        viewer_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+        refreshed = await ac.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": login.json()["refresh_token"]},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["scope"] == "auth:read"
+        assert decode_access_token(refreshed.json()["access_token"])["scope"] == "auth:read"
+
+        for token_type in ("personal", "service", "admin"):
+            for scopes in (["admin:*"], ["token:*"], ["*"], ["admin:*", "auth:read", "token:*", "mcp:*"]):
+                denied = await ac.post(
+                    "/api/v1/tokens",
+                    headers=viewer_headers,
+                    json={"name": "escalation", "token_type": token_type, "org_id": org_id, "scopes": scopes},
+                )
+                assert denied.status_code == 403
+
+        roles = await ac.get(f"/api/v1/roles?org_id={org_id}", headers=owner_headers)
+        operator_role = next(role for role in roles.json() if role["name"] == "operator")
+        promoted = await ac.put(
+            f"/api/v1/users/{viewer_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role_id": operator_role["id"], "status": "active"},
+        )
+        assert promoted.status_code == 200
+        operator_login = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"},
+        )
+        assert operator_login.status_code == 200
+        assert set(operator_login.json()["scope"].split()) == {"auth:read", "token:*", "mcp:*"}
+        operator_headers = {"Authorization": f"Bearer {operator_login.json()['access_token']}"}
+
+        for scopes in (["admin:*"], ["*"]):
+            denied = await ac.post(
+                "/api/v1/tokens",
+                headers=operator_headers,
+                json={"name": "operator escalation", "token_type": "service", "org_id": org_id, "scopes": scopes},
+            )
+            assert denied.status_code == 403
+        allowed = await ac.post(
+            "/api/v1/tokens",
+            headers=operator_headers,
+            json={"name": "operator mcp", "token_type": "service", "org_id": org_id, "scopes": ["mcp:tools"]},
+        )
+        assert allowed.status_code == 200
+
+        owner_admin_token = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "owner admin", "token_type": "admin", "org_id": org_id, "scopes": ["*"]},
+        )
+        assert owner_admin_token.status_code == 200
+        operator_rotate = await ac.post(
+            f"/api/v1/tokens/{owner_admin_token.json()['id']}/rotate",
+            headers=operator_headers,
+        )
+        assert operator_rotate.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_token_administration_stays_in_the_callers_org(monkeypatch):
+    password = "correct horse battery"
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        target = await ac.post(
+            "/api/v1/tokens",
+            headers=bearer(owner_token),
+            json={"name": "bootstrap service", "token_type": "service", "scopes": ["auth:read"]},
+        )
+        second = await ac.post("/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        tenant_service = await ac.post(
+            "/api/v1/tokens",
+            headers=bearer(switched.json()["access_token"]),
+            json={"name": "second automation", "token_type": "service", "scopes": ["token:*", "auth:read"]},
+        )
+        async with async_session_factory() as db:
+            _orgless, orgless_raw = await services.create_api_token(
+                db,
+                name="legacy automation",
+                token_type_value="service",
+                org_id=None,
+                user_id=None,
+                project_id=None,
+                client_id=None,
+                scopes=["token:*", "auth:read"],
+                audiences=[],
+                expires_at=None,
+            )
+            await db.commit()
+
+        for raw in (orgless_raw, tenant_service.json()["token"]):
+            headers = bearer(raw)
+            assert (await ac.get("/api/v1/tokens", headers=headers, params={"org_id": bootstrap_id})).status_code == 403
+            created = await ac.post(
+                "/api/v1/tokens",
+                headers=headers,
+                json={"name": "cross org", "token_type": "service", "org_id": bootstrap_id, "scopes": ["auth:read"]},
+            )
+            assert created.status_code == 403
+            assert (await ac.post(f"/api/v1/tokens/{target.json()['id']}/rotate", headers=headers)).status_code == 403
+            assert (await ac.delete(f"/api/v1/tokens/{target.json()['id']}", headers=headers)).status_code == 403
+        assert (await ac.get("/api/v1/tokens", headers=bearer(orgless_raw))).status_code == 403
+
+        own_org = await ac.get("/api/v1/tokens", headers=bearer(tenant_service.json()["token"]))
+        assert own_org.status_code == 200
+        platform_revoke = await ac.delete(f"/api/v1/tokens/{tenant_service.json()['id']}", headers=bearer(owner_token))
+        assert platform_revoke.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_operator_command_revokes_tokens_that_exceed_the_owners_role():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        viewer = await register(ac, json={"email": "viewer@example.com", "password": password})
+        org_id = owner.json()["orgs"][0]["id"]
+
+        async def mint(user_id: str | None, token_type: str, scopes: list[str]):
+            async with async_session_factory() as db:
+                token, raw = await services.create_api_token(
+                    db,
+                    name=f"{token_type} token",
+                    token_type_value=token_type,
+                    org_id=org_id,
+                    user_id=user_id,
+                    project_id=None,
+                    client_id=None,
+                    scopes=scopes,
+                    audiences=[],
+                    expires_at=None,
+                )
+                await db.commit()
+                return token.id, raw
+
+        escalated_id, escalated_raw = await mint(viewer.json()["user"]["id"], "personal", ["admin:*", "auth:read"])
+        await mint(viewer.json()["user"]["id"], "personal", ["auth:read"])
+        await mint(owner.json()["user"]["id"], "admin", ["*"])
+        unowned_id, _unowned_raw = await mint(None, "service", ["*"])
+
+        listed = await ops.overscoped_tokens()
+        assert {(item["id"], item["action"]) for item in listed} == {(escalated_id, "revoke"), (unowned_id, "review")}
+        assert next(item for item in listed if item["id"] == escalated_id)["excess"] == ["admin:*"]
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {escalated_raw}"})
+        assert me.status_code == 200
+
+        await ops.overscoped_tokens(revoke=True)
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {escalated_raw}"})
+        assert me.status_code == 401
+        assert [item["id"] for item in await ops.overscoped_tokens()] == [unowned_id]
+
+
+@pytest.mark.asyncio
 async def test_api_token_validation_returns_product_metadata_and_policy_checks():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -4913,8 +5827,8 @@ async def test_api_token_validation_returns_product_metadata_and_policy_checks()
 @pytest.mark.asyncio
 async def test_client_token_management_and_audit_filters():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -5037,8 +5951,8 @@ async def test_client_token_management_and_audit_filters():
 @pytest.mark.asyncio
 async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -5047,8 +5961,8 @@ async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
         owner_id = owner_payload["user"]["id"]
         org_id = owner_payload["orgs"][0]["id"]
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
@@ -5119,3 +6033,1596 @@ async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
         )
         assert revoked.status_code == 200
         assert revoked.json()["status"] == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_security_alert_is_sent_through_sendy_in_the_background(monkeypatch):
+    sent: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(202, json={"data": {"id": "email-1"}})
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    for key, recipient in (("", "ops@example.com"), ("test-sendy-key", "")):
+        monkeypatch.setattr(settings, "sendy_api_key", key)
+        monkeypatch.setattr(settings, "alert_email_to", recipient)
+        alerts.send_security_alert("Skipped", ["Action: none"], "gatekeeper-skip")
+        assert not alerts._pending
+
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    alerts.send_security_alert("Role set\r\nto owner", ["Action: user.membership.update"], "gatekeeper-audit-1")
+    assert alerts._pending
+    await asyncio.gather(*alerts._pending)
+
+    assert len(sent) == 1
+    request = sent[0]
+    assert request.method == "POST"
+    assert str(request.url) == "https://usesendy.com/api/v1/emails"
+    assert request.headers["authorization"] == "Bearer test-sendy-key"
+    assert request.headers["content-type"] == "application/vnd.api+json"
+    assert request.headers["accept"] == "application/vnd.api+json"
+    assert request.headers["idempotency-key"] == "gatekeeper-audit-1"
+    assert json.loads(request.content) == {
+        "data": {
+            "type": "emails",
+            "attributes": {
+                "from": settings.alert_email_from,
+                "to": "ops@example.com",
+                "subject": "[GateKeeper] Role set to owner",
+                "text": "Action: user.membership.update",
+            },
+        }
+    }
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sendy unreachable")
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(fail))
+    alerts.send_security_alert("Unreachable", ["Action: none"], "gatekeeper-audit-2")
+    await asyncio.gather(*alerts._pending)
+
+
+@pytest.mark.asyncio
+async def test_security_events_queue_alerts_without_secret_values(monkeypatch):
+    sent: list[dict] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append({"key": request.headers["idempotency-key"], **json.loads(request.content)["data"]["attributes"]})
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        token = await ac.post(
+            "/api/v1/tokens",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"name": "automation", "token_type": "personal", "scopes": ["admin:*"]},
+        )
+        assert token.status_code == 200
+        for _attempt in range(2):
+            refused = await ac.post("/api/v1/auth/signup", json={"email": "intruder@example.com", "password": password})
+            assert refused.status_code == 403
+        await asyncio.gather(*alerts._pending)
+
+    by_subject = {item["subject"]: item for item in sent}
+    assert {
+        "[GateKeeper] User created",
+        "[GateKeeper] Privileged login from a new IP",
+        "[GateKeeper] API token created",
+        "[GateKeeper] Signup refused",
+    }.issubset(by_subject)
+    token_alert = by_subject["[GateKeeper] API token created"]["text"]
+    assert "Actor: owner@example.com" in token_alert
+    assert "Client IP: 127.0.0.1" in token_alert
+    assert "scopes: admin:*" in token_alert
+    assert "Time (UTC): " in token_alert
+    refusal_keys = [item["key"] for item in sent if item["subject"] == "[GateKeeper] Signup refused"]
+    assert len(refusal_keys) == 1
+    for item in sent:
+        assert token.json()["token"] not in item["text"]
+        assert password not in item["text"]
+        assert owner.json()["access_token"] not in item["text"]
+
+
+@pytest.mark.asyncio
+async def test_switch_org_is_limited_to_hosted_sessions_and_never_widens_a_token():
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_token = owner.json()["access_token"]
+        second = await ac.post(
+            "/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"}
+        )
+        assert second.status_code == 200
+
+        device = await ac.post(
+            "/oauth/device_authorization", json={"client_id": "gatekeeper-cli", "scope": "auth:read"}
+        )
+        approved = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=bearer(owner_token),
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert cli.json()["scope"] == "auth:read"
+        widened = await ac.post(
+            "/api/v1/auth/session/switch-org",
+            headers=bearer(cli.json()["access_token"]),
+            json={"org_id": second.json()["id"]},
+        )
+        assert widened.status_code == 403
+        assert widened.json()["detail"] == "Organization switching is limited to hosted sessions"
+
+        for extra in ({"client_id": "gatekeeper-cli"}, {"audience": "gatekeeper-api"}, {"scope": "auth:read"}):
+            changed = await ac.post(
+                "/api/v1/auth/session/switch-org",
+                headers=bearer(owner_token),
+                json={"org_id": second.json()["id"], **extra},
+            )
+            assert changed.status_code == 400
+
+        hosted = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        assert hosted.status_code == 200
+        claims = decode_access_token(hosted.json()["access_token"])
+        assert claims["org_id"] == second.json()["id"]
+        assert claims["aud"] == settings.issuer
+        assert claims.get("azp") is None
+        assert claims["scope"] == "*"
+
+
+async def bootstrap_owner_and_admin(ac: AsyncClient, password: str = "correct horse battery"):
+    """Owner (platform admin) plus an org admin of the bootstrap org who is not a platform admin."""
+    owner = await register(ac, json={"email": "owner@example.com", "password": password})
+    owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+    org_id = owner.json()["orgs"][0]["id"]
+    admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+    promoted = await ac.put(
+        f"/api/v1/users/{admin.json()['user']['id']}/membership",
+        headers=owner_headers,
+        json={"org_id": org_id, "role": "admin", "status": "active"},
+    )
+    assert promoted.status_code == 200
+    login = await ac.post("/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password})
+    admin_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    return owner_headers, admin_headers, org_id, admin.json()["user"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_gatekeeper_audiences_including_the_issuer_are_reserved():
+    body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        for audiences in ([settings.issuer], ["gatekeeper-api"]):
+            denied = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "audiences": audiences})
+            assert denied.status_code == 403
+        for audiences, expected in (([settings.issuer], 200), (["gatekeeper-api"], 200), (["sentinel-api"], 403)):
+            token = await ac.post(
+                "/api/v1/tokens",
+                headers=admin_headers,
+                json={"name": "bound", "token_type": "personal", "audiences": audiences},
+            )
+            assert token.status_code == expected
+        owned = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "audiences": ["my-api"]})
+        assert owned.status_code == 200
+        retarget = await ac.patch(
+            f"/api/v1/clients/{owned.json()['id']}", headers=admin_headers, json={"audiences": [settings.issuer]}
+        )
+        assert retarget.status_code == 403
+
+        first_party = await ac.post(
+            "/api/v1/clients", headers=owner_headers, json={**body, "audiences": [settings.issuer]}
+        )
+        assert first_party.status_code == 200
+        removed = await ac.delete(f"/api/v1/clients/{first_party.json()['id']}", headers=admin_headers)
+        assert removed.status_code == 403
+        assert (await ac.delete(f"/api/v1/clients/{owned.json()['id']}", headers=admin_headers)).status_code == 200
+        owner_token = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "bound", "token_type": "personal", "audiences": ["sentinel-api"]},
+        )
+        assert owner_token.status_code == 200
+
+
+async def approve_consent(ac: AsyncClient, headers: dict[str, str], params: dict[str, str]) -> str:
+    """Approve the way the hosted consent page does: nonce from the context endpoint, then POST."""
+    context = await ac.get("/api/v1/oauth/authorize/context", headers=headers, params=params)
+    assert context.status_code == 200
+    approved = await ac.post(
+        "/oauth/authorize",
+        headers=headers,
+        json={**params, "approve": True, "consent_nonce": context.json()["consent_nonce"]},
+    )
+    assert approved.status_code == 200
+    return approved.json()["redirect_to"]
+
+
+@pytest.mark.asyncio
+async def test_consent_needs_a_session_bound_nonce_and_post_and_only_platform_admins_verify_clients():
+    body = {
+        "name": "Product",
+        "public": True,
+        "redirect_uris": ["https://app.example.com/callback", "https://evil.example.com/callback"],
+        "audiences": ["example-api"],
+        "scopes": ["openid", "auth:read"],
+    }
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        verified = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "verified": True})
+        assert verified.status_code == 403
+        own = await ac.post("/api/v1/clients", headers=admin_headers, json=body)
+        assert own.status_code == 200
+        marked = await ac.patch(f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"verified": True})
+        assert marked.status_code == 403
+        unchanged = await ac.patch(
+            f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"verified": False, "name": "Renamed"}
+        )
+        assert unchanged.status_code == 200
+
+        created = await ac.post("/api/v1/clients", headers=owner_headers, json={**body, "verified": True})
+        assert created.status_code == 200
+        params = {
+            "response_type": "code",
+            "client_id": created.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+            "audience": "example-api",
+            "state": "s1",
+        }
+        forged = await ac.get("/oauth/authorize", headers=owner_headers, params={**params, "approve": "true"})
+        assert forged.status_code == 302
+        assert urlparse(forged.headers["location"]).path == "/authorize"
+
+        context = await ac.get("/api/v1/oauth/authorize/context", headers=owner_headers, params=params)
+        nonce = context.json()["consent_nonce"]
+        for submitted in (
+            {**params, "approve": True},
+            {**params, "approve": True, "consent_nonce": "0" * 64},
+            {**params, "approve": True, "consent_nonce": nonce, "code_challenge": "attacker"},
+            {**params, "approve": True, "consent_nonce": nonce, "redirect_uri": "https://evil.example.com/callback"},
+        ):
+            refused = await ac.post("/oauth/authorize", headers=owner_headers, json=submitted)
+            assert refused.status_code == 403
+        other_session = await ac.post(
+            "/api/v1/auth/login", json={"email": "owner@example.com", "password": "correct horse battery"}
+        )
+        replayed = await ac.post(
+            "/oauth/authorize",
+            headers={"Authorization": f"Bearer {other_session.json()['access_token']}"},
+            json={**params, "approve": True, "consent_nonce": nonce},
+        )
+        assert replayed.status_code == 403
+
+        location = urlparse(await approve_consent(ac, owner_headers, params))
+        assert f"{location.scheme}://{location.netloc}{location.path}" == "https://app.example.com/callback"
+        assert parse_qs(location.query)["code"][0].startswith("gkc_")
+
+
+@pytest.mark.asyncio
+async def test_org_admins_cannot_hand_out_roles_or_policies_above_their_own():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "member@example.com", "password": "correct horse battery"})
+        member_id = member.json()["user"]["id"]
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        superuser = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "superuser", "permissions": ["*"]}
+        )
+        assert superuser.status_code == 200
+
+        for role in ({"role": "owner"}, {"role_id": superuser.json()["id"]}, {"role": "operator"}):
+            promoted = await ac.put(
+                f"/api/v1/users/{member_id}/membership",
+                headers=admin_headers,
+                json={"org_id": org_id, "status": "active", **role},
+            )
+            assert promoted.status_code == 403
+            invited = await ac.post(
+                "/api/v1/invitations",
+                headers=admin_headers,
+                json={"email": "new@example.com", "org_id": org_id, **role},
+            )
+            assert invited.status_code == 403
+            provisioned = await ac.post(
+                "/api/v1/users/provision",
+                headers=admin_headers,
+                json={"email": "new@example.com", "org_id": org_id, **role},
+            )
+            assert provisioned.status_code == 403
+        demoted = await ac.put(
+            f"/api/v1/users/{owner_id}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "active"},
+        )
+        assert demoted.status_code == 403
+        peer = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "admin", "status": "active"},
+        )
+        assert peer.status_code == 200
+
+        for name, permissions, expected in (
+            ("support", ["*"], 403),
+            ("support", ["token:*"], 403),
+            ("Owner", ["auth:read"], 400),
+            (" ADMIN ", ["auth:read"], 400),
+            ("oper-ator", ["auth:read"], 400),
+            ("support", ["auth:read"], 200),
+        ):
+            created = await ac.post(
+                "/api/v1/roles",
+                headers=admin_headers,
+                json={"org_id": org_id, "name": name, "permissions": permissions},
+            )
+            assert created.status_code == expected
+
+        roles = {role["name"]: role["id"] for role in (await ac.get("/api/v1/roles", headers=owner_headers)).json()}
+        renamed_owner = await ac.put(
+            f"/scim/v2/Groups/{roles['owner']}", headers=admin_headers, json={"displayName": "former", "members": []}
+        )
+        assert renamed_owner.status_code == 403
+        renamed_admin = await ac.patch(
+            f"/scim/v2/Groups/{roles['admin']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "displayName", "value": "Owner"}]},
+        )
+        assert renamed_admin.status_code == 400
+        lookalike = await ac.post("/scim/v2/Groups", headers=admin_headers, json={"displayName": "OWNER"})
+        assert lookalike.status_code == 400
+        owner_group = await ac.patch(
+            f"/scim/v2/Groups/{roles['owner']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member_id}]}]},
+        )
+        assert owner_group.status_code == 403
+        scim_owner = await ac.patch(
+            f"/scim/v2/Users/{member_id}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "roles", "value": [{"value": "owner"}]}]},
+        )
+        assert scim_owner.status_code == 403
+
+        for policy in ({"require_mfa": True}, {"admin_step_up_mfa_required": True}):
+            changed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json=policy)
+            assert changed.status_code == 403
+        renamed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json={"name": "Renamed"})
+        assert renamed.status_code == 200
+        owner_promotes = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert owner_promotes.status_code == 200
+
+    async with async_session_factory() as db:
+        actions = set((await db.execute(select(AuditEvent.action))).scalars())
+    assert "role.create" in actions
+
+
+@pytest.mark.asyncio
+async def test_user_api_tokens_follow_the_owners_current_role():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        created = await ac.post(
+            "/api/v1/tokens",
+            headers=admin_headers,
+            json={
+                "name": "automation",
+                "token_type": "personal",
+                "org_id": org_id,
+                "scopes": ["admin:*", "auth:*"],
+            },
+        )
+        assert created.status_code == 200
+        raw = created.json()["token"]
+        token_headers = {"Authorization": f"Bearer {raw}"}
+        validate = {"token": raw, "required_scopes": ["admin:*"]}
+        assert (await ac.get("/api/v1/users", headers=token_headers)).status_code == 200
+        assert (await ac.post("/api/v1/tokens/validate", json=validate)).json()["scope_ok"] is True
+
+        demoted = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "active"},
+        )
+        assert demoted.status_code == 200
+        assert (await ac.get("/api/v1/users", headers=token_headers)).status_code == 403
+        checked = (await ac.post("/api/v1/tokens/validate", json=validate)).json()
+        assert checked["scope_ok"] is False
+        assert checked["scopes"] == []
+
+        removed = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "revoked"},
+        )
+        assert removed.status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+        assert (await ac.post("/api/v1/tokens/validate", json=validate)).json()["active"] is False
+
+    async with async_session_factory() as db:
+        user = (await db.execute(select(User).where(User.email == "admin@corp.example.com"))).scalar_one()
+        token, orgless_raw = await services.create_api_token(
+            db,
+            name="org-less",
+            token_type_value="personal",
+            org_id=None,
+            user_id=user.id,
+            project_id=None,
+            client_id=None,
+            scopes=["admin:*", "auth:read"],
+            audiences=[],
+            expires_at=None,
+        )
+        await db.commit()
+    async with await client() as ac:
+        orgless = await ac.post("/api/v1/tokens/validate", json={"token": orgless_raw})
+        assert orgless.json()["scopes"] == ["auth:read"]
+
+
+@pytest.mark.asyncio
+async def test_scim_and_provisioning_cannot_reenable_or_attach_accounts_from_other_orgs():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        other_id = other.json()["id"]
+        async with async_session_factory() as db:
+            role_ids = {(role.org_id, role.name): role.id for role in (await db.execute(select(Role))).scalars()}
+            users = {}
+            for email, org_ids in (
+                ("elsewhere@example.com", [other_id]),
+                ("both@example.com", [org_id, other_id]),
+                ("local@example.com", [org_id]),
+            ):
+                user = User(email=email, password_hash=None, disabled=True)
+                db.add(user)
+                await db.flush()
+                for member_org in org_ids:
+                    db.add(Membership(org_id=member_org, user_id=user.id, role_id=role_ids[(member_org, "viewer")]))
+                users[email] = user.id
+            await db.commit()
+        viewer_group = role_ids[(org_id, "viewer")]
+
+        attach = await ac.post(
+            f"/scim/v2/Users?org_id={org_id}",
+            headers=admin_headers,
+            json={"userName": "elsewhere@example.com", "active": True, "roles": [{"value": "viewer"}]},
+        )
+        assert attach.status_code == 403
+        provision = await ac.post(
+            "/api/v1/users/provision", headers=admin_headers, json={"email": "elsewhere@example.com", "org_id": org_id}
+        )
+        assert provision.status_code == 403
+        for member in (users["elsewhere@example.com"], users["both@example.com"]):
+            grouped = await ac.patch(
+                f"/scim/v2/Groups/{viewer_group}",
+                headers=admin_headers,
+                json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member}]}]},
+            )
+            assert grouped.status_code == 403
+        reenable = {"Operations": [{"op": "replace", "path": "active", "value": True}]}
+        both = await ac.patch(f"/scim/v2/Users/{users['both@example.com']}", headers=admin_headers, json=reenable)
+        assert both.status_code == 403
+        local = await ac.patch(f"/scim/v2/Users/{users['local@example.com']}", headers=admin_headers, json=reenable)
+        assert local.status_code == 200
+        assert local.json()["active"] is True
+
+    async with async_session_factory() as db:
+        disabled = dict((await db.execute(select(User.email, User.disabled))).all())
+        members = set((await db.execute(select(Membership.user_id).where(Membership.org_id == org_id))).scalars())
+    assert disabled["elsewhere@example.com"] is True
+    assert disabled["both@example.com"] is True
+    assert users["elsewhere@example.com"] not in members
+
+
+@pytest.mark.asyncio
+async def test_api_tokens_bind_only_projects_clients_and_audiences_of_their_own_org():
+    client_body = {"name": "Other app", "public": True, "redirect_uris": ["https://other.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        other_id = other.json()["id"]
+        switched = await ac.post("/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": other_id})
+        other_headers = {"Authorization": f"Bearer {switched.json()['access_token']}"}
+        foreign_project = await ac.post(
+            "/api/v1/projects",
+            headers=other_headers,
+            json={"org_id": other_id, "name": "Theirs", "slug": "theirs", "audience": "their-api"},
+        )
+        foreign_client = await ac.post(
+            "/api/v1/clients", headers=other_headers, json={**client_body, "audiences": ["their-api"]}
+        )
+        own_project = await ac.post(
+            "/api/v1/projects",
+            headers=admin_headers,
+            json={"org_id": org_id, "name": "Ours", "slug": "ours", "audience": "our-api"},
+        )
+        own_client = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**client_body, "audiences": ["our-app-api"]}
+        )
+        assert {foreign_project.status_code, foreign_client.status_code, own_project.status_code} == {200}
+        assert own_client.status_code == 200
+
+        token = {"name": "bound", "token_type": "service", "org_id": org_id, "scopes": ["auth:read"]}
+        for binding, expected in (
+            ({"project_id": foreign_project.json()["id"]}, 403),
+            ({"client_id": foreign_client.json()["id"]}, 403),
+            ({"project_id": own_project.json()["id"], "audiences": ["their-api"]}, 400),
+            ({"client_id": own_client.json()["id"], "audiences": ["our-api"]}, 400),
+            ({"project_id": own_project.json()["id"], "audiences": ["our-api"]}, 200),
+            ({"client_id": own_client.json()["id"], "audiences": ["our-app-api"]}, 200),
+        ):
+            created = await ac.post("/api/v1/tokens", headers=admin_headers, json={**token, **binding})
+            assert created.status_code == expected, binding
+
+
+@pytest.mark.asyncio
+async def test_federated_login_never_bypasses_mfa_or_links_by_email(monkeypatch):
+    monkeypatch.setattr(settings, "google_client_id", "")
+    monkeypatch.setattr(settings, "google_client_secret", "")
+    monkeypatch.setattr(
+        settings,
+        "oauth_providers_json",
+        """[{"id":"example","name":"Example","client_id":"c","client_secret":"s",
+        "authorization_url":"https://login.example.com/authorize","token_url":"https://login.example.com/token",
+        "userinfo_url":"https://login.example.com/userinfo",
+        "redirect_uri":"https://auth.example.com/api/v1/auth/oauth/example/callback"}]""",
+    )
+
+    async def fake_profile(provider, code):
+        return {"sub": "ext-owner", "email": "owner@example.com", "name": "Owner", "email_verified": True}
+
+    monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
+
+    async def federated_login(ac: AsyncClient):
+        ac.cookies.clear()
+        started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/account"})
+        return await ac.get(
+            "/api/v1/auth/oauth/example/callback", params={"code": "c", "state": started.json()["state"]}
+        )
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_id = owner.json()["user"]["id"]
+        assert (await federated_login(ac)).status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(Identity.id))).first() is None
+            user = await db.get(User, owner_id)
+            user.mfa_totp_enabled_at = services.now_utc()
+            db.add(Identity(user_id=owner_id, provider="example", provider_subject="ext-owner", email=user.email))
+            await db.commit()
+        refused = await federated_login(ac)
+        assert refused.status_code == 401
+        assert (await ac.get("/api/v1/auth/me")).status_code == 401
+
+        async with async_session_factory() as db:
+            user = await db.get(User, owner_id)
+            user.mfa_totp_enabled_at = None
+            await db.commit()
+        assert (await federated_login(ac)).status_code == 302
+
+
+@pytest.mark.asyncio
+async def test_signup_is_rate_limited_per_ip_and_refusal_alerts_are_deduplicated(monkeypatch):
+    sent: list[str] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["data"]["attributes"]["subject"])
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        statuses = []
+        for attempt in range(6):
+            refused = await ac.post(
+                "/api/v1/auth/signup", json={"email": f"intruder{attempt}@example.com", "password": "x" * 12}
+            )
+            statuses.append(refused.status_code)
+        await asyncio.gather(*alerts._pending)
+    assert statuses == [403, 403, 403, 403, 429, 429]
+    assert sent.count("[GateKeeper] Signup refused") == 1
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_lists_what_new_accounts_touched_and_revoke_takes_filters():
+    client_body = {"name": "Flagged", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        evil = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Evil", "slug": "evil"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": evil.json()["id"]}
+        )
+        await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"org_id": evil.json()["id"], "role": "owner", "status": "active"},
+        )
+        admin_login = await ac.post(
+            "/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": "correct horse battery"}
+        )
+        admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+        flagged = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "audiences": ["x-api"], "scopes": ["openid", "admin:*"]},
+        )
+        quiet = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "audiences": ["y-api"], "scopes": ["openid"]},
+        )
+        token = await ac.post("/api/v1/tokens", headers=admin_headers, json={"name": "mine", "token_type": "personal"})
+        role = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "support", "permissions": []}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations", headers=owner_headers, json={"email": "pending@example.com", "org_id": org_id}
+        )
+        for created in (flagged, quiet, token, role, invite):
+            assert created.status_code == 200
+        await approve_consent(
+            ac,
+            admin_headers,
+            {
+                "response_type": "code",
+                "client_id": flagged.json()["client_id"],
+                "redirect_uri": "https://app.example.com/callback",
+                "code_challenge": "abc",
+                "code_challenge_method": "plain",
+                "scope": "openid",
+                "audience": "x-api",
+            },
+        )
+
+    async with async_session_factory() as db:
+        owner = await db.get(User, owner_id)
+        owner.created_at = services.now_utc() - timedelta(days=30)
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    assert [row["email"] for row in sweep["accounts"]] == ["admin@corp.example.com"]
+    assert {(row["org"], row["role"]) for row in sweep["memberships"]} == {("example", "admin"), ("evil", "owner")}
+    assert [row["slug"] for row in sweep["owned_orgs"]] == ["evil"]
+    listed_clients = {row["client_id"] for row in sweep["clients"]}
+    assert flagged.json()["client_id"] in listed_clients
+    assert quiet.json()["client_id"] in listed_clients  # created since the cutoff
+    assert token.json()["id"] in {row["id"] for row in sweep["api_tokens"]}
+    assert [row["email"] for row in sweep["invitations"]] == ["pending@example.com"]
+    assert [row["client_id"] for row in sweep["oauth_grants"]] == [flagged.json()["client_id"]]
+    assert [row["name"] for row in sweep["roles"]] == ["support"]
+    assert "admin@corp.example.com" in {row["user"] for row in sweep["sessions"]}
+    assert all("token_hash" not in row and "secret" not in str(row) for rows in sweep.values() for row in rows)
+
+    async with async_session_factory() as db:
+        overscoped, _raw = await services.create_api_token(
+            db,
+            name="overscoped",
+            token_type_value="personal",
+            org_id=org_id,
+            user_id=admin_id,
+            project_id=None,
+            client_id=None,
+            scopes=["*"],
+            audiences=[],
+            expires_at=None,
+        )
+        await db.commit()
+    assert [item["id"] for item in await ops.overscoped_tokens()] == [overscoped.id]
+    assert await ops.overscoped_tokens(revoke=True, ids=["no-such-token"]) == []
+    assert await ops.overscoped_tokens(revoke=True, exclude_users=["admin@corp.example.com"]) == []
+    assert [item["id"] for item in await ops.overscoped_tokens()] == [overscoped.id]
+    revoked = await ops.overscoped_tokens(revoke=True, ids=[overscoped.id])
+    assert [item["id"] for item in revoked] == [overscoped.id]
+    assert await ops.overscoped_tokens() == []
+
+
+@pytest.mark.asyncio
+async def test_password_reset_revokes_sessions_and_api_tokens():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        session_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        token = await ac.post("/api/v1/tokens", headers=session_headers, json={"name": "cli", "token_type": "personal"})
+        token_headers = {"Authorization": f"Bearer {token.json()['token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 200
+        async with async_session_factory() as db:
+            user_id = owner.json()["user"]["id"]
+            code = await services.create_one_time_code(
+                db, email="owner@example.com", purpose="reset_password", user_id=user_id
+            )
+            await db.commit()
+        reset = await ac.post(
+            "/api/v1/auth/password/reset/confirm",
+            json={"email": "owner@example.com", "code": code, "new_password": "a brand new passphrase"},
+        )
+        assert reset.status_code == 200
+        ac.cookies.clear()
+        assert (await ac.get("/api/v1/auth/me", headers=session_headers)).status_code == 401
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": owner.json()["refresh_token"]})
+        assert refreshed.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_org_admins_cannot_take_over_owner_or_platform_admin_accounts(monkeypatch):
+    password = "correct horse battery"
+    new_password = {"Operations": [{"op": "replace", "path": "password", "value": "attacker chosen secret"}]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        attempts = (
+            ("patch", f"/scim/v2/Users/{owner_id}", new_password),
+            ("post", f"/api/v1/users/{owner_id}/mfa/totp/reset", None),
+            ("patch", f"/api/v1/users/{owner_id}", {"display_name": "Taken"}),
+            ("post", f"/api/v1/users/{owner_id}/delete", {"dry_run": True}),
+            ("post", f"/api/v1/users/{owner_id}/sessions/revoke", None),
+        )
+        for method, path, body in attempts:
+            response = await getattr(ac, method)(path, headers=admin_headers, **({"json": body} if body else {}))
+            assert response.status_code == 403, path
+        stolen = await ac.post(
+            "/api/v1/auth/login", json={"email": "owner@example.com", "password": "attacker chosen secret"}
+        )
+        assert stolen.status_code == 401
+
+        async with async_session_factory() as db:
+            roles = {(role.org_id, role.name): role.id for role in (await db.execute(select(Role))).scalars()}
+            second = Organization(name="Second", slug="second")
+            db.add(second)
+            await db.flush()
+            for name in ("owner", "admin"):
+                permissions = ["*"] if name == "owner" else ["admin:*", "auth:*"]
+                role = Role(org_id=second.id, name=name, permissions=permissions)
+                db.add(role)
+                await db.flush()
+                roles[(second.id, name)] = role.id
+            people = {}
+            for email, role_name in (("tenant-owner@example.com", "owner"), ("tenant-admin@example.com", "admin")):
+                user = await services.create_user(db, email=email, password=password)
+                db.add(Membership(org_id=second.id, user_id=user.id, role_id=roles[(second.id, role_name)]))
+                people[role_name] = user.id
+            platform = await services.create_user(db, email="platform@example.com", password=password)
+            await db.commit()
+        tenant_admin = await ac.post(
+            "/api/v1/auth/login", json={"email": "tenant-admin@example.com", "password": password}
+        )
+        tenant_headers = {"Authorization": f"Bearer {tenant_admin.json()['access_token']}"}
+        tenant_takeover = await ac.patch(f"/scim/v2/Users/{people['owner']}", headers=tenant_headers, json=new_password)
+        assert tenant_takeover.status_code == 403
+
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        adopted = await ac.post(
+            "/api/v1/users/provision", headers=admin_headers, json={"email": "platform@example.com", "org_id": org_id}
+        )
+        assert adopted.status_code == 403
+
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        member_id = member.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        reset = await ac.post(f"/api/v1/users/{member_id}/mfa/totp/reset", headers=owner_headers)
+        assert reset.status_code == 200
+        renamed = await ac.patch(f"/api/v1/users/{member_id}", headers=owner_headers, json={"display_name": "Co-owner"})
+        assert renamed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_consent_accepts_only_hosted_sessions():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid", "auth:*", "admin:*", "token:*"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:* admin:* token:*",
+            "audience": "x-api",
+        }
+        api_token = await ac.post(
+            "/api/v1/tokens", headers=owner_headers, json={"name": "narrow", "token_type": "personal"}
+        )
+        device = await ac.post(
+            "/oauth/device_authorization", json={"client_id": "gatekeeper-cli", "scope": "auth:read"}
+        )
+        await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=owner_headers,
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        product = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "client_id": app_client.json()["client_id"],
+            },
+        )
+        ac.cookies.clear()
+        outsiders = [api_token.json()["token"], cli.json()["access_token"], product.json()["access_token"]]
+
+        async def refused(raw: str) -> None:
+            headers = {"Authorization": f"Bearer {raw}"}
+            context = await ac.get("/api/v1/oauth/authorize/context", headers=headers, params=params)
+            assert context.status_code == 401
+            got = await ac.get("/oauth/authorize", headers=headers, params=params)
+            assert got.status_code == 302 and urlparse(got.headers["location"]).path == "/login"
+            posted = await ac.post(
+                "/oauth/authorize", headers=headers, json={**params, "approve": True, "consent_nonce": "0" * 64}
+            )
+            assert urlparse(posted.json()["redirect_to"]).path == "/login"
+
+        for raw in outsiders:
+            await refused(raw)
+        approved = await approve_consent(ac, owner_headers, params)
+        assert "code=" in approved
+        for raw in outsiders:
+            await refused(raw)
+        ac.cookies.clear()
+        remembered = await ac.get("/oauth/authorize", headers=owner_headers, params=params)
+        assert "code=" in remembered.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_clients_without_an_audience_need_a_platform_admin():
+    body = {"name": "Backend", "public": False, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        empty = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "scopes": ["auth:read"]})
+        assert empty.status_code == 403
+        own = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**body, "audiences": ["my-api"], "scopes": ["auth:read"]}
+        )
+        assert own.status_code == 200
+        cleared = await ac.patch(f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"audiences": []})
+        assert cleared.status_code == 403
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": own.json()["client_id"],
+                "client_secret": own.json()["client_secret"],
+            },
+        )
+        assert decode_access_token(service.json()["access_token"], audience="my-api")["aud"] == "my-api"
+        service_headers = {"Authorization": f"Bearer {service.json()['access_token']}"}
+        assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
+        platform = await ac.post("/api/v1/clients", headers=owner_headers, json={**body, "scopes": ["auth:read"]})
+        assert platform.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scim_group_add_cannot_demote_an_owner():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "co-owner@example.com", "password": "correct horse battery"})
+        member_id = member.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        roles = {role["name"]: role["id"] for role in (await ac.get("/api/v1/roles", headers=owner_headers)).json()}
+        demoted = await ac.patch(
+            f"/scim/v2/Groups/{roles['viewer']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member_id}]}]},
+        )
+        assert demoted.status_code == 403
+    async with async_session_factory() as db:
+        role_id = (
+            await db.execute(select(Membership.role_id).where(Membership.user_id == member_id))
+        ).scalar_one()
+    assert role_id == roles["owner"]
+
+
+@pytest.mark.asyncio
+async def test_only_owners_change_org_policy_or_prune_the_audit_log():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        for policy in (
+            {"audit_retention_days": 1},
+            {"trusted_device_mfa_bypass": True},
+            {"session_idle_timeout_minutes": 5},
+            {"allow_user_hard_delete": True},
+        ):
+            changed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json=policy)
+            assert changed.status_code == 403, policy
+        same = await ac.patch(
+            f"/api/v1/orgs/{org_id}", headers=admin_headers, json={"name": "Renamed", "require_mfa": False}
+        )
+        assert same.status_code == 200
+        retention = await ac.patch(f"/api/v1/orgs/{org_id}", headers=owner_headers, json={"audit_retention_days": 30})
+        assert retention.status_code == 200
+        prune = {"org_id": org_id, "dry_run": False}
+        assert (await ac.post("/api/v1/audit/prune", headers=admin_headers, json=prune)).status_code == 403
+        assert (await ac.post("/api/v1/audit/prune", headers=owner_headers, json=prune)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_consent_post_without_a_session_returns_to_the_same_authorize_request():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid",
+            "audience": "x-api",
+            "state": "keep-me",
+        }
+        ac.cookies.clear()
+        posted = await ac.post("/oauth/authorize", json={**params, "approve": True, "consent_nonce": "0" * 64})
+        login = urlparse(posted.json()["redirect_to"])
+        assert login.path == "/login"
+        resume = parse_qs(login.query)["redirect"][0]
+        assert "approve" not in resume and "consent_nonce" not in resume
+        resumed = await ac.get(resume, headers=owner_headers)
+        assert resumed.status_code == 302
+        consent = urlparse(resumed.headers["location"])
+        assert consent.path == "/authorize"
+        assert parse_qs(consent.query)["state"] == ["keep-me"]
+
+
+@pytest.mark.asyncio
+async def test_migration_turns_off_email_linking_on_existing_providers():
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.models import OAuthProvider
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20261105_0023_disable_email_linking.py"
+    spec = importlib.util.spec_from_file_location("migration_0023", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    async with async_session_factory() as db:
+        db.add(
+            OAuthProvider(
+                provider_id="legacy",
+                name="Legacy",
+                authorization_url="https://login.example.com/authorize",
+                token_url="https://login.example.com/token",
+                userinfo_url="https://login.example.com/userinfo",
+                allow_email_linking=True,
+            )
+        )
+        await db.commit()
+
+    def upgrade(connection) -> None:
+        with Operations.context(MigrationContext.configure(connection)):
+            migration.upgrade()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(upgrade)
+    async with async_session_factory() as db:
+        assert (await db.execute(select(OAuthProvider.allow_email_linking))).scalars().all() == [False]
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_lists_new_and_audience_less_clients_and_recent_changes():
+    body = {"name": "App", "public": True, "redirect_uris": ["https://app.example.com/callback"], "scopes": ["openid"]}
+    async with await client() as ac:
+        owner_headers, _admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        created = {}
+        for name, audiences in (("new", ["plain-api"]), ("empty", []), ("old", ["quiet-api"])):
+            response = await ac.post(
+                "/api/v1/clients", headers=owner_headers, json={**body, "name": name, "audiences": audiences}
+            )
+            assert response.status_code == 200
+            created[name] = response.json()
+        role = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "support", "permissions": []}
+        )
+        assert role.status_code == 200
+    long_ago = services.now_utc() - timedelta(days=30)
+    async with async_session_factory() as db:
+        for user in (await db.execute(select(User))).scalars():
+            user.created_at = long_ago
+        for name in ("empty", "old"):
+            row = (
+                await db.execute(select(main_module.AuthClient).where(main_module.AuthClient.id == created[name]["id"]))
+            ).scalar_one()
+            row.created_at = long_ago
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    listed = {row["client_id"] for row in sweep["clients"]}
+    assert created["new"]["client_id"] in listed
+    assert created["empty"]["client_id"] in listed
+    assert created["old"]["client_id"] not in listed
+    actions = {row["action"] for row in sweep["audit_events"]}
+    assert {"client.create", "role.create", "user.membership.update"} <= actions
+    assert "auth.login" not in actions
+
+
+@pytest.mark.asyncio
+async def test_rotating_an_api_token_rechecks_its_bindings():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": other.json()["id"]}
+        )
+        project = await ac.post(
+            "/api/v1/projects",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"org_id": other.json()["id"], "name": "Theirs", "slug": "theirs", "audience": "their-api"},
+        )
+        assert project.status_code == 200
+        async with async_session_factory() as db:
+            legacy, _raw = await services.create_api_token(
+                db,
+                name="legacy",
+                token_type_value="service",
+                org_id=org_id,
+                user_id=None,
+                project_id=project.json()["id"],
+                client_id=None,
+                scopes=["auth:read"],
+                audiences=["their-api"],
+                expires_at=None,
+            )
+            await db.commit()
+        rotated = await ac.post(f"/api/v1/tokens/{legacy.id}/rotate", headers=owner_headers)
+        assert rotated.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_platform_admins_may_assign_any_role(monkeypatch):
+    async with await client() as ac:
+        _owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "member@example.com", "password": "correct horse battery"})
+        monkeypatch.setattr(settings, "platform_admin_user_ids", admin_id)
+        promoted = await ac.put(
+            f"/api/v1/users/{member.json()['user']['id']}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_password_reset_and_change_close_pending_codes_grants_and_tokens():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid",
+            "audience": "x-api",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+        await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=owner_headers,
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        async with async_session_factory() as db:
+            reset_code = await services.create_one_time_code(
+                db, email="owner@example.com", purpose="reset_password", user_id=owner.json()["user"]["id"]
+            )
+            await db.commit()
+        reset = await ac.post(
+            "/api/v1/auth/password/reset/confirm",
+            json={"email": "owner@example.com", "code": reset_code, "new_password": "a brand new passphrase"},
+        )
+        assert reset.status_code == 200
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": app_client.json()["client_id"],
+                "redirect_uri": "https://app.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        assert exchanged.status_code == 400
+        polled = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert polled.status_code == 400
+
+        ac.cookies.clear()
+        login = {"email": "owner@example.com", "password": "a brand new passphrase"}
+        current = (await ac.post("/api/v1/auth/login", json=login)).json()["access_token"]
+        other = (await ac.post("/api/v1/auth/login", json=login)).json()["access_token"]
+        ac.cookies.clear()
+        api_token = await ac.post(
+            "/api/v1/tokens",
+            headers={"Authorization": f"Bearer {current}"},
+            json={"name": "cli", "token_type": "personal"},
+        )
+        changed = await ac.post(
+            "/api/v1/auth/password/change",
+            headers={"Authorization": f"Bearer {current}"},
+            json={"current_password": "a brand new passphrase", "new_password": "another new passphrase"},
+        )
+        assert changed.status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {current}"})).status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {other}"})).status_code == 401
+        token_headers = {"Authorization": f"Bearer {api_token.json()['token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_client_tokens_never_fall_back_to_the_issuer_audience():
+    from jose import jwt as jose_jwt
+
+    mcp = {
+        "name": "MCP",
+        "redirect_uris": ["https://mcp.example.com/callback"],
+        "audiences": [],
+        "mcp_resource_uri": "https://mcp.example.com/mcp",
+        "scopes": ["openid", "auth:read"],
+    }
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        mcp_only = await ac.post("/api/v1/clients", headers=admin_headers, json={**mcp, "public": True})
+        assert mcp_only.status_code == 403
+        own = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**mcp, "public": True, "audiences": ["mine-api"]}
+        )
+        emptied = await ac.patch(
+            f"/api/v1/clients/{own.json()['id']}",
+            headers=admin_headers,
+            json={"audiences": [], "mcp_resource_uri": "https://mcp.example.com/mcp"},
+        )
+        assert emptied.status_code == 403
+
+        public = await ac.post("/api/v1/clients", headers=owner_headers, json={**mcp, "public": True})
+        params = {
+            "response_type": "code",
+            "client_id": public.json()["client_id"],
+            "redirect_uri": "https://mcp.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": public.json()["client_id"],
+                "redirect_uri": "https://mcp.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        app_token = exchanged.json()["access_token"]
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(app_token)["aud"])
+        app_headers = {"Authorization": f"Bearer {app_token}"}
+        assert (await ac.get("/api/v1/oauth/authorize/context", headers=app_headers, params=params)).status_code == 401
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": exchanged.json()["refresh_token"]})
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(refreshed.json()["access_token"])["aud"])
+
+        confidential = await ac.post("/api/v1/clients", headers=owner_headers, json={**mcp, "public": False})
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": confidential.json()["client_id"],
+                "client_secret": confidential.json()["client_secret"],
+            },
+        )
+        service_headers = {"Authorization": f"Bearer {service.json()['access_token']}"}
+        assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
+        assert "code=" in await approve_consent(ac, owner_headers, params)
+
+
+@pytest.mark.asyncio
+async def test_app_sessions_stored_with_the_issuer_audience_refresh_to_the_client_audience():
+    from jose import jwt as jose_jwt
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        created = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "MCP",
+                "public": True,
+                "redirect_uris": ["https://mcp.example.com/callback"],
+                "audiences": [],
+                "mcp_resource_uri": "https://mcp.example.com/mcp",
+                "scopes": ["openid", "auth:read"],
+            },
+        )
+        client_id = created.json()["client_id"]
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": "https://mcp.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "redirect_uri": "https://mcp.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        session_id = jose_jwt.get_unverified_claims(exchanged.json()["access_token"])["session_id"]
+        async with async_session_factory() as db:
+            stored = await db.get(Session, session_id)
+            stored.audience = settings.issuer  # an app session stored before the deploy
+            await db.commit()
+        ac.cookies.clear()
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": exchanged.json()["refresh_token"]})
+        assert refreshed.status_code == 200
+        app_token = refreshed.json()["access_token"]
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(app_token)["aud"])
+        app_headers = {"Authorization": f"Bearer {app_token}"}
+        assert (await ac.get("/api/v1/oauth/authorize/context", headers=app_headers, params=params)).status_code == 401
+
+        hosted = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "client_id": client_id,
+                "audience": settings.issuer,
+            },
+        )
+        ac.cookies.clear()
+        hosted_refresh = await ac.post("/api/v1/auth/refresh", json={"refresh_token": hosted.json()["refresh_token"]})
+        hosted_token = hosted_refresh.json()["access_token"]
+        assert jose_jwt.get_unverified_claims(hosted_token)["aud"] == settings.issuer
+        hosted_context = await ac.get(
+            "/api/v1/oauth/authorize/context", headers={"Authorization": f"Bearer {hosted_token}"}, params=params
+        )
+        assert hosted_context.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_device_grants_need_a_hosted_approver_and_a_public_or_authenticated_client():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        owner_id = owner.json()["user"]["id"]
+
+        async def start_and_approve(headers: dict[str, str]):
+            device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+            approved = await ac.post(
+                "/api/v1/auth/device/approve",
+                headers=headers,
+                json={"user_code": device.json()["user_code"], "approve": True},
+            )
+            return device, approved
+
+        device, approved = await start_and_approve(owner_headers)
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        pat = await ac.post("/api/v1/tokens", headers=owner_headers, json={"name": "pat", "token_type": "personal"})
+        ac.cookies.clear()
+        for raw in (cli.json()["access_token"], pat.json()["token"]):
+            _device, refused = await start_and_approve({"Authorization": f"Bearer {raw}"})
+            assert refused.status_code == 401
+            options = await ac.post(
+                "/api/v1/auth/device/passkey/options",
+                headers={"Authorization": f"Bearer {raw}"},
+                json={"user_code": _device.json()["user_code"]},
+            )
+            assert options.status_code == 401
+
+        confidential = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "Backend",
+                "public": False,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["backend-api"],
+                "scopes": ["openid", "auth:read"],
+            },
+        )
+        started = await ac.post("/oauth/device_authorization", json={"client_id": confidential.json()["client_id"]})
+        assert started.status_code == 400
+        async with async_session_factory() as db:
+            db.add(
+                main_module.DeviceGrant(
+                    device_code_hash=security.token_hash("gkd_legacy"),
+                    user_code_hash=security.token_hash("LEGACY-CODE"),
+                    user_code_hint="LEGA",
+                    client_id=confidential.json()["id"],
+                    scope="openid",
+                    user_id=owner_id,
+                    amr=["pwd"],
+                    expires_at=services.now_utc() + timedelta(minutes=5),
+                    approved_at=services.now_utc(),
+                )
+            )
+            await db.commit()
+        exchange = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": "gkd_legacy",
+            "client_id": confidential.json()["client_id"],
+        }
+        assert (await ac.post("/oauth/token", data=exchange)).status_code == 401
+        assert (await ac.post("/oauth/token", data={**exchange, "client_secret": "wrong"})).status_code == 401
+        secret = confidential.json()["client_secret"]
+        assert (await ac.post("/oauth/token", data={**exchange, "client_secret": secret})).status_code == 200
+
+
+async def second_tenant_with_admin(ac: AsyncClient, password: str = "correct horse battery"):
+    """A second org whose only member is its admin, who is not a platform admin."""
+    async with async_session_factory() as db:
+        tenant = Organization(name="Tenant", slug="tenant")
+        db.add(tenant)
+        await db.flush()
+        roles = await services.add_default_org_roles(db, tenant)
+        admin = await services.create_user(db, email="tenant-admin@example.com", password=password)
+        db.add(Membership(org_id=tenant.id, user_id=admin.id, role_id=roles["admin"].id))
+        await db.commit()
+        tenant_id, role_ids = tenant.id, {name: role.id for name, role in roles.items()}
+    login = await ac.post("/api/v1/auth/login", json={"email": "tenant-admin@example.com", "password": password})
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}, tenant_id, role_ids
+
+
+@pytest.mark.asyncio
+async def test_tenant_admins_cannot_pull_existing_accounts_into_their_org(monkeypatch):
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        owner_id = owner.json()["user"]["id"]
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            orphan = await services.create_user(db, email="orphan@example.com", password="correct horse battery")
+            platform = await services.create_user(db, email="platform@example.com", password="correct horse battery")
+            await db.commit()
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        for user_id in (owner_id, orphan.id, platform.id):
+            pulled = await ac.put(
+                f"/api/v1/users/{user_id}/membership",
+                headers=tenant_headers,
+                json={"org_id": tenant_id, "role": "viewer", "status": "active"},
+            )
+            assert pulled.status_code == 403, user_id
+        assert (await ac.get("/api/v1/auth/me", headers=owner_headers)).status_code == 200
+
+        async with async_session_factory() as db:
+            db.add(Membership(org_id=tenant_id, user_id=owner_id, role_id=tenant_roles["viewer"]))
+            await db.commit()
+        touched = await ac.put(
+            f"/api/v1/users/{owner_id}/membership",
+            headers=tenant_headers,
+            json={"org_id": tenant_id, "role": "viewer", "status": "active"},
+        )
+        assert touched.status_code == 403
+        assert (await ac.get("/api/v1/auth/me", headers=owner_headers)).status_code == 200
+
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        adopted = await ac.put(
+            f"/api/v1/users/{orphan.id}/membership",
+            headers=owner_headers,
+            json={"org_id": bootstrap_id, "role": "viewer", "status": "active"},
+        )
+        assert adopted.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scim_deactivation_cannot_disable_platform_admins_or_owners(monkeypatch):
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            platform = await services.create_user(db, email="platform@example.com", password="correct horse battery")
+            tenant_owner = await services.create_user(db, email="t-owner@example.com", password="correct horse battery")
+            db.add(Membership(org_id=tenant_id, user_id=platform.id, role_id=tenant_roles["viewer"]))
+            db.add(Membership(org_id=tenant_id, user_id=tenant_owner.id, role_id=tenant_roles["owner"]))
+            await db.commit()
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        deactivate = {"Operations": [{"op": "replace", "path": "active", "value": False}]}
+        for user_id in (platform.id, tenant_owner.id):
+            patched = await ac.patch(f"/scim/v2/Users/{user_id}", headers=tenant_headers, json=deactivate)
+            assert patched.status_code == 403, user_id
+            deleted = await ac.delete(f"/scim/v2/Users/{user_id}", headers=tenant_headers)
+            assert deleted.status_code == 403, user_id
+    async with async_session_factory() as db:
+        disabled = dict((await db.execute(select(User.email, User.disabled))).all())
+    assert disabled["platform@example.com"] is False
+    assert disabled["t-owner@example.com"] is False
+
+
+@pytest.mark.asyncio
+async def test_scim_cannot_revoke_or_rename_an_owner_who_joined_a_tenant():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_id = owner.json()["user"]["id"]
+        await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": password})
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            db.add(Membership(org_id=tenant_id, user_id=owner_id, role_id=tenant_roles["viewer"]))
+            await db.commit()
+
+        async def live_sessions() -> int:
+            async with async_session_factory() as db:
+                live = select(Session.id).where(Session.user_id == owner_id, Session.revoked_at.is_(None))
+                return len((await db.execute(live)).all())
+
+        assert await live_sessions() == 2
+        members = [{"value": owner_id}]
+        removed = await ac.patch(
+            f"/scim/v2/Groups/{tenant_roles['viewer']}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "remove", "path": "members", "value": members}]},
+        )
+        assert removed.status_code == 403
+        moved = await ac.patch(
+            f"/scim/v2/Groups/{tenant_roles['admin']}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": members}]},
+        )
+        assert moved.status_code == 403
+        deleted = await ac.delete(f"/scim/v2/Users/{owner_id}", headers=tenant_headers)
+        assert deleted.status_code == 403
+        renamed = await ac.patch(
+            f"/scim/v2/Users/{owner_id}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "replace", "path": "displayName", "value": "Taken Over"}]},
+        )
+        assert renamed.status_code == 403
+        assert await live_sessions() == 2
+    async with async_session_factory() as db:
+        assert (await db.get(User, owner_id)).display_name != "Taken Over"
+        status = await db.scalar(
+            select(Membership.status).where(Membership.user_id == owner_id, Membership.org_id == tenant_id)
+        )
+        assert status == "active"
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_flags_mcp_only_clients():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        created = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={
+                "name": "MCP",
+                "public": True,
+                "redirect_uris": ["https://mcp.example.com/callback"],
+                "audiences": [],
+                "mcp_resource_uri": "https://mcp.example.com/mcp",
+                "scopes": ["openid"],
+            },
+        )
+        assert created.status_code == 200
+    long_ago = services.now_utc() - timedelta(days=30)
+    async with async_session_factory() as db:
+        row = await db.get(main_module.AuthClient, created.json()["id"])
+        row.created_at = long_ago
+        for user in (await db.execute(select(User))).scalars():
+            user.created_at = long_ago
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    assert sweep["owned_orgs"] == []
+    assert created.json()["client_id"] in {row["client_id"] for row in sweep["clients"]}
+
+
+@pytest.mark.asyncio
+async def test_star_scope_cannot_revoke_sessions_in_other_orgs():
+    password = "correct horse battery"
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": password})
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        member_session = decode_access_token(member.json()["access_token"])["session_id"]
+        async with async_session_factory() as db:
+            tenant = Organization(name="Tenant", slug="tenant")
+            db.add(tenant)
+            await db.flush()
+            roles = await services.add_default_org_roles(db, tenant)
+            tenant_owner = await services.create_user(db, email="t-owner@example.com", password=password)
+            db.add(Membership(org_id=tenant.id, user_id=tenant_owner.id, role_id=roles["owner"].id))
+            await db.commit()
+        login = await ac.post("/api/v1/auth/login", json={"email": "t-owner@example.com", "password": password})
+        assert login.json()["scope"] == "*"
+        revoked = await ac.delete(
+            f"/api/v1/sessions/{member_session}", headers={"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
+        assert revoked.status_code in (403, 404)
+        member_headers = {"Authorization": f"Bearer {member.json()['access_token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=member_headers)).status_code == 200

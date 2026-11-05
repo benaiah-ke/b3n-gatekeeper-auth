@@ -11,7 +11,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import ApiToken, AuthClient, Membership, Role, Session, User
 from app.security import decode_access_token, now_utc, token_hash
-from app.services import enforce_session_idle_timeout
+from app.services import effective_api_token_scopes, enforce_session_idle_timeout
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -48,18 +48,22 @@ async def current_principal(
             not api_token
             or api_token.revoked_at
             or (api_token.expires_at and api_token.expires_at <= now_utc())
+            or (api_token.audiences and not settings.gatekeeper_audience_set.intersection(api_token.audiences))
         ):
             raise HTTPException(status_code=401, detail="Invalid API token")
         if api_token.user_id:
             user = await db.get(User, api_token.user_id)
             if not user or user.disabled:
                 raise HTTPException(status_code=401, detail="Invalid API token")
+        scopes = await effective_api_token_scopes(db, api_token)
+        if scopes is None:
+            raise HTTPException(status_code=401, detail="Invalid API token")
         api_token.last_used_at = now_utc()
         await db.commit()
         return Principal(
             subject=api_token.user_id or api_token.client_id or api_token.id,
             auth_type=api_token.token_type,
-            scopes=api_token.scopes or [],
+            scopes=scopes,
             org_id=api_token.org_id,
             user_id=api_token.user_id,
             token_id=api_token.id,
@@ -69,6 +73,11 @@ async def current_principal(
         claims = decode_access_token(raw)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
+    # Tokens minted for other resource servers (sentinel-api, product APIs) are not GateKeeper credentials.
+    audience = claims.get("aud")
+    audiences = {audience} if isinstance(audience, str) else set(audience or [])
+    if not settings.gatekeeper_audience_set.intersection(audiences):
+        raise HTTPException(status_code=401, detail="Invalid access token")
     scope = str(claims.get("scope", "")).split()
     token_type = str(claims.get("token_type", "access"))
     subject = str(claims.get("sub", ""))

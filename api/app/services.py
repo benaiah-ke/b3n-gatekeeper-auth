@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ipaddress
+import logging
 import secrets
 import smtplib
 import ssl
@@ -12,11 +14,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts import send_security_alert
 from app.config import settings
 from app.models import (
     ApiToken,
     AuditEvent,
     AuthClient,
+    InstallClaim,
     Membership,
     OneTimeCode,
     Organization,
@@ -26,6 +30,7 @@ from app.models import (
     Session,
     User,
     WebAuthnCredential,
+    uuid_str,
 )
 from app.schemas import OrgRead, UserRead
 from app.security import (
@@ -40,6 +45,8 @@ from app.security import (
     verify_password,
 )
 
+logger = logging.getLogger("gatekeeper")
+SIGNUP_CLOSED_DETAIL = "Sign up is closed. Ask an administrator to invite you."
 MFA_AMR_VALUES = {"otp", "recovery", "webauthn"}
 TRUSTED_DEVICE_AMR = "trusted_device"
 DEFAULT_ORG_ROLES = [
@@ -48,6 +55,52 @@ DEFAULT_ORG_ROLES = [
     ("operator", ["auth:read", "token:*", "mcp:*"]),
     ("viewer", ["auth:read"]),
 ]
+# OIDC identity scopes carry no permissions, so role capping lets them through.
+IDENTITY_SCOPES = {"openid", "profile", "email", "offline_access"}
+# Self-service baseline for sessions that are not bound to an organization.
+BASELINE_PERMISSIONS = ["auth:read"]
+PRIVILEGED_ROLES = {"owner", "admin", "operator"}
+SECURITY_ALERT_SUBJECTS = {
+    "user.create": "User created",
+    "org.create": "Organization created",
+    "client.create": "OAuth client created",
+    "client.update": "OAuth client updated",
+    "client.secret.rotate": "OAuth client secret rotated",
+    "mfa.totp.disable": "Authenticator MFA disabled",
+    "user.mfa.totp.reset": "Authenticator MFA reset by an admin",
+    "mfa.passkey.revoke": "Passkey removed",
+    "mfa.totp.enable": "Authenticator MFA added",
+    "mfa.passkey.register": "Passkey added",
+    "auth.signup.refused": "Signup refused",
+    "auth.email_code.refused": "Email code refused",
+    "auth.invitation.refused": "Invitation signup refused",
+    "auth.oauth.signup.refused": "Federated signup refused",
+    "auth.login.new_ip": "Privileged login from a new IP",
+    "org.owner.missing": "Bootstrap organization has no owner",
+    "org.owner.bootstrap": "Bootstrap owner set by an operator",
+}
+ROLE_ALERT_ACTIONS = {
+    "user.membership.update",
+    "user.provision",
+    "invitation.accept",
+    "scim.user.upsert",
+    "scim.user.replace",
+    "scim.user.patch",
+}
+# Only these audit detail keys are copied into alert emails, so secrets never leave the database.
+ALERT_DETAIL_KEYS = (
+    "email",
+    "role",
+    "roles",
+    "scopes",
+    "token_type",
+    "client_id",
+    "audiences",
+    "public",
+    "provider",
+    "purpose",
+    "signup_mode",
+)
 
 
 def amr_satisfies_mfa(amr: list[str] | None) -> bool:
@@ -85,12 +138,110 @@ def trusted_device_mfa_bypass_allowed(client: AuthClient | None, org: Organizati
     return True
 
 
+def scope_granted(scope: str, permissions: list[str]) -> bool:
+    granted = set(permissions)
+    if scope in IDENTITY_SCOPES or "*" in granted or scope in granted:
+        return True
+    prefix, separator, _rest = scope.partition(":")
+    return bool(separator) and f"{prefix}:*" in granted
+
+
+def cap_scopes(requested: list[str], permissions: list[str]) -> list[str]:
+    return [scope for scope in dict.fromkeys(requested) if scope_granted(scope, permissions)]
+
+
+def capped_session_scopes(requested: list[str], selected_org: OrgRead | None) -> list[str]:
+    permissions = (selected_org.permissions or []) if selected_org else BASELINE_PERMISSIONS
+    return cap_scopes(requested, permissions) or cap_scopes(BASELINE_PERMISSIONS, permissions)
+
+
+async def effective_api_token_scopes(db: AsyncSession, token: ApiToken) -> list[str] | None:
+    """Scopes a user-owned API token may use now: its stored scopes capped to the owner's current role in the token's
+    org (the self-service baseline when it has no org). None when the owner is no longer an active member there."""
+    if not token.user_id:
+        return list(token.scopes or [])
+    if not token.org_id:
+        return cap_scopes(token.scopes or [], BASELINE_PERMISSIONS)
+    result = await db.execute(
+        select(Role.permissions)
+        .join(Membership, Membership.role_id == Role.id)
+        .where(Membership.user_id == token.user_id, Membership.org_id == token.org_id, Membership.status == "active")
+    )
+    row = result.first()
+    return None if row is None else cap_scopes(token.scopes or [], row[0] or [])
+
+
 def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = None) -> list[str]:
     selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
     derived_scopes = set(selected_org.permissions if selected_org else [])
     if not derived_scopes:
         derived_scopes = {permission for org in memberships for permission in org.permissions}
     return sorted(derived_scopes or {"auth:read"})
+
+
+def _trusted_proxy(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(address in network for network in settings.trusted_proxy_networks)
+
+
+def client_ip(request: Request | None) -> str | None:
+    """Real client IP. X-Forwarded-For counts only when the TCP peer is a trusted proxy, and then the
+    rightmost entry that is not itself a trusted proxy wins, so client-supplied entries are ignored.
+    CF-Connecting-IP is never trusted."""
+    if not request or not request.client:
+        return None
+    peer = request.client.host
+    try:
+        if not _trusted_proxy(ipaddress.ip_address(peer)):
+            return peer
+    except ValueError:
+        return peer
+    entries = [item.strip() for item in request.headers.get("x-forwarded-for", "").split(",") if item.strip()]
+    for entry in reversed(entries):
+        try:
+            address = ipaddress.ip_address(entry)
+        except ValueError:
+            return peer
+        if not _trusted_proxy(address):
+            return str(address)
+    return entries[0] if entries else peer
+
+
+def security_alert_subject(action: str, details: dict[str, Any]) -> str | None:
+    if action in SECURITY_ALERT_SUBJECTS:
+        return SECURITY_ALERT_SUBJECTS[action]
+    if action == "user.provision" and details.get("created_user"):
+        return "User created"
+    role = details.get("role")
+    if action in ROLE_ALERT_ACTIONS and role in PRIVILEGED_ROLES and details.get("membership_changed", True):
+        return f"Role set to {role}"
+    group = details.get("display_name")
+    if action.startswith("scim.group.") and group in PRIVILEGED_ROLES and details.get("changed_members"):
+        return f"Role set to {group}"
+    if action in {"token.create", "token.rotate"} and set(details.get("scopes") or []) - {"auth:read"}:
+        return "API token created"
+    return None
+
+
+async def queue_security_alert(db: AsyncSession, event: AuditEvent, subject: str) -> None:
+    actor = await db.get(User, event.actor_user_id) if event.actor_user_id else None
+    now = now_utc()
+    key = f"gatekeeper-{event.id}"
+    if event.action.endswith(".refused"):
+        # One email per source IP per hour, however many attempts it makes.
+        key = f"gatekeeper-{event.action}-{event.ip_address or 'unknown'}-{now:%Y%m%d%H}"
+    lines = [
+        f"Action: {event.action}",
+        f"Actor: {actor.email if actor else 'none'}",
+        f"Target: {event.target_type or '-'} {event.target_id or ''}".rstrip(),
+        f"Organization: {event.org_id or '-'}",
+        f"Client IP: {event.ip_address or 'unknown'}",
+        f"Time (UTC): {now:%Y-%m-%d %H:%M:%S}",
+    ]
+    for detail_key in ALERT_DETAIL_KEYS:
+        value = (event.details or {}).get(detail_key)
+        if value not in (None, "", []):
+            lines.append(f"{detail_key}: {', '.join(map(str, value)) if isinstance(value, list) else value}")
+    send_security_alert(subject, lines, key)
 
 
 async def audit(
@@ -104,17 +255,20 @@ async def audit(
     details: dict[str, Any] | None = None,
     request: Request | None = None,
 ) -> None:
-    db.add(
-        AuditEvent(
-            org_id=org_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            target_type=target_type,
-            target_id=target_id,
-            ip_address=request.client.host if request and request.client else None,
-            details=details or {},
-        )
+    event = AuditEvent(
+        id=uuid_str(),
+        org_id=org_id,
+        actor_user_id=actor_user_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        ip_address=client_ip(request),
+        details=details or {},
     )
+    db.add(event)
+    subject = security_alert_subject(action, details or {})
+    if subject:
+        await queue_security_alert(db, event, subject)
 
 
 async def enforce_rate_limit(
@@ -223,7 +377,7 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     org = result.scalar_one_or_none()
     if org:
         await ensure_default_clients(db, org)
-        await ensure_bootstrap_owner(db, org)
+        await report_missing_bootstrap_owner(db, org)
         await db.commit()
         return org
 
@@ -233,7 +387,7 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     await add_default_org_roles(db, org)
     await audit(db, "org.bootstrap", org_id=org.id, target_type="organization", target_id=org.id)
     await ensure_default_clients(db, org)
-    await ensure_bootstrap_owner(db, org)
+    await report_missing_bootstrap_owner(db, org)
     await db.commit()
     return org
 
@@ -262,51 +416,22 @@ async def org_has_owner(db: AsyncSession, org_id: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def ensure_bootstrap_owner(db: AsyncSession, org: Organization) -> bool:
+async def report_missing_bootstrap_owner(db: AsyncSession, org: Organization) -> None:
+    """Never promote anyone automatically. An ownerless bootstrap org with members is an incident
+    for an operator to resolve with `python -m app.ops bootstrap-owner --email ...`."""
     if await org_has_owner(db, org.id):
-        return False
-
-    role_result = await db.execute(select(Role).where(Role.org_id == org.id, Role.name == "owner"))
-    owner_role = role_result.scalar_one_or_none()
-    if not owner_role:
-        return False
-
-    bootstrap_email = str(settings.bootstrap_admin_email).lower()
-    candidate_result = await db.execute(
-        select(Membership)
-        .join(User, User.id == Membership.user_id)
-        .where(
-            Membership.org_id == org.id,
-            Membership.status == "active",
-            User.email == bootstrap_email,
-        )
-        .order_by(Membership.created_at.asc())
-        .limit(1)
+        return
+    member = await db.execute(
+        select(Membership.id).where(Membership.org_id == org.id, Membership.status == "active").limit(1)
     )
-    candidate = candidate_result.scalar_one_or_none()
-    if not candidate:
-        candidate_result = await db.execute(
-            select(Membership)
-            .where(Membership.org_id == org.id, Membership.status == "active")
-            .order_by(Membership.created_at.asc())
-            .limit(1)
-        )
-        candidate = candidate_result.scalar_one_or_none()
-
-    if not candidate:
-        return False
-
-    candidate.role_id = owner_role.id
-    await audit(
-        db,
-        "org.owner.bootstrap",
-        org_id=org.id,
-        actor_user_id=candidate.user_id,
-        target_type="membership",
-        target_id=candidate.id,
-        details={"reason": "no_active_owner"},
+    if member.scalar_one_or_none() is None:
+        return
+    logger.warning(
+        "Bootstrap organization %s has active members but no active owner; "
+        "run python -m app.ops bootstrap-owner --email <owner email>",
+        org.slug,
     )
-    return True
+    await audit(db, "org.owner.missing", org_id=org.id, target_type="organization", target_id=org.id)
 
 
 async def ensure_default_clients(db: AsyncSession, org: Organization) -> None:
@@ -365,6 +490,7 @@ async def create_user(
     existing = await db.execute(select(User).where(User.email == normalized))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already exists")
+    first_user = (await db.execute(select(User.id).limit(1))).scalar_one_or_none() is None
     user = User(
         email=normalized,
         display_name=display_name,
@@ -373,26 +499,33 @@ async def create_user(
     )
     db.add(user)
     await db.flush()
+    if first_user:
+        # The primary key lets exactly one concurrent signup claim the empty install.
+        db.add(InstallClaim(name="first-owner", user_id=user.id))
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL) from None
 
-    bootstrap_org = await ensure_bootstrap(db)
-    needs_first_owner = not await org_has_owner(db, bootstrap_org.id)
-    if normalized == str(settings.bootstrap_admin_email).lower() or needs_first_owner:
-        role_name = "owner"
-    else:
-        role_name = "viewer"
-    result = await db.execute(
-        select(Role).where(Role.org_id == bootstrap_org.id, Role.name == role_name)
-    )
-    role = result.scalar_one()
-    db.add(Membership(org_id=bootstrap_org.id, user_id=user.id, role_id=role.id, status="active"))
+    # New accounts get no organization by default. Only the first owner of an empty install, or the
+    # configured bootstrap admin while the bootstrap org has no owner, joins the bootstrap org.
+    bootstrap_org_id = None
+    if first_user or normalized == str(settings.bootstrap_admin_email).lower():
+        bootstrap_org = await ensure_bootstrap(db)
+        if first_user or not await org_has_owner(db, bootstrap_org.id):
+            result = await db.execute(select(Role).where(Role.org_id == bootstrap_org.id, Role.name == "owner"))
+            role = result.scalar_one()
+            db.add(Membership(org_id=bootstrap_org.id, user_id=user.id, role_id=role.id, status="active"))
+            bootstrap_org_id = bootstrap_org.id
     await audit(
         db,
         "user.create",
-        org_id=bootstrap_org.id,
+        org_id=bootstrap_org_id,
         actor_user_id=user.id,
         target_type="user",
         target_id=user.id,
-        details={"role": role_name, "first_owner": needs_first_owner},
+        details={"role": "owner" if bootstrap_org_id else None, "first_owner": first_user},
     )
     await db.commit()
     await db.refresh(user)
@@ -421,7 +554,7 @@ async def create_session_tokens(
     device_id_hash: str | None = None,
     trusted_at=None,
     trusted_until=None,
-) -> tuple[str, str, Session, RefreshToken]:
+) -> tuple[str, str, Session, RefreshToken, list[str]]:
     memberships = await org_roles(db, user.id)
     if org_id is None and bind_default_org:
         org_id = memberships[0].id if memberships else None
@@ -430,6 +563,31 @@ async def create_session_tokens(
         raise HTTPException(status_code=403, detail="Organization membership required")
     if scopes is None:
         scopes = derive_membership_scopes(memberships, org_id)
+    scopes = capped_session_scopes(scopes, selected_org)
+    audience = audience or (client_default_audience(client) if client else settings.issuer)
+    login_ip = client_ip(request)
+    privileged_roles = sorted({org.role for org in memberships if org.role in PRIVILEGED_ROLES})
+    if login_ip and privileged_roles:
+        seen = await db.execute(
+            select(Session.id)
+            .where(
+                Session.user_id == user.id,
+                Session.ip_address == login_ip,
+                Session.created_at >= now_utc() - timedelta(days=30),
+            )
+            .limit(1)
+        )
+        if seen.scalar_one_or_none() is None:
+            await audit(
+                db,
+                "auth.login.new_ip",
+                org_id=org_id,
+                actor_user_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                details={"roles": privileged_roles},
+                request=request,
+            )
     session_secret = new_opaque_token("gks")
     refresh_secret = new_opaque_token("gkr")
     issued_at = now_utc()
@@ -439,9 +597,11 @@ async def create_session_tokens(
         client_id=client.id if client else None,
         token_hash=token_hash(session_secret),
         device_id_hash=device_id_hash,
-        ip_address=request.client.host if request and request.client else None,
+        ip_address=login_ip,
         user_agent=request.headers.get("user-agent") if request else None,
         amr=list(amr or []),
+        scopes=scopes,
+        audience=audience or settings.issuer,
         trusted_at=trusted_at,
         trusted_until=trusted_until,
         last_seen_at=issued_at,
@@ -469,6 +629,7 @@ async def create_session_tokens(
     }
     if amr:
         extra_claims["amr"] = amr
+    extra_claims["roles"] = [selected_org.role] if selected_org and selected_org.role else []
     if selected_org:
         extra_claims.update(
             {
@@ -480,13 +641,13 @@ async def create_session_tokens(
     access = create_access_token(
         subject=user.id,
         audience=audience or settings.issuer,
-        scopes=scopes or ["auth:read"],
+        scopes=scopes,
         token_type="user",
         client_id=client.client_id if client else None,
         org_id=org_id,
         extra=extra_claims,
     )
-    return access, refresh_secret, session, refresh
+    return access, refresh_secret, session, refresh, scopes
 
 
 async def revoke_session_with_refresh_tokens(
@@ -592,15 +753,16 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
             refresh.revoked_at = refresh.revoked_at or session.revoked_at
             await db.commit()
             raise HTTPException(status_code=401, detail="MFA required for this session")
-    derived_scopes = set(selected_org.permissions if selected_org else [])
-    if not derived_scopes:
-        derived_scopes = {permission for org in memberships for permission in org.permissions}
-    scopes = client.scopes if client else sorted(derived_scopes or {"auth:read"})
-    audience = (
-        client.audiences[0]
-        if client and client.audiences
-        else settings.issuer
-    )
+    if session.scopes is not None:
+        requested_scopes = list(session.scopes)
+    else:  # sessions created before scopes were stored
+        requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
+    scopes = capped_session_scopes(requested_scopes, selected_org)
+    audience = session.audience or (client_default_audience(client) if client else settings.issuer)
+    # Only the hosted UI's own logins (they always carry a device cookie hash) keep the issuer audience for a
+    # client. Code and device flow sessions never store one, so an app session stored with the issuer is narrowed.
+    if client and audience == settings.issuer and not session.device_id_hash:
+        audience = client_default_audience(client)
     refresh.used_at = now_utc()
     new_refresh_secret = new_opaque_token("gkr")
     new_refresh = RefreshToken(
@@ -622,6 +784,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     }
     if session.amr:
         extra_claims["amr"] = session.amr
+    extra_claims["roles"] = [selected_org.role] if selected_org and selected_org.role else []
     if selected_org:
         extra_claims.update(
             {
@@ -664,6 +827,12 @@ async def get_client_by_client_id(db: AsyncSession, client_id: str) -> AuthClien
 def validate_redirect(client: AuthClient, redirect_uri: str) -> None:
     if redirect_uri not in (client.redirect_uris or []):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+
+def client_default_audience(client: AuthClient) -> list[str] | str:
+    """Audience for a client's tokens when none was asked for. Never the issuer: that audience marks hosted
+    GateKeeper sessions, which alone may authorize apps and switch orgs."""
+    return list(client.audiences or []) or client.mcp_resource_uri or settings.gatekeeper_api_audience
 
 
 def validate_audience(client: AuthClient, audience: str | None) -> str | None:

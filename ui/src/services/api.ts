@@ -1,4 +1,5 @@
 import type {
+  AdminAccount,
   AdminUser,
   AccountDeactivateResult,
   AccountExport,
@@ -353,6 +354,9 @@ export const api = {
   unlinkIdentity(id: string) {
     return request<{ status: string; id: string }>(`/api/v1/auth/identities/${id}`, { method: 'DELETE' })
   },
+  discovery() {
+    return request<{ issuer: string }>('/.well-known/openid-configuration')
+  },
   oauthProviders() {
     return request<OAuthProvider[]>('/api/v1/auth/oauth/providers')
   },
@@ -488,6 +492,12 @@ export const api = {
     const suffix = query.toString() ? `?${query.toString()}` : ''
     return request<AdminUser[]>(`/api/v1/users${suffix}`)
   },
+  newAccounts(params: { createdAfter?: string } = {}) {
+    const query = new URLSearchParams()
+    if (params.createdAfter) query.set('created_after', params.createdAfter)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<AdminAccount[]>(`/api/v1/admin/accounts${suffix}`)
+  },
   updateUser(id: string, payload: { display_name?: string | null; email_verified?: boolean; disabled?: boolean }) {
     return request<AdminUser>(`/api/v1/users/${id}`, {
       method: 'PATCH',
@@ -590,6 +600,12 @@ export const api = {
   authorizeContext(query: string) {
     const suffix = query.startsWith('?') || !query ? query : `?${query}`
     return request<AuthorizeContext>(`/api/v1/oauth/authorize/context${suffix}`)
+  },
+  approveAuthorization(payload: Record<string, string | boolean>) {
+    return request<{ redirect_to: string }>('/oauth/authorize', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
   },
   oauthGrants() {
     return request<OAuthGrant[]>('/api/v1/oauth/grants')

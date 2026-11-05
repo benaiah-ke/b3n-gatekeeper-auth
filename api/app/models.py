@@ -76,7 +76,7 @@ class OAuthProvider(Base, TimestampMixin):
     email_claim: Mapped[str] = mapped_column(String(120), default="email", nullable=False)
     name_claim: Mapped[str] = mapped_column(String(120), default="name", nullable=False)
     email_verified_claim: Mapped[str] = mapped_column(String(120), default="email_verified", nullable=False)
-    allow_email_linking: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    allow_email_linking: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     require_verified_email: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
@@ -187,6 +187,9 @@ class Session(Base, TimestampMixin):
     trusted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     trusted_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     amr: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
+    # Scopes and audience granted at login, so refresh never widens them.
+    scopes: Mapped[list[str] | None] = mapped_column(json_type(), nullable=True)
+    audience: Mapped[Any] = mapped_column(json_type(), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -367,6 +370,16 @@ class OneTimeCode(Base, TimestampMixin):
     code_hash: Mapped[str] = mapped_column(String(80), unique=True, index=True, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class InstallClaim(Base):
+    """One-time install claims guarded by the primary key, such as the first-owner signup."""
+
+    __tablename__ = "install_claims"
+
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class AuditEvent(Base):

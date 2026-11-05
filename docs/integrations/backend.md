@@ -68,11 +68,23 @@ Session-bound user JWTs include:
 - `org_id`: selected organization when the token is organization-bound.
 - `org_slug`, `org_role`, and `permissions`: active membership claims for the
   selected organization.
+- `roles`: the user's role names in the token's organization (empty when the
+  token has no organization). Enforce roles from this claim or `org_role`.
 - `azp`: OAuth client id when issued for a client.
-- `scope`: OAuth scopes granted to this token.
+- `scope`: OAuth scopes granted to this token. Scopes are always capped to the
+  permissions of the user's role in the token's organization, so a client that
+  lists a scope does not grant it to users whose role lacks it.
+
+GateKeeper's own API only accepts tokens whose audience is the issuer or
+`GATEKEEPER_API_AUDIENCE` (default `gatekeeper-api`). A token issued for your
+product audience is rejected there with 401, so product backends that proxy
+GateKeeper account endpoints must use a GateKeeper session token for those calls.
+Direct password and passkey logins may request `audience` set to the issuer to
+get that session token while still applying the client's login policy.
 
 Personal-account tokens for clients that do not require organization membership
-can intentionally omit `org_id`, `org_role`, and `permissions`.
+can intentionally omit `org_id`, `org_role`, and `permissions`, and carry an
+empty `roles` list. Service tokens from client credentials carry no role claims.
 
 ## Product Policy
 
