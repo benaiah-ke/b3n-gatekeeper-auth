@@ -42,8 +42,8 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `DELETE /api/v1/auth/identities/{identity_id}` | Provider API | Unlink a social/federated identity when another sign-in method remains. |
 | `GET /api/v1/auth/account/export` | Provider API | Export current account profile, memberships, passkey metadata, sessions, grants, token metadata, identities, and recent audit events. |
 | `POST /api/v1/auth/account/deactivate` | Provider API | Deactivate the current account with proof, last-owner protection, and revocation cleanup. |
-| `POST /api/v1/auth/email-code/request` | Provider API | Request email code for login, verification, or password reset. |
-| `POST /api/v1/auth/email-code/verify` | Provider API | Verify an email code and issue tokens for an existing account. Never creates an account. |
+| `POST /api/v1/auth/email-code/request` | Provider API | Request email code for login, verification, or password reset. Returns 403 unless `EMAIL_CODE_LOGIN_ENABLED=true`. |
+| `POST /api/v1/auth/email-code/verify` | Provider API | Verify an email code and issue tokens for an existing account, applying the same MFA and client/org policy as password login (`totp_code`, `recovery_code`, `client_id`, `scope`, `audience`). Never creates an account. Returns 403 unless `EMAIL_CODE_LOGIN_ENABLED=true`. |
 | `POST /api/v1/auth/password/reset/request` | Provider API | Start password reset. |
 | `POST /api/v1/auth/password/reset/confirm` | Provider API | Complete password reset. |
 | `GET /api/v1/auth/oauth/providers` | Provider API | List configured OIDC/social providers without secrets. |

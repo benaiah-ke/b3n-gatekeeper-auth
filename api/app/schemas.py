@@ -367,6 +367,11 @@ class EmailCodeVerify(BaseModel):
     email: EmailStr
     code: str
     purpose: Literal["login", "verify_email", "reset_password"] = "login"
+    client_id: str | None = None
+    scope: str | None = None
+    audience: str | None = None
+    totp_code: str | None = None
+    recovery_code: str | None = None
 
 
 class PasswordResetConfirm(BaseModel):

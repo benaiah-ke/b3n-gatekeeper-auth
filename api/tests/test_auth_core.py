@@ -142,7 +142,8 @@ async def test_signup_is_closed_after_the_first_owner():
 
 
 @pytest.mark.asyncio
-async def test_email_code_never_creates_accounts():
+async def test_email_code_never_creates_accounts(monkeypatch):
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
     async with await client() as ac:
         requested = await ac.post("/api/v1/auth/email-code/request", json={"email": "stranger@example.com"})
         assert requested.status_code == 200
@@ -162,6 +163,79 @@ async def test_email_code_never_creates_accounts():
 
     async with async_session_factory() as db:
         assert (await db.execute(select(User.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_email_code_routes_are_off_by_default():
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        requested = await ac.post("/api/v1/auth/email-code/request", json={"email": "owner@example.com"})
+        assert requested.status_code == 403
+        async with async_session_factory() as db:
+            code = await services.create_one_time_code(db, email="owner@example.com", purpose="login")
+            await db.commit()
+        verified = await ac.post("/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": code})
+        assert verified.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_email_code_login_enforces_mfa_and_client_policy(monkeypatch):
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    password = "correct horse battery"
+
+    async def email_code(email: str) -> str:
+        async with async_session_factory() as db:
+            code = await services.create_one_time_code(db, email=email, purpose="login")
+            await db.commit()
+        return code
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        secret = (await ac.post("/api/v1/auth/mfa/totp/setup", headers=owner_headers)).json()["secret"]
+        enabled = await ac.post(
+            "/api/v1/auth/mfa/totp/enable", headers=owner_headers, json={"code": totp_code(secret)}
+        )
+        assert enabled.status_code == 200
+
+        code = await email_code("owner@example.com")
+        without_totp = await ac.post(
+            "/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": code}
+        )
+        assert without_totp.status_code == 401
+        assert without_totp.json()["detail"] == "TOTP code required"
+        with_totp = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={"email": "owner@example.com", "code": code, "totp_code": totp_code(secret)},
+        )
+        assert with_totp.status_code == 200
+        assert decode_access_token(with_totp.json()["access_token"])["amr"] == ["email", "otp"]
+
+        strict = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={"name": "Strict", "public": True, "audiences": ["strict-api"], "require_mfa": True},
+        )
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        no_mfa = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={
+                "email": "member@example.com",
+                "code": await email_code("member@example.com"),
+                "client_id": strict.json()["client_id"],
+            },
+        )
+        assert no_mfa.status_code == 403
+        assert no_mfa.json()["detail"] == "MFA enrollment required for this client"
+
+        async with async_session_factory() as db:
+            (await db.get(User, member.json()["user"]["id"])).disabled = True
+            await db.commit()
+        disabled = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={"email": "member@example.com", "code": await email_code("member@example.com")},
+        )
+        assert disabled.status_code == 401
 
 
 @pytest.mark.asyncio

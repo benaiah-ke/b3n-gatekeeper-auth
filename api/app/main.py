@@ -1084,8 +1084,24 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
         window_seconds=300,
     )
     user = await authenticate_password(db, str(body.email), body.password)
+    return await complete_login(
+        db, request=request, response=response, user=user, body=body, first_factor="pwd", audit_action="auth.login"
+    )
+
+
+async def complete_login(
+    db: AsyncSession,
+    *,
+    request: Request,
+    response: Response,
+    user: User,
+    body: LoginRequest | EmailCodeVerify,
+    first_factor: str,
+    audit_action: str,
+) -> TokenResponse:
+    """MFA, client/org policy and session issue shared by every first factor (password, email code)."""
     client = await get_client_by_client_id(db, body.client_id) if body.client_id else None
-    amr = ["pwd"]
+    amr = [first_factor]
     effective_org_id = await effective_client_org_id(db, client=client, user=user)
     policy_org = await db.get(Organization, effective_org_id) if effective_org_id else None
     device_id = current_or_new_device_id(request)
@@ -1132,7 +1148,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
         trusted_at=trusted_session.trusted_at if TRUSTED_DEVICE_AMR in amr and trusted_session else None,
         trusted_until=trusted_session.trusted_until if TRUSTED_DEVICE_AMR in amr and trusted_session else None,
     )
-    await audit(db, "auth.login", actor_user_id=user.id, request=request)
+    await audit(db, audit_action, actor_user_id=user.id, request=request)
     await db.commit()
     set_session_cookie(response, access)
     set_refresh_cookie(response, refresh)
@@ -4451,8 +4467,14 @@ async def accept_invitation(
     )
 
 
+def require_email_code_login() -> None:
+    if not settings.email_code_login_enabled:
+        raise HTTPException(status_code=403, detail="Email code sign-in is disabled")
+
+
 @app.post("/api/v1/auth/email-code/request")
 async def request_email_code(body: EmailCodeRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    require_email_code_login()
     await enforce_rate_limit(
         db,
         key=f"email-code:{str(body.email).lower()}:{body.purpose}",
@@ -4485,6 +4507,13 @@ async def verify_email_code(
     response: Response,
     db: AsyncSession = Depends(get_db),
 ):
+    require_email_code_login()
+    await enforce_rate_limit(
+        db,
+        key=f"email-code-verify:{str(body.email).lower()}:{client_ip(request) or 'unknown'}",
+        limit=10,
+        window_seconds=300,
+    )
     await verify_one_time_code(db, email=str(body.email), purpose=body.purpose, code=body.code)
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = result.scalar_one_or_none()
@@ -4493,23 +4522,18 @@ async def verify_email_code(
             db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
         )
         raise HTTPException(status_code=401, detail="Invalid or expired code")
+    if user.disabled:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     if body.purpose == "verify_email":
         user.email_verified = True
-    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
-        db, user, request=request, amr=["email"]
-    )
-    orgs = await org_roles(db, user.id)
-    await audit(db, f"auth.email_code.{body.purpose}", actor_user_id=user.id, request=request)
-    await db.commit()
-    set_session_cookie(response, access)
-    set_refresh_cookie(response, refresh)
-    return TokenResponse(
-        access_token=access,
-        refresh_token=refresh,
-        expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join(scopes),
-        user=user_read(user),
-        orgs=orgs,
+    return await complete_login(
+        db,
+        request=request,
+        response=response,
+        user=user,
+        body=body,
+        first_factor="email",
+        audit_action=f"auth.email_code.{body.purpose}",
     )
 
 

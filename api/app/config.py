@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     refresh_token_ttl_days: int = 30
     device_code_ttl_seconds: int = 600
     email_code_ttl_seconds: int = 900
+    # Email-code sign-in stays off unless set; when on it applies the same MFA and client/org policy as passwords.
+    email_code_login_enabled: bool = False
     webauthn_rp_id: str = ""
     webauthn_rp_name: str = "GateKeeper"
     webauthn_origins: str = ""
