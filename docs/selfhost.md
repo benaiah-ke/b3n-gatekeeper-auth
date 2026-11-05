@@ -47,9 +47,12 @@ At minimum, replace:
 - `BOOTSTRAP_ADMIN_EMAIL`.
 - SMTP settings before relying on email verification, reset, or invitations.
 - `TRUSTED_PROXY_CIDRS` with your reverse proxy network so audit logs, sessions
-  and rate limits see the real client IP. The proxy must overwrite, not append
-  to, `X-Forwarded-For` and drop any client-sent `CF-Connecting-IP` unless it
-  sits behind Cloudflare.
+  and rate limits see the real client IP. GateKeeper reads only
+  `X-Forwarded-For`, and only when the connection comes from a trusted proxy; it
+  takes the rightmost address that is not a trusted proxy. `CF-Connecting-IP` is
+  ignored. Caddy must set `X-Forwarded-For` to `{client_ip}` (Caddy 2.5+ replaces
+  untrusted incoming values by default; if Caddy itself sits behind Cloudflare,
+  configure Caddy's `trusted_proxies` so `{client_ip}` is the real visitor).
 - `SENDY_API_KEY` and `ALERT_EMAIL_TO` to receive security alert emails.
 
 Security defaults: `SIGNUP_MODE=closed` (no open signup mode exists),

@@ -163,22 +163,31 @@ def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = No
     return sorted(derived_scopes or {"auth:read"})
 
 
+def _trusted_proxy(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(address in network for network in settings.trusted_proxy_networks)
+
+
 def client_ip(request: Request | None) -> str | None:
-    """Real client IP: forwarded headers count only when the TCP peer is a trusted proxy."""
+    """Real client IP. X-Forwarded-For counts only when the TCP peer is a trusted proxy, and then the
+    rightmost entry that is not itself a trusted proxy wins, so client-supplied entries are ignored.
+    CF-Connecting-IP is never trusted."""
     if not request or not request.client:
         return None
     peer = request.client.host
     try:
-        trusted = any(ipaddress.ip_address(peer) in network for network in settings.trusted_proxy_networks)
+        if not _trusted_proxy(ipaddress.ip_address(peer)):
+            return peer
     except ValueError:
         return peer
-    if not trusted:
-        return peer
-    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0]
-    try:
-        return str(ipaddress.ip_address(forwarded.strip()))
-    except ValueError:
-        return peer
+    entries = [item.strip() for item in request.headers.get("x-forwarded-for", "").split(",") if item.strip()]
+    for entry in reversed(entries):
+        try:
+            address = ipaddress.ip_address(entry)
+        except ValueError:
+            return peer
+        if not _trusted_proxy(address):
+            return str(address)
+    return entries[0] if entries else peer
 
 
 def security_alert_subject(action: str, details: dict[str, Any]) -> str | None:

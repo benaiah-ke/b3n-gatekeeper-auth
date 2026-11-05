@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     enable_dynamic_client_registration: bool = False
     mcp_default_scopes: str = "mcp:tools,mcp:resources"
 
-    # Comma-separated proxy CIDRs whose X-Forwarded-For / CF-Connecting-IP headers are trusted. Empty trusts nothing.
+    # Comma-separated proxy CIDRs whose X-Forwarded-For header is trusted. Empty trusts nothing.
     trusted_proxy_cidrs: str = ""
 
     cookie_name: str = "gk_session"

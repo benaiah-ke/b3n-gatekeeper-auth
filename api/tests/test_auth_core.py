@@ -3222,18 +3222,22 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         assert revoked_login_replay.json()["detail"] == "Passkey ceremony expired or already used"
 
 
-def test_client_ip_trusts_forwarded_headers_only_from_trusted_proxies(monkeypatch):
-    def fake_request(peer: str, headers: dict[str, str]):
-        return SimpleNamespace(client=SimpleNamespace(host=peer), headers=headers)
+def test_client_ip_uses_the_rightmost_untrusted_forwarded_address(monkeypatch):
+    def client_ip(peer: str, forwarded: str | None = None, **headers: str) -> str | None:
+        if forwarded is not None:
+            headers["x-forwarded-for"] = forwarded
+        return services.client_ip(SimpleNamespace(client=SimpleNamespace(host=peer), headers=headers))
 
-    forwarded = {"x-forwarded-for": "203.0.113.9, 10.0.0.1"}
-    assert services.client_ip(fake_request("172.18.0.6", forwarded)) == "172.18.0.6"
-    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "172.18.0.0/16")
-    assert services.client_ip(fake_request("172.18.0.6", forwarded)) == "203.0.113.9"
-    assert services.client_ip(fake_request("198.51.100.20", forwarded)) == "198.51.100.20"
-    with_cf = {**forwarded, "cf-connecting-ip": "2001:db8::7"}
-    assert services.client_ip(fake_request("172.18.0.6", with_cf)) == "2001:db8::7"
-    assert services.client_ip(fake_request("172.18.0.6", {"x-forwarded-for": "not-an-ip"})) == "172.18.0.6"
+    assert client_ip("172.18.0.6", "203.0.113.9") == "172.18.0.6"
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "172.18.0.0/16, 10.0.0.0/8")
+    assert client_ip("198.51.100.20", "203.0.113.9") == "198.51.100.20"
+    assert client_ip("172.18.0.6", "203.0.113.9") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "1.2.3.4, 203.0.113.9") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "203.0.113.9, 10.0.0.1") == "203.0.113.9"
+    assert client_ip("172.18.0.6", "203.0.113.9", **{"cf-connecting-ip": "2001:db8::7"}) == "203.0.113.9"
+    assert client_ip("172.18.0.6", **{"cf-connecting-ip": "2001:db8::7"}) == "172.18.0.6"
+    assert client_ip("172.18.0.6", "203.0.113.9, not-an-ip") == "172.18.0.6"
+    assert client_ip("172.18.0.6", "10.0.0.5, 10.0.0.1") == "10.0.0.5"
     assert services.client_ip(None) is None
 
 
