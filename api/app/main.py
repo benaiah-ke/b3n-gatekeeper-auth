@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 import re
@@ -5422,6 +5424,21 @@ async def oauth_provider_callback(
     return await complete_oauth_provider_callback(provider_id, code, state, request, db, principal=principal)
 
 
+def consent_nonce(principal: Principal, client: AuthClient, redirect_uri: str, code_challenge: str) -> str:
+    """Proof that the hosted consent page for this exact request was shown to this session."""
+    message = "|".join(
+        [
+            "oauth-consent",
+            principal.user_id or "",
+            principal.session_id or principal.token_id or "",
+            client.client_id,
+            redirect_uri,
+            code_challenge,
+        ]
+    )
+    return hmac.new(settings.secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 @app.get("/oauth/authorize")
 async def oauth_authorize_get(
     request: Request,
@@ -5434,9 +5451,43 @@ async def oauth_authorize_get(
     state: str | None = None,
     audience: str | None = None,
     org_id: str | None = None,
-    approve: bool = False,
     principal: Principal | None = Depends(optional_principal),
     db: AsyncSession = Depends(get_db),
+):
+    # A GET never approves consent, so a link or image on another site cannot grant an app access.
+    return await oauth_authorize(
+        request,
+        response_type,
+        client_id,
+        redirect_uri,
+        code_challenge,
+        code_challenge_method,
+        scope,
+        state,
+        audience,
+        org_id,
+        False,
+        None,
+        principal,
+        db,
+    )
+
+
+async def oauth_authorize(
+    request: Request,
+    response_type: str,
+    client_id: str,
+    redirect_uri: str,
+    code_challenge: str,
+    code_challenge_method: str,
+    scope: str,
+    state: str | None,
+    audience: str | None,
+    org_id: str | None,
+    approve: bool,
+    submitted_nonce: str | None,
+    principal: Principal | None,
+    db: AsyncSession,
 ):
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Unsupported response_type")
@@ -5472,6 +5523,10 @@ async def oauth_authorize_get(
             )
             return RedirectResponse(login_url, status_code=302)
         raise
+    if approve and not hmac.compare_digest(
+        submitted_nonce or "", consent_nonce(principal, client, redirect_uri, code_challenge)
+    ):
+        raise HTTPException(status_code=403, detail="Consent confirmation is missing or expired")
     if not approve:
         grant = await find_oauth_grant(
             db,
@@ -5539,7 +5594,7 @@ async def oauth_authorize_post(
     principal: Principal | None = Depends(optional_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    return await oauth_authorize_get(
+    result = await oauth_authorize(
         request,
         body.response_type,
         body.client_id,
@@ -5551,9 +5606,12 @@ async def oauth_authorize_post(
         body.audience,
         body.org_id,
         body.approve,
+        body.consent_nonce,
         principal,
         db,
     )
+    # The hosted consent page posts with fetch, so it gets the redirect target as JSON and navigates itself.
+    return {"redirect_to": result.headers["location"]}
 
 
 @app.get("/api/v1/oauth/authorize/context")
@@ -5605,6 +5663,7 @@ async def oauth_authorize_context(
         "orgs": [org.model_dump() for org in orgs],
         "selected_org_id": selected_org.id if selected_org else None,
         "code_challenge_method": code_challenge_method,
+        "consent_nonce": consent_nonce(principal, client, redirect_uri, code_challenge),
     }
 
 
@@ -6675,7 +6734,7 @@ async def create_client(
 ):
     redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
     allowed_origins = validate_url_list(body.allowed_origins, field_name="allowed_origins", origin_only=True)
-    if uses_reserved_audience(body.audiences, body.mcp_resource_uri):
+    if body.verified or uses_reserved_audience(body.audiences, body.mcp_resource_uri):
         await require_platform_admin(db, principal)
     client_id = validate_operator_client_id(body.client_id)
     if client_id:
@@ -6756,7 +6815,7 @@ async def update_client(
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
     if uses_reserved_audience(client.audiences, client.mcp_resource_uri) or uses_reserved_audience(
         body.audiences, body.mcp_resource_uri
-    ):
+    ) or (body.verified is not None and body.verified != bool(client.verified_at)):
         await require_platform_admin(db, principal)
     if body.scopes is not None:
         await ensure_client_scopes_allowed(db, principal=principal, org_id=client.org_id, scopes=body.scopes)

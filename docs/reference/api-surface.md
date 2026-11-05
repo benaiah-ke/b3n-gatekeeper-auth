@@ -99,9 +99,9 @@ product wants to own its own auth screens, use the provider APIs directly.
 
 | Endpoint | Surface | Use |
 | --- | --- | --- |
-| `GET /oauth/authorize` | OAuth/OIDC | Authorization-code + PKCE request. |
-| `POST /oauth/authorize` | OAuth/OIDC | Hosted approval/consent submission. |
-| `GET /api/v1/oauth/authorize/context` | Hosted UI backing API | Context for the hosted authorize page. |
+| `GET /oauth/authorize` | OAuth/OIDC | Authorization-code + PKCE request. Never approves consent; without a remembered grant it redirects to the hosted consent page. |
+| `POST /oauth/authorize` | OAuth/OIDC | Hosted consent submission. `approve: true` needs the `consent_nonce` from the context endpoint (bound to the session, client, redirect URI and code challenge). Returns `{"redirect_to": ...}`. |
+| `GET /api/v1/oauth/authorize/context` | Hosted UI backing API | Context for the hosted authorize page, including `consent_nonce`. |
 | `POST /oauth/token` | OAuth/OIDC | Authorization-code, refresh-token, device-code, and client-credentials exchange. |
 | `POST /oauth/device_authorization` | OAuth/OIDC | Start CLI/device authorization. |
 | `POST /api/v1/auth/device/approve` | Provider API | Approve or deny a device flow from an active session, with TOTP/recovery input when required. |

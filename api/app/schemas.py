@@ -702,6 +702,7 @@ class OAuthAuthorizeRequest(BaseModel):
     audience: str | None = None
     org_id: str | None = None
     approve: bool = False
+    consent_nonce: str | None = None
 
 
 class OAuthGrantRead(BaseModel):

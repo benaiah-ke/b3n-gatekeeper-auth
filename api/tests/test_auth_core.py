@@ -3434,10 +3434,10 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
         refreshed_claims = decode_access_token(refreshed.json()["access_token"], audience="mfa-api")
         assert refreshed_claims["amr"] == ["pwd", "otp"]
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {ui_access}"},
-            params={
+        approved = await approve_consent(
+            ac,
+            {"Authorization": f"Bearer {ui_access}"},
+            {
                 "response_type": "code",
                 "client_id": created.json()["client_id"],
                 "redirect_uri": "https://app.example.com/callback",
@@ -3445,11 +3445,9 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
                 "code_challenge_method": "plain",
                 "scope": "openid profile email api:read",
                 "audience": "mfa-api",
-                "approve": "true",
             },
         )
-        assert approved.status_code == 302
-        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        code = parse_qs(urlparse(approved).query)["code"][0]
         token = await ac.post(
             "/oauth/token",
             data={
@@ -4617,20 +4615,22 @@ async def test_authorize_requires_consent_before_issuing_code():
         )
         assert invalid_context.status_code == 403
 
-        invalid_approve = await ac.get(
+        invalid_approve = await ac.post(
             "/oauth/authorize",
             headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": "not-an-org"},
+            json={
+                **params,
+                "approve": True,
+                "org_id": "not-an-org",
+                "consent_nonce": context_payload["consent_nonce"],
+            },
         )
         assert invalid_approve.status_code == 403
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": selected_org_id},
+        approved = await approve_consent(
+            ac, {"Authorization": f"Bearer {access}"}, {**params, "org_id": selected_org_id}
         )
-        assert approved.status_code == 302
-        callback = urlparse(approved.headers["location"])
+        callback = urlparse(approved)
         assert f"{callback.scheme}://{callback.netloc}{callback.path}" == "https://app.example.com/callback"
         callback_query = parse_qs(callback.query)
         assert callback_query["state"] == ["consent-state"]
@@ -4729,13 +4729,10 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
             "audience": "example-api",
         }
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true", "org_id": org_id, "state": "admin-review"},
+        approved = await approve_consent(
+            ac, {"Authorization": f"Bearer {access}"}, {**params, "org_id": org_id, "state": "admin-review"}
         )
-        assert approved.status_code == 302
-        assert parse_qs(urlparse(approved.headers["location"]).query)["code"][0].startswith("gkc_")
+        assert parse_qs(urlparse(approved).query)["code"][0].startswith("gkc_")
 
         admin_grants = await ac.get(
             f"/api/v1/oauth/grants/admin?org_id={org_id}",
@@ -4815,12 +4812,11 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
             "scope": "openid profile api:read",
             "audience": "second-api",
         }
-        second_approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {second_access}"},
-            params={**second_params, "approve": "true", "org_id": second_org_id, "state": "second-admin-review"},
+        await approve_consent(
+            ac,
+            {"Authorization": f"Bearer {second_access}"},
+            {**second_params, "org_id": second_org_id, "state": "second-admin-review"},
         )
-        assert second_approved.status_code == 302
 
         cross_org_list = await ac.get(
             f"/api/v1/oauth/grants/admin?org_id={second_org_id}",
@@ -4879,13 +4875,8 @@ async def test_authorize_can_issue_personal_tokens_for_clients_without_required_
         assert context.status_code == 200
         assert context.json()["selected_org_id"] is None
 
-        approved = await ac.get(
-            "/oauth/authorize",
-            headers={"Authorization": f"Bearer {access}"},
-            params={**params, "approve": "true"},
-        )
-        assert approved.status_code == 302
-        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        approved = await approve_consent(ac, {"Authorization": f"Bearer {access}"}, params)
+        code = parse_qs(urlparse(approved).query)["code"][0]
 
         token = await ac.post(
             "/oauth/token",
@@ -6240,3 +6231,79 @@ async def test_gatekeeper_audiences_including_the_issuer_are_reserved():
             json={"name": "bound", "token_type": "personal", "audiences": ["sentinel-api"]},
         )
         assert owner_token.status_code == 200
+
+
+async def approve_consent(ac: AsyncClient, headers: dict[str, str], params: dict[str, str]) -> str:
+    """Approve the way the hosted consent page does: nonce from the context endpoint, then POST."""
+    context = await ac.get("/api/v1/oauth/authorize/context", headers=headers, params=params)
+    assert context.status_code == 200
+    approved = await ac.post(
+        "/oauth/authorize",
+        headers=headers,
+        json={**params, "approve": True, "consent_nonce": context.json()["consent_nonce"]},
+    )
+    assert approved.status_code == 200
+    return approved.json()["redirect_to"]
+
+
+@pytest.mark.asyncio
+async def test_consent_needs_a_session_bound_nonce_and_post_and_only_platform_admins_verify_clients():
+    body = {
+        "name": "Product",
+        "public": True,
+        "redirect_uris": ["https://app.example.com/callback", "https://evil.example.com/callback"],
+        "audiences": ["example-api"],
+        "scopes": ["openid", "auth:read"],
+    }
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        verified = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "verified": True})
+        assert verified.status_code == 403
+        own = await ac.post("/api/v1/clients", headers=admin_headers, json=body)
+        assert own.status_code == 200
+        marked = await ac.patch(f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"verified": True})
+        assert marked.status_code == 403
+        unchanged = await ac.patch(
+            f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"verified": False, "name": "Renamed"}
+        )
+        assert unchanged.status_code == 200
+
+        created = await ac.post("/api/v1/clients", headers=owner_headers, json={**body, "verified": True})
+        assert created.status_code == 200
+        params = {
+            "response_type": "code",
+            "client_id": created.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+            "audience": "example-api",
+            "state": "s1",
+        }
+        forged = await ac.get("/oauth/authorize", headers=owner_headers, params={**params, "approve": "true"})
+        assert forged.status_code == 302
+        assert urlparse(forged.headers["location"]).path == "/authorize"
+
+        context = await ac.get("/api/v1/oauth/authorize/context", headers=owner_headers, params=params)
+        nonce = context.json()["consent_nonce"]
+        for submitted in (
+            {**params, "approve": True},
+            {**params, "approve": True, "consent_nonce": "0" * 64},
+            {**params, "approve": True, "consent_nonce": nonce, "code_challenge": "attacker"},
+            {**params, "approve": True, "consent_nonce": nonce, "redirect_uri": "https://evil.example.com/callback"},
+        ):
+            refused = await ac.post("/oauth/authorize", headers=owner_headers, json=submitted)
+            assert refused.status_code == 403
+        other_session = await ac.post(
+            "/api/v1/auth/login", json={"email": "owner@example.com", "password": "correct horse battery"}
+        )
+        replayed = await ac.post(
+            "/oauth/authorize",
+            headers={"Authorization": f"Bearer {other_session.json()['access_token']}"},
+            json={**params, "approve": True, "consent_nonce": nonce},
+        )
+        assert replayed.status_code == 403
+
+        location = urlparse(await approve_consent(ac, owner_headers, params))
+        assert f"{location.scheme}://{location.netloc}{location.path}" == "https://app.example.com/callback"
+        assert parse_qs(location.query)["code"][0].startswith("gkc_")

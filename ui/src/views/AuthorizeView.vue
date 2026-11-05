@@ -2,7 +2,7 @@
 import { AlertTriangle, BadgeCheck, CheckCircle2, ExternalLink, ShieldCheck, XCircle } from 'lucide-vue-next'
 import { computed, onMounted, ref } from 'vue'
 
-import { api, gatekeeperApiUrl } from '@/services/api'
+import { api } from '@/services/api'
 import type { AuthorizeContext } from '@/types'
 
 const context = ref<AuthorizeContext | null>(null)
@@ -73,15 +73,23 @@ async function load() {
   }
 }
 
-function approve() {
-  const params = currentQuery()
-  params.set('approve', 'true')
-  if (selectedOrgId.value) {
-    params.set('org_id', selectedOrgId.value)
-  } else {
-    params.delete('org_id')
+async function approve() {
+  if (!context.value) {
+    return
   }
-  window.location.assign(gatekeeperApiUrl(`/oauth/authorize?${params.toString()}`))
+  const payload: Record<string, string | boolean> = Object.fromEntries(currentQuery())
+  delete payload.org_id
+  if (selectedOrgId.value) {
+    payload.org_id = selectedOrgId.value
+  }
+  payload.approve = true
+  payload.consent_nonce = context.value.consent_nonce
+  try {
+    const result = await api.approveAuthorization(payload)
+    window.location.assign(result.redirect_to)
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Could not approve this sign-in request'
+  }
 }
 
 function deny() {

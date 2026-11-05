@@ -325,6 +325,7 @@ export interface AuthorizeContext {
   orgs: Org[]
   selected_org_id?: string | null
   code_challenge_method: string
+  consent_nonce: string
 }
 
 export interface OAuthGrant {

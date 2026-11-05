@@ -601,6 +601,12 @@ export const api = {
     const suffix = query.startsWith('?') || !query ? query : `?${query}`
     return request<AuthorizeContext>(`/api/v1/oauth/authorize/context${suffix}`)
   },
+  approveAuthorization(payload: Record<string, string | boolean>) {
+    return request<{ redirect_to: string }>('/oauth/authorize', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  },
   oauthGrants() {
     return request<OAuthGrant[]>('/api/v1/oauth/grants')
   },
