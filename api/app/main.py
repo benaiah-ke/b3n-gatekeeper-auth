@@ -3152,7 +3152,10 @@ async def scim_apply_user_state(
         active_count_result = await db.execute(
             select(func.count(Membership.id)).where(Membership.user_id == user.id, Membership.status == "active")
         )
-        if int(active_count_result.scalar_one() or 0) == 0:
+        if int(active_count_result.scalar_one() or 0) == 0 and not user.disabled:
+            await ensure_account_wide_change_allowed(
+                db, user_id=user.id, principal=principal, visible_org_ids=[org.id]
+            )
             user.disabled = True
 
     disabled_changed = previous_disabled != user.disabled

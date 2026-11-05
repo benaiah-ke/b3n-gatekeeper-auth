@@ -7429,3 +7429,27 @@ async def test_tenant_admins_cannot_pull_existing_accounts_into_their_org(monkey
             json={"org_id": bootstrap_id, "role": "viewer", "status": "active"},
         )
         assert adopted.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scim_deactivation_cannot_disable_platform_admins_or_owners(monkeypatch):
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            platform = await services.create_user(db, email="platform@example.com", password="correct horse battery")
+            tenant_owner = await services.create_user(db, email="t-owner@example.com", password="correct horse battery")
+            db.add(Membership(org_id=tenant_id, user_id=platform.id, role_id=tenant_roles["viewer"]))
+            db.add(Membership(org_id=tenant_id, user_id=tenant_owner.id, role_id=tenant_roles["owner"]))
+            await db.commit()
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        deactivate = {"Operations": [{"op": "replace", "path": "active", "value": False}]}
+        for user_id in (platform.id, tenant_owner.id):
+            patched = await ac.patch(f"/scim/v2/Users/{user_id}", headers=tenant_headers, json=deactivate)
+            assert patched.status_code == 403, user_id
+            deleted = await ac.delete(f"/scim/v2/Users/{user_id}", headers=tenant_headers)
+            assert deleted.status_code == 403, user_id
+    async with async_session_factory() as db:
+        disabled = dict((await db.execute(select(User.email, User.disabled))).all())
+    assert disabled["platform@example.com"] is False
+    assert disabled["t-owner@example.com"] is False
