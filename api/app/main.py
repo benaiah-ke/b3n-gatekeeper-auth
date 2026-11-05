@@ -4723,13 +4723,45 @@ async def get_db_oauth_provider(db: AsyncSession, provider_id: str) -> OAuthProv
     return result.scalar_one_or_none()
 
 
+async def is_platform_admin(db: AsyncSession, user_id: str | None) -> bool:
+    if not user_id:
+        return False
+    if user_id in settings.platform_admin_user_id_set:
+        return True
+    result = await db.execute(
+        select(Membership.id)
+        .join(Organization, Organization.id == Membership.org_id)
+        .join(Role, Role.id == Membership.role_id)
+        .where(
+            Membership.user_id == user_id,
+            Membership.status == "active",
+            Organization.slug == settings.bootstrap_org_slug,
+            Role.name == "owner",
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def require_platform_admin(db: AsyncSession, principal: Principal) -> None:
+    # Scopes alone (even admin:* or *) are not enough: the caller must be a platform admin user.
+    if not await is_platform_admin(db, principal.user_id):
+        raise HTTPException(status_code=403, detail="Platform admin required")
+
+
+def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
+    reserved = settings.reserved_audience_set
+    return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
+
+
 async def require_install_owner(db: AsyncSession, principal: Principal) -> Organization:
-    if "*" not in principal.scopes or not principal.org_id:
+    if not has_capability(principal.scopes, "admin:*") or not principal.org_id:
         raise HTTPException(status_code=403, detail="Install owner required")
     result = await db.execute(select(Organization).where(Organization.slug == settings.bootstrap_org_slug))
     bootstrap_org = result.scalar_one_or_none()
     if not bootstrap_org or principal.org_id != bootstrap_org.id:
         raise HTTPException(status_code=403, detail="Install owner required")
+    await require_platform_admin(db, principal)
     return bootstrap_org
 
 
@@ -6294,6 +6326,7 @@ async def create_org(
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
+    await require_platform_admin(db, principal)
     org = Organization(
         name=body.name,
         slug=body.slug,
@@ -6523,6 +6556,8 @@ async def create_client(
 ):
     redirect_uris = validate_url_list(body.redirect_uris, field_name="redirect_uris")
     allowed_origins = validate_url_list(body.allowed_origins, field_name="allowed_origins", origin_only=True)
+    if uses_reserved_audience(body.audiences, body.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     client_id = validate_operator_client_id(body.client_id)
     if client_id:
         existing = await db.execute(select(AuthClient.id).where(AuthClient.client_id == client_id))
@@ -6597,6 +6632,10 @@ async def update_client(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri) or uses_reserved_audience(
+        body.audiences, body.mcp_resource_uri
+    ):
+        await require_platform_admin(db, principal)
     if body.name is not None:
         client.name = body.name
     if "description" in body.model_fields_set:
@@ -6659,6 +6698,8 @@ async def rotate_client_secret(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     if client.public:
         raise HTTPException(status_code=400, detail="Public clients do not have secrets")
     secret = new_opaque_token("gkcs")

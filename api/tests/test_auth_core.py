@@ -448,6 +448,73 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
 
 
 @pytest.mark.asyncio
+async def test_platform_admin_gates_orgs_reserved_audience_clients_and_providers(monkeypatch):
+    password = "correct horse battery"
+    client_body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+        admin_id = admin.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "admin", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        admin_login = await ac.post(
+            "/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password}
+        )
+        assert "admin:*" in admin_login.json()["scope"].split()
+        admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+
+        denied_org = await ac.post("/api/v1/orgs", headers=admin_headers, json={"name": "X", "slug": "x"})
+        assert denied_org.status_code == 403
+        for extra in ({"audiences": ["sentinel-api"]}, {"audiences": ["my-api"], "mcp_resource_uri": "knowhere-api"}):
+            denied = await ac.post("/api/v1/clients", headers=admin_headers, json={**client_body, **extra})
+            assert denied.status_code == 403
+        own_client = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**client_body, "audiences": ["my-api"]}
+        )
+        assert own_client.status_code == 200
+        retarget = await ac.patch(
+            f"/api/v1/clients/{own_client.json()['id']}",
+            headers=admin_headers,
+            json={"audiences": ["gatekeeper-api"]},
+        )
+        assert retarget.status_code == 403
+        first_party = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "public": False, "audiences": ["sentinel-api"]},
+        )
+        assert first_party.status_code == 200
+        first_party_id = first_party.json()["id"]
+        rename = await ac.patch(f"/api/v1/clients/{first_party_id}", headers=admin_headers, json={"name": "Mine"})
+        assert rename.status_code == 403
+        rotate = await ac.post(f"/api/v1/clients/{first_party_id}/rotate-secret", headers=admin_headers)
+        assert rotate.status_code == 403
+        assert (await ac.get("/api/v1/auth/oauth/providers/admin", headers=admin_headers)).status_code == 403
+
+        service = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "owner service", "token_type": "service", "org_id": org_id, "scopes": ["*"]},
+        )
+        service_headers = {"Authorization": f"Bearer {service.json()['token']}"}
+        service_org = await ac.post("/api/v1/orgs", headers=service_headers, json={"name": "S", "slug": "s"})
+        assert service_org.status_code == 403
+        assert (await ac.get("/api/v1/auth/oauth/providers/admin", headers=service_headers)).status_code == 403
+
+        owner_org = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "O", "slug": "o"})
+        assert owner_org.status_code == 200
+        monkeypatch.setattr(settings, "platform_admin_user_ids", admin_id)
+        allowed = await ac.post("/api/v1/orgs", headers=admin_headers, json={"name": "A", "slug": "a"})
+        assert allowed.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
         signup = await register(

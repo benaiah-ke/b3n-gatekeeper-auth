@@ -66,6 +66,11 @@ class Settings(BaseSettings):
     # Neither mode allows open self-service signup after the first owner of an empty install.
     signup_mode: Literal["closed", "invite"] = "closed"
 
+    # Platform admins are active owners of the bootstrap org plus these comma-separated user IDs.
+    platform_admin_user_ids: str = ""
+    # Only platform admins may create or change OAuth clients that target these audiences.
+    reserved_audiences: str = "gatekeeper-api,sentinel-api,knowhere-api,devsync,woodpecker"
+
     bootstrap_admin_email: EmailStr = "admin@example.com"
     bootstrap_org_name: str = "Example Org"
     bootstrap_org_slug: str = "example"
@@ -99,6 +104,14 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def platform_admin_user_id_set(self) -> set[str]:
+        return {item.strip() for item in self.platform_admin_user_ids.split(",") if item.strip()}
+
+    @property
+    def reserved_audience_set(self) -> set[str]:
+        return {item.strip() for item in self.reserved_audiences.split(",") if item.strip()}
 
     @property
     def mcp_default_scope_list(self) -> list[str]:
