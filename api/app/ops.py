@@ -13,6 +13,7 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models import (
     ApiToken,
+    AuditEvent,
     AuthClient,
     Invitation,
     Membership,
@@ -24,9 +25,18 @@ from app.models import (
     User,
 )
 from app.security import now_utc
-from app.services import BASELINE_PERMISSIONS, DEFAULT_ORG_ROLES, audit, cap_scopes, ensure_bootstrap
+from app.services import (
+    ALERT_DETAIL_KEYS,
+    BASELINE_PERMISSIONS,
+    DEFAULT_ORG_ROLES,
+    audit,
+    cap_scopes,
+    ensure_bootstrap,
+)
 
 PRIVILEGED_SCOPES = {"*", "admin:*", "token:*"}
+# Audit actions that change who can do what: roles, clients, memberships and owners.
+CHANGE_ACTION_PREFIXES = ("role.", "client.", "user.membership.", "user.provision", "invitation.", "scim.", "org.")
 
 
 async def set_bootstrap_owner(email: str) -> str:
@@ -161,6 +171,8 @@ async def incident_sweep(since: datetime) -> dict[str, list[dict]]:
             client
             for client in (await db.execute(select(AuthClient).order_by(AuthClient.created_at))).scalars()
             if client.org_id in owned_org_ids
+            or client.created_at >= since
+            or not (client.audiences or client.mcp_resource_uri)
             or flagged_audiences.intersection(client.audiences or [])
             or PRIVILEGED_SCOPES.intersection(client.scopes or [])
             or client.verified_at
@@ -229,6 +241,16 @@ async def incident_sweep(since: datetime) -> dict[str, list[dict]]:
                 .order_by(Session.created_at)
             )
         ).all()
+        changes = (
+            await db.execute(
+                select(AuditEvent)
+                .where(
+                    AuditEvent.created_at >= since,
+                    or_(*[AuditEvent.action.startswith(prefix) for prefix in CHANGE_ACTION_PREFIXES]),
+                )
+                .order_by(AuditEvent.created_at)
+            )
+        ).scalars()
         return {
             "accounts": [
                 {
@@ -318,6 +340,19 @@ async def incident_sweep(since: datetime) -> dict[str, list[dict]]:
                     "live_refresh_tokens": row[1],
                 }
                 for row in sessions
+            ],
+            "audit_events": [
+                {
+                    "time": _when(event.created_at),
+                    "action": event.action,
+                    "actor": emails.get(event.actor_user_id),
+                    "org": slugs.get(event.org_id),
+                    "target": f"{event.target_type or '-'}:{event.target_id or '-'}",
+                    "ip": event.ip_address,
+                    # Only the alert allowlist, so no secret ever reaches the terminal.
+                    **{key: (event.details or {})[key] for key in ALERT_DETAIL_KEYS if (event.details or {}).get(key)},
+                }
+                for event in changes
             ],
         }
 

@@ -6707,7 +6707,7 @@ async def test_incident_sweep_lists_what_new_accounts_touched_and_revoke_takes_f
     assert [row["slug"] for row in sweep["owned_orgs"]] == ["evil"]
     listed_clients = {row["client_id"] for row in sweep["clients"]}
     assert flagged.json()["client_id"] in listed_clients
-    assert quiet.json()["client_id"] not in listed_clients
+    assert quiet.json()["client_id"] in listed_clients  # created since the cutoff
     assert token.json()["id"] in {row["id"] for row in sweep["api_tokens"]}
     assert [row["email"] for row in sweep["invitations"]] == ["pending@example.com"]
     assert [row["client_id"] for row in sweep["oauth_grants"]] == [flagged.json()["client_id"]]
@@ -7060,3 +7060,39 @@ async def test_migration_turns_off_email_linking_on_existing_providers():
         await conn.run_sync(upgrade)
     async with async_session_factory() as db:
         assert (await db.execute(select(OAuthProvider.allow_email_linking))).scalars().all() == [False]
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_lists_new_and_audience_less_clients_and_recent_changes():
+    body = {"name": "App", "public": True, "redirect_uris": ["https://app.example.com/callback"], "scopes": ["openid"]}
+    async with await client() as ac:
+        owner_headers, _admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        created = {}
+        for name, audiences in (("new", ["plain-api"]), ("empty", []), ("old", ["quiet-api"])):
+            response = await ac.post(
+                "/api/v1/clients", headers=owner_headers, json={**body, "name": name, "audiences": audiences}
+            )
+            assert response.status_code == 200
+            created[name] = response.json()
+        role = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "support", "permissions": []}
+        )
+        assert role.status_code == 200
+    long_ago = services.now_utc() - timedelta(days=30)
+    async with async_session_factory() as db:
+        for user in (await db.execute(select(User))).scalars():
+            user.created_at = long_ago
+        for name in ("empty", "old"):
+            row = (
+                await db.execute(select(main_module.AuthClient).where(main_module.AuthClient.id == created[name]["id"]))
+            ).scalar_one()
+            row.created_at = long_ago
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    listed = {row["client_id"] for row in sweep["clients"]}
+    assert created["new"]["client_id"] in listed
+    assert created["empty"]["client_id"] in listed
+    assert created["old"]["client_id"] not in listed
+    actions = {row["action"] for row in sweep["audit_events"]}
+    assert {"client.create", "role.create", "user.membership.update"} <= actions
+    assert "auth.login" not in actions
