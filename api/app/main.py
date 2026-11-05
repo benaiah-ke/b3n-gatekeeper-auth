@@ -185,6 +185,7 @@ from app.services import (
     create_session_tokens,
     create_user,
     derive_membership_scopes,
+    effective_api_token_scopes,
     enforce_rate_limit,
     enforce_session_idle_timeout,
     ensure_bootstrap,
@@ -7117,7 +7118,7 @@ async def token_validation_response(
     org = await db.get(Organization, token.org_id) if token.org_id else None
     project = await db.get(Project, token.project_id) if token.project_id else None
     client = await db.get(AuthClient, token.client_id) if token.client_id else None
-    scopes = token.scopes or []
+    scopes = await effective_api_token_scopes(db, token) or []
     audiences = token.audiences or []
     missing_scopes = missing_token_scopes(scopes, request_body.required_scopes)
     audience_ok = not request_body.audience or request_body.audience in audiences

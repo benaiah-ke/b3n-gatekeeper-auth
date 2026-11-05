@@ -11,7 +11,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import ApiToken, AuthClient, Membership, Role, Session, User
 from app.security import decode_access_token, now_utc, token_hash
-from app.services import enforce_session_idle_timeout
+from app.services import effective_api_token_scopes, enforce_session_idle_timeout
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -55,12 +55,15 @@ async def current_principal(
             user = await db.get(User, api_token.user_id)
             if not user or user.disabled:
                 raise HTTPException(status_code=401, detail="Invalid API token")
+        scopes = await effective_api_token_scopes(db, api_token)
+        if scopes is None:
+            raise HTTPException(status_code=401, detail="Invalid API token")
         api_token.last_used_at = now_utc()
         await db.commit()
         return Principal(
             subject=api_token.user_id or api_token.client_id or api_token.id,
             auth_type=api_token.token_type,
-            scopes=api_token.scopes or [],
+            scopes=scopes,
             org_id=api_token.org_id,
             user_id=api_token.user_id,
             token_id=api_token.id,

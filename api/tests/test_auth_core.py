@@ -6410,3 +6410,64 @@ async def test_org_admins_cannot_hand_out_roles_or_policies_above_their_own():
         actions = set((await db.execute(select(AuditEvent.action))).scalars())
     assert "role.create" in actions
 
+
+@pytest.mark.asyncio
+async def test_user_api_tokens_follow_the_owners_current_role():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        created = await ac.post(
+            "/api/v1/tokens",
+            headers=admin_headers,
+            json={
+                "name": "automation",
+                "token_type": "personal",
+                "org_id": org_id,
+                "scopes": ["admin:*", "auth:*"],
+            },
+        )
+        assert created.status_code == 200
+        raw = created.json()["token"]
+        token_headers = {"Authorization": f"Bearer {raw}"}
+        validate = {"token": raw, "required_scopes": ["admin:*"]}
+        assert (await ac.get("/api/v1/users", headers=token_headers)).status_code == 200
+        assert (await ac.post("/api/v1/tokens/validate", json=validate)).json()["scope_ok"] is True
+
+        demoted = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "active"},
+        )
+        assert demoted.status_code == 200
+        assert (await ac.get("/api/v1/users", headers=token_headers)).status_code == 403
+        checked = (await ac.post("/api/v1/tokens/validate", json=validate)).json()
+        assert checked["scope_ok"] is False
+        assert checked["scopes"] == []
+
+        removed = await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "revoked"},
+        )
+        assert removed.status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+        assert (await ac.post("/api/v1/tokens/validate", json=validate)).json()["active"] is False
+
+    async with async_session_factory() as db:
+        user = (await db.execute(select(User).where(User.email == "admin@corp.example.com"))).scalar_one()
+        token, orgless_raw = await services.create_api_token(
+            db,
+            name="org-less",
+            token_type_value="personal",
+            org_id=None,
+            user_id=user.id,
+            project_id=None,
+            client_id=None,
+            scopes=["admin:*", "auth:read"],
+            audiences=[],
+            expires_at=None,
+        )
+        await db.commit()
+    async with await client() as ac:
+        orgless = await ac.post("/api/v1/tokens/validate", json={"token": orgless_raw})
+        assert orgless.json()["scopes"] == ["auth:read"]
+

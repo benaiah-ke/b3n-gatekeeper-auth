@@ -155,6 +155,22 @@ def capped_session_scopes(requested: list[str], selected_org: OrgRead | None) ->
     return cap_scopes(requested, permissions) or cap_scopes(BASELINE_PERMISSIONS, permissions)
 
 
+async def effective_api_token_scopes(db: AsyncSession, token: ApiToken) -> list[str] | None:
+    """Scopes a user-owned API token may use now: its stored scopes capped to the owner's current role in the token's
+    org (the self-service baseline when it has no org). None when the owner is no longer an active member there."""
+    if not token.user_id:
+        return list(token.scopes or [])
+    if not token.org_id:
+        return cap_scopes(token.scopes or [], BASELINE_PERMISSIONS)
+    result = await db.execute(
+        select(Role.permissions)
+        .join(Membership, Membership.role_id == Role.id)
+        .where(Membership.user_id == token.user_id, Membership.org_id == token.org_id, Membership.status == "active")
+    )
+    row = result.first()
+    return None if row is None else cap_scopes(token.scopes or [], row[0] or [])
+
+
 def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = None) -> list[str]:
     selected_org = next((org for org in memberships if org.id == org_id), None) if org_id else None
     derived_scopes = set(selected_org.permissions if selected_org else [])
