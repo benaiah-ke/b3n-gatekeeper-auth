@@ -53,6 +53,11 @@ export interface AdminUser extends User {
   memberships: UserMembership[]
 }
 
+export interface AdminAccount extends AdminUser {
+  last_session_ip?: string | null
+  last_session_at?: string | null
+}
+
 export interface LinkedIdentity {
   id: string
   provider: string

@@ -1360,6 +1360,41 @@ async def test_admin_user_hard_delete_requires_org_policy_and_confirmation():
 
 
 @pytest.mark.asyncio
+async def test_platform_admin_lists_new_accounts_newest_first():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        newcomer = await register(ac, json={"email": "newcomer@example.com", "password": password})
+        async with async_session_factory() as db:
+            for user_id, age in ((owner.json()["user"]["id"], 48), (newcomer.json()["user"]["id"], 1)):
+                (await db.get(User, user_id)).created_at = security.now_utc() - timedelta(hours=age)
+            await db.commit()
+
+        listed = await ac.get("/api/v1/admin/accounts", headers=owner_headers)
+        assert listed.status_code == 200
+        assert [item["email"] for item in listed.json()] == ["newcomer@example.com", "owner@example.com"]
+        newest = listed.json()[0]
+        assert newest["last_session_ip"] == "127.0.0.1"
+        assert newest["last_session_at"]
+        assert newest["mfa_totp_enabled"] is False
+        assert newest["passkey_count"] == 0
+        assert newest["disabled"] is False
+        memberships = [(item["org_name"], item["role"]) for item in newest["memberships"]]
+        assert memberships == [(settings.bootstrap_org_name, "viewer")]
+        assert not {"password_hash", "mfa_totp_secret_encrypted"}.intersection(newest)
+
+        cutoff = (security.now_utc() - timedelta(hours=24)).isoformat()
+        recent = await ac.get("/api/v1/admin/accounts", headers=owner_headers, params={"created_after": cutoff})
+        assert [item["email"] for item in recent.json()] == ["newcomer@example.com"]
+
+        denied = await ac.get(
+            "/api/v1/admin/accounts", headers={"Authorization": f"Bearer {newcomer.json()['access_token']}"}
+        )
+        assert denied.status_code == 403
+
+
+@pytest.mark.asyncio
 async def test_admin_user_provisioning_creates_and_updates_org_memberships():
     async with await client() as ac:
         owner = await register(

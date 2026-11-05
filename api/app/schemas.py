@@ -35,6 +35,11 @@ class UserAdminRead(UserRead):
     memberships: list[MembershipRead] = []
 
 
+class AdminAccountRead(UserAdminRead):
+    last_session_ip: str | None = None
+    last_session_at: datetime | None = None
+
+
 class UserAdminUpdate(BaseModel):
     display_name: str | None = Field(default=None, max_length=160)
     email_verified: bool | None = None

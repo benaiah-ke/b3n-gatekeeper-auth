@@ -3,10 +3,12 @@ import { CheckCircle2, KeyRound, RotateCcw, Search, ShieldAlert, ShieldCheck, Tr
 import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '@/services/api'
-import type { AdminUser, Role, SetupStatus, UserDeleteResult, UserMembership } from '@/types'
+import type { AdminAccount, AdminUser, Role, SetupStatus, UserDeleteResult, UserMembership } from '@/types'
 
 const setup = ref<SetupStatus | null>(null)
 const users = ref<AdminUser[]>([])
+// Stays null unless the signed-in user is a platform admin.
+const newAccounts = ref<AdminAccount[] | null>(null)
 const roles = ref<Role[]>([])
 const query = ref('')
 const loading = ref(true)
@@ -67,6 +69,8 @@ async function load() {
     ])
     roles.value = roleRows
     users.value = userRows
+    const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString()
+    newAccounts.value = await api.newAccounts({ createdAfter: since }).catch(() => null)
     if (!provisionRoleId.value) {
       provisionRoleId.value = roleRows.find((role) => role.name === 'viewer')?.id || roleRows[0]?.id || ''
     }
@@ -253,6 +257,54 @@ onMounted(load)
           <h2 class="mt-2 text-2xl font-semibold">{{ owners.length }}</h2>
         </article>
       </div>
+
+      <article v-if="newAccounts" class="panel grid gap-3 p-4">
+        <div>
+          <p class="mono-label">Last 30 days</p>
+          <h2 class="mt-2 text-xl font-semibold">New Accounts</h2>
+        </div>
+        <p v-if="!newAccounts.length" class="text-sm text-muted">No accounts were created in the last 30 days.</p>
+        <div
+          v-for="account in newAccounts"
+          v-else
+          :key="account.id"
+          class="flex flex-wrap items-start justify-between gap-3 border-t border-border pt-3"
+        >
+          <div class="min-w-0">
+            <p class="break-words text-sm font-semibold">{{ account.email }}</p>
+            <p class="mt-1 break-words font-mono text-xs text-muted">
+              created {{ new Date(account.created_at).toLocaleString() }} / last ip {{ account.last_session_ip || 'none' }}
+            </p>
+          </div>
+          <div class="flex flex-wrap gap-2">
+            <span
+              class="rounded-md border px-2 py-1 font-mono text-xs"
+              :class="account.disabled ? 'border-red/50 text-red' : 'border-green/50 text-green'"
+            >
+              {{ account.disabled ? 'suspended' : 'active' }}
+            </span>
+            <span class="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted">
+              {{ account.email_verified ? 'verified' : 'unverified' }}
+            </span>
+            <span class="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted">
+              {{ account.mfa_totp_enabled || account.passkey_count ? 'mfa on' : 'mfa off' }}
+            </span>
+            <span
+              v-for="membership in account.memberships"
+              :key="membership.id"
+              class="rounded-md border border-border bg-surface px-2 py-1 font-mono text-xs text-muted"
+            >
+              {{ membership.org_name }} / {{ membership.role }} / {{ membership.status }}
+            </span>
+            <span
+              v-if="!account.memberships.length"
+              class="rounded-md border border-border px-2 py-1 font-mono text-xs text-muted"
+            >
+              no organization
+            </span>
+          </div>
+        </div>
+      </article>
 
       <form class="panel grid gap-4 p-4" :class="{ 'opacity-60': !canManage }" @submit.prevent="provisionUser">
         <div class="flex flex-wrap items-start justify-between gap-3">

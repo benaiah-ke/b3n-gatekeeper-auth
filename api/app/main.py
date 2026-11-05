@@ -69,6 +69,7 @@ from app.models import (
 from app.schemas import (
     AccountDeactivateRequest,
     AccountDeactivateResponse,
+    AdminAccountRead,
     AuditPruneRequest,
     AuditPruneResponse,
     AuditRead,
@@ -3751,6 +3752,39 @@ async def list_users(
     result = await db.execute(query)
     users = result.scalars().unique().all()
     return [await user_admin_read(db, user, visible_org_ids) for user in users]
+
+
+@app.get("/api/v1/admin/accounts", response_model=list[AdminAccountRead])
+async def list_new_accounts(
+    created_after: datetime | None = None,
+    limit: int = Query(100, ge=1, le=500),
+    principal: Principal = Depends(require_scopes(["admin:*"])),
+    db: AsyncSession = Depends(get_db),
+):
+    await require_platform_admin(db, principal)
+    query = select(User).order_by(User.created_at.desc()).limit(limit)
+    if created_after:
+        if created_after.tzinfo:
+            created_after = created_after.astimezone(UTC).replace(tzinfo=None)
+        query = query.where(User.created_at > created_after)
+    accounts: list[AdminAccountRead] = []
+    for user in (await db.execute(query)).scalars():
+        last_session = (
+            await db.execute(
+                select(Session.ip_address, Session.created_at)
+                .where(Session.user_id == user.id)
+                .order_by(Session.created_at.desc())
+                .limit(1)
+            )
+        ).first()
+        accounts.append(
+            AdminAccountRead(
+                **(await user_admin_read(db, user)).model_dump(),
+                last_session_ip=last_session[0] if last_session else None,
+                last_session_at=last_session[1] if last_session else None,
+            )
+        )
+    return accounts
 
 
 @app.post("/api/v1/users/provision", response_model=UserProvisionResponse)

@@ -1,4 +1,5 @@
 import type {
+  AdminAccount,
   AdminUser,
   AccountDeactivateResult,
   AccountExport,
@@ -487,6 +488,12 @@ export const api = {
     if (params.q) query.set('q', params.q)
     const suffix = query.toString() ? `?${query.toString()}` : ''
     return request<AdminUser[]>(`/api/v1/users${suffix}`)
+  },
+  newAccounts(params: { createdAfter?: string } = {}) {
+    const query = new URLSearchParams()
+    if (params.createdAfter) query.set('created_after', params.createdAfter)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<AdminAccount[]>(`/api/v1/admin/accounts${suffix}`)
   },
   updateUser(id: string, payload: { display_name?: string | null; email_verified?: boolean; disabled?: boolean }) {
     return request<AdminUser>(`/api/v1/users/${id}`, {
