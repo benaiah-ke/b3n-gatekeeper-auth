@@ -4952,6 +4952,9 @@ async def ensure_client_scopes_allowed(
 
 def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
     # GateKeeper's own audiences (the issuer included) are always reserved: tokens for them act on GateKeeper.
+    # A client with no audience gets issuer-audience tokens, so it counts as reserved too.
+    if not audiences and not mcp_resource_uri:
+        return True
     reserved = settings.reserved_audience_set | settings.gatekeeper_audience_set
     return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
 
@@ -6945,7 +6948,8 @@ async def update_client(
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
     if uses_reserved_audience(client.audiences, client.mcp_resource_uri) or uses_reserved_audience(
-        body.audiences, body.mcp_resource_uri
+        client.audiences if body.audiences is None else body.audiences,
+        client.mcp_resource_uri if body.mcp_resource_uri is None else body.mcp_resource_uri,
     ) or (body.verified is not None and body.verified != bool(client.verified_at)):
         await require_platform_admin(db, principal)
     if body.scopes is not None:

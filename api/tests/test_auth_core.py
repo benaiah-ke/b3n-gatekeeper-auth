@@ -677,7 +677,12 @@ async def test_org_admin_cannot_update_another_organization(monkeypatch):
 @pytest.mark.asyncio
 async def test_client_scopes_are_capped_to_the_creators_permissions(monkeypatch):
     password = "correct horse battery"
-    body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    body = {
+        "name": "Product",
+        "public": True,
+        "redirect_uris": ["https://app.example.com/callback"],
+        "audiences": ["product-api"],
+    }
 
     def bearer(token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
@@ -6901,3 +6906,31 @@ async def test_consent_accepts_only_hosted_sessions():
         ac.cookies.clear()
         remembered = await ac.get("/oauth/authorize", headers=owner_headers, params=params)
         assert "code=" in remembered.headers["location"]
+
+
+@pytest.mark.asyncio
+async def test_clients_without_an_audience_need_a_platform_admin():
+    body = {"name": "Backend", "public": False, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        empty = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "scopes": ["auth:read"]})
+        assert empty.status_code == 403
+        own = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**body, "audiences": ["my-api"], "scopes": ["auth:read"]}
+        )
+        assert own.status_code == 200
+        cleared = await ac.patch(f"/api/v1/clients/{own.json()['id']}", headers=admin_headers, json={"audiences": []})
+        assert cleared.status_code == 403
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": own.json()["client_id"],
+                "client_secret": own.json()["client_secret"],
+            },
+        )
+        assert decode_access_token(service.json()["access_token"], audience="my-api")["aud"] == "my-api"
+        service_headers = {"Authorization": f"Bearer {service.json()['access_token']}"}
+        assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
+        platform = await ac.post("/api/v1/clients", headers=owner_headers, json={**body, "scopes": ["auth:read"]})
+        assert platform.status_code == 200
