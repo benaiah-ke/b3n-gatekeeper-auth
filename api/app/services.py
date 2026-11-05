@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import secrets
 import smtplib
 import ssl
@@ -43,6 +44,7 @@ from app.security import (
     verify_password,
 )
 
+logger = logging.getLogger("gatekeeper")
 MFA_AMR_VALUES = {"otp", "recovery", "webauthn"}
 TRUSTED_DEVICE_AMR = "trusted_device"
 DEFAULT_ORG_ROLES = [
@@ -72,6 +74,8 @@ SECURITY_ALERT_SUBJECTS = {
     "auth.invitation.refused": "Invitation signup refused",
     "auth.oauth.signup.refused": "Federated signup refused",
     "auth.login.new_ip": "Privileged login from a new IP",
+    "org.owner.missing": "Bootstrap organization has no owner",
+    "org.owner.bootstrap": "Bootstrap owner set by an operator",
 }
 ROLE_ALERT_ACTIONS = {
     "user.membership.update",
@@ -346,7 +350,7 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     org = result.scalar_one_or_none()
     if org:
         await ensure_default_clients(db, org)
-        await ensure_bootstrap_owner(db, org)
+        await report_missing_bootstrap_owner(db, org)
         await db.commit()
         return org
 
@@ -356,7 +360,7 @@ async def ensure_bootstrap(db: AsyncSession) -> Organization:
     await add_default_org_roles(db, org)
     await audit(db, "org.bootstrap", org_id=org.id, target_type="organization", target_id=org.id)
     await ensure_default_clients(db, org)
-    await ensure_bootstrap_owner(db, org)
+    await report_missing_bootstrap_owner(db, org)
     await db.commit()
     return org
 
@@ -385,51 +389,22 @@ async def org_has_owner(db: AsyncSession, org_id: str) -> bool:
     return result.scalar_one_or_none() is not None
 
 
-async def ensure_bootstrap_owner(db: AsyncSession, org: Organization) -> bool:
+async def report_missing_bootstrap_owner(db: AsyncSession, org: Organization) -> None:
+    """Never promote anyone automatically. An ownerless bootstrap org with members is an incident
+    for an operator to resolve with `python -m app.ops bootstrap-owner --email ...`."""
     if await org_has_owner(db, org.id):
-        return False
-
-    role_result = await db.execute(select(Role).where(Role.org_id == org.id, Role.name == "owner"))
-    owner_role = role_result.scalar_one_or_none()
-    if not owner_role:
-        return False
-
-    bootstrap_email = str(settings.bootstrap_admin_email).lower()
-    candidate_result = await db.execute(
-        select(Membership)
-        .join(User, User.id == Membership.user_id)
-        .where(
-            Membership.org_id == org.id,
-            Membership.status == "active",
-            User.email == bootstrap_email,
-        )
-        .order_by(Membership.created_at.asc())
-        .limit(1)
+        return
+    member = await db.execute(
+        select(Membership.id).where(Membership.org_id == org.id, Membership.status == "active").limit(1)
     )
-    candidate = candidate_result.scalar_one_or_none()
-    if not candidate:
-        candidate_result = await db.execute(
-            select(Membership)
-            .where(Membership.org_id == org.id, Membership.status == "active")
-            .order_by(Membership.created_at.asc())
-            .limit(1)
-        )
-        candidate = candidate_result.scalar_one_or_none()
-
-    if not candidate:
-        return False
-
-    candidate.role_id = owner_role.id
-    await audit(
-        db,
-        "org.owner.bootstrap",
-        org_id=org.id,
-        actor_user_id=candidate.user_id,
-        target_type="membership",
-        target_id=candidate.id,
-        details={"reason": "no_active_owner"},
+    if member.scalar_one_or_none() is None:
+        return
+    logger.warning(
+        "Bootstrap organization %s has active members but no active owner; "
+        "run python -m app.ops bootstrap-owner --email <owner email>",
+        org.slug,
     )
-    return True
+    await audit(db, "org.owner.missing", org_id=org.id, target_type="organization", target_id=org.id)
 
 
 async def ensure_default_clients(db: AsyncSession, org: Organization) -> None:

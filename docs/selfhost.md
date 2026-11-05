@@ -184,6 +184,18 @@ out. If `/account` loads but shows `viewer`, signup succeeded but the account
 cannot perform setup actions. Use an owner account or the configured bootstrap
 admin account; do not work around this by sharing tokens.
 
+## Operator Commands
+
+GateKeeper never promotes anyone to bootstrap org owner on its own. If the
+bootstrap org has members but no active owner, the API logs a warning, writes an
+`org.owner.missing` audit event and sends a security alert. Fix it from a shell
+on the host:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops bootstrap-owner --email owner@example.com
+```
+
 ## Setup Checklist
 
 - `/account` shows an owner role for the bootstrap org.

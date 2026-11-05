@@ -17,7 +17,7 @@ from sqlalchemy import select
 from webauthn.helpers import bytes_to_base64url
 from webauthn.helpers.structs import CredentialDeviceType
 
-from app import alerts, security, services
+from app import alerts, ops, security, services
 from app import main as main_module
 from app.config import settings
 from app.database import Base, async_session_factory, engine
@@ -3937,6 +3937,43 @@ async def test_new_accounts_get_no_default_bootstrap_membership(monkeypatch):
         for email in ("plain@example.com", str(settings.bootstrap_admin_email)):
             user = await services.create_user(db, email=email, password=password)
             assert await services.org_roles(db, user.id) == []
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_org_without_owner_is_never_auto_promoted(monkeypatch):
+    sent: list[str] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["data"]["attributes"]["subject"])
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+
+    async with async_session_factory() as db:
+        owner_membership = (
+            await db.execute(select(Membership).where(Membership.user_id == owner.json()["user"]["id"]))
+        ).scalar_one()
+        owner_membership.status = "revoked"
+        await db.commit()
+        org = await services.ensure_bootstrap(db)
+        assert not await services.org_has_owner(db, org.id)
+        assert [item.role for item in await services.org_roles(db, member.json()["user"]["id"])] == ["viewer"]
+        missing = await db.execute(select(AuditEvent).where(AuditEvent.action == "org.owner.missing"))
+        assert missing.scalars().first() is not None
+    await asyncio.gather(*alerts._pending)
+    assert "[GateKeeper] Bootstrap organization has no owner" in sent
+
+    await ops.set_bootstrap_owner("member@example.com")
+    async with async_session_factory() as db:
+        assert [item.role for item in await services.org_roles(db, member.json()["user"]["id"])] == ["owner"]
+        promoted = await db.execute(select(AuditEvent).where(AuditEvent.action == "org.owner.bootstrap"))
+        assert promoted.scalar_one().details["via"] == "operator"
 
 
 @pytest.mark.asyncio
