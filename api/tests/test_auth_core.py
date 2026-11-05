@@ -47,6 +47,7 @@ def reset_jwt_key_cache():
 
 @pytest.fixture(autouse=True)
 async def reset_db():
+    alerts._recent.clear()
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
@@ -6114,7 +6115,7 @@ async def test_security_events_queue_alerts_without_secret_values(monkeypatch):
     assert "scopes: admin:*" in token_alert
     assert "Time (UTC): " in token_alert
     refusal_keys = [item["key"] for item in sent if item["subject"] == "[GateKeeper] Signup refused"]
-    assert len(refusal_keys) == 2 and len(set(refusal_keys)) == 1
+    assert len(refusal_keys) == 1
     for item in sent:
         assert token.json()["token"] not in item["text"]
         assert password not in item["text"]
@@ -6612,3 +6613,27 @@ async def test_federated_login_never_bypasses_mfa_or_links_by_email(monkeypatch)
             user.mfa_totp_enabled_at = None
             await db.commit()
         assert (await federated_login(ac)).status_code == 302
+
+
+@pytest.mark.asyncio
+async def test_signup_is_rate_limited_per_ip_and_refusal_alerts_are_deduplicated(monkeypatch):
+    sent: list[str] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["data"]["attributes"]["subject"])
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        statuses = []
+        for attempt in range(6):
+            refused = await ac.post(
+                "/api/v1/auth/signup", json={"email": f"intruder{attempt}@example.com", "password": "x" * 12}
+            )
+            statuses.append(refused.status_code)
+        await asyncio.gather(*alerts._pending)
+    assert statuses == [403, 403, 403, 403, 429, 429]
+    assert sent.count("[GateKeeper] Signup refused") == 1

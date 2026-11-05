@@ -1042,6 +1042,7 @@ async def pending_invitation_exists(db: AsyncSession, email: str) -> bool:
 
 @app.post("/api/v1/auth/signup", response_model=TokenResponse)
 async def signup(body: SignupRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    await enforce_rate_limit(db, key=f"signup:{client_ip(request) or 'unknown'}", limit=5, window_seconds=3600)
     # Self-service signup only bootstraps the first owner of an empty install.
     if (await db.execute(select(User.id).limit(1))).scalar_one_or_none():
         await refuse_registration(db, "auth.signup.refused", email=str(body.email), request=request)
