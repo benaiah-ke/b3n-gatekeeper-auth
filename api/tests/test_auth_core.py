@@ -6525,3 +6525,44 @@ async def test_scim_and_provisioning_cannot_reenable_or_attach_accounts_from_oth
     assert disabled["elsewhere@example.com"] is True
     assert disabled["both@example.com"] is True
     assert users["elsewhere@example.com"] not in members
+
+
+@pytest.mark.asyncio
+async def test_api_tokens_bind_only_projects_clients_and_audiences_of_their_own_org():
+    client_body = {"name": "Other app", "public": True, "redirect_uris": ["https://other.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        other_id = other.json()["id"]
+        switched = await ac.post("/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": other_id})
+        other_headers = {"Authorization": f"Bearer {switched.json()['access_token']}"}
+        foreign_project = await ac.post(
+            "/api/v1/projects",
+            headers=other_headers,
+            json={"org_id": other_id, "name": "Theirs", "slug": "theirs", "audience": "their-api"},
+        )
+        foreign_client = await ac.post(
+            "/api/v1/clients", headers=other_headers, json={**client_body, "audiences": ["their-api"]}
+        )
+        own_project = await ac.post(
+            "/api/v1/projects",
+            headers=admin_headers,
+            json={"org_id": org_id, "name": "Ours", "slug": "ours", "audience": "our-api"},
+        )
+        own_client = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**client_body, "audiences": ["our-app-api"]}
+        )
+        assert {foreign_project.status_code, foreign_client.status_code, own_project.status_code} == {200}
+        assert own_client.status_code == 200
+
+        token = {"name": "bound", "token_type": "service", "org_id": org_id, "scopes": ["auth:read"]}
+        for binding, expected in (
+            ({"project_id": foreign_project.json()["id"]}, 403),
+            ({"client_id": foreign_client.json()["id"]}, 403),
+            ({"project_id": own_project.json()["id"], "audiences": ["their-api"]}, 400),
+            ({"client_id": own_client.json()["id"], "audiences": ["our-api"]}, 400),
+            ({"project_id": own_project.json()["id"], "audiences": ["our-api"]}, 200),
+            ({"client_id": own_client.json()["id"], "audiences": ["our-app-api"]}, 200),
+        ):
+            created = await ac.post("/api/v1/tokens", headers=admin_headers, json={**token, **binding})
+            assert created.status_code == expected, binding

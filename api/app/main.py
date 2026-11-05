@@ -7236,6 +7236,25 @@ async def list_tokens(
     return [token_read(token) for token in result.scalars()]
 
 
+async def ensure_token_bindings_allowed(
+    db: AsyncSession, *, org_id: str | None, project_id: str | None, client_id: str | None, audiences: list[str]
+) -> None:
+    """A token binds only a project and client of its own org, and only audiences they serve."""
+    allowed_audiences: set[str] = set()
+    if project_id:
+        project = await db.get(Project, project_id)
+        if not project or project.org_id != org_id:
+            raise HTTPException(status_code=403, detail="Project belongs to another organization")
+        allowed_audiences.add(project.audience)
+    if client_id:
+        client = await db.get(AuthClient, client_id)
+        if not client or client.org_id != org_id:
+            raise HTTPException(status_code=403, detail="Client belongs to another organization")
+        allowed_audiences.update(client.audiences or [])
+    if (project_id or client_id) and not set(audiences or []).issubset(allowed_audiences):
+        raise HTTPException(status_code=400, detail="Token audiences must belong to its project or client")
+
+
 @app.post("/api/v1/tokens", response_model=TokenRead)
 async def create_token(
     body: TokenCreate,
@@ -7264,6 +7283,9 @@ async def create_token(
         scopes = await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
     if reserved_token_audience(body.audiences):
         await require_platform_admin(db, principal)
+    await ensure_token_bindings_allowed(
+        db, org_id=org_id, project_id=body.project_id, client_id=body.client_id, audiences=body.audiences
+    )
     token, raw = await create_api_token(
         db,
         name=body.name,
