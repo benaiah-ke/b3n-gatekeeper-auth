@@ -4629,7 +4629,20 @@ async def confirm_password_reset(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     user.password_hash = hash_password(body.new_password)
-    await audit(db, "auth.password.reset", actor_user_id=user.id, request=request)
+    # A reset means the old password may be known to someone else, so everything it opened is closed.
+    revoked_sessions = await revoke_user_sessions(db, user_id=user.id)
+    tokens = await db.execute(select(ApiToken).where(ApiToken.user_id == user.id, ApiToken.revoked_at.is_(None)))
+    revoked_tokens = 0
+    for token in tokens.scalars():
+        token.revoked_at = now_utc()
+        revoked_tokens += 1
+    await audit(
+        db,
+        "auth.password.reset",
+        actor_user_id=user.id,
+        details={"revoked_sessions": revoked_sessions, "revoked_tokens": revoked_tokens},
+        request=request,
+    )
     await db.commit()
     return {"status": "updated"}
 

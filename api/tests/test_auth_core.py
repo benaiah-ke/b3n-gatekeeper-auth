@@ -6730,3 +6730,29 @@ async def test_incident_sweep_lists_what_new_accounts_touched_and_revoke_takes_f
     revoked = await ops.overscoped_tokens(revoke=True, ids=[overscoped.id])
     assert [item["id"] for item in revoked] == [overscoped.id]
     assert await ops.overscoped_tokens() == []
+
+
+@pytest.mark.asyncio
+async def test_password_reset_revokes_sessions_and_api_tokens():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        session_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        token = await ac.post("/api/v1/tokens", headers=session_headers, json={"name": "cli", "token_type": "personal"})
+        token_headers = {"Authorization": f"Bearer {token.json()['token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 200
+        async with async_session_factory() as db:
+            user_id = owner.json()["user"]["id"]
+            code = await services.create_one_time_code(
+                db, email="owner@example.com", purpose="reset_password", user_id=user_id
+            )
+            await db.commit()
+        reset = await ac.post(
+            "/api/v1/auth/password/reset/confirm",
+            json={"email": "owner@example.com", "code": code, "new_password": "a brand new passphrase"},
+        )
+        assert reset.status_code == 200
+        ac.cookies.clear()
+        assert (await ac.get("/api/v1/auth/me", headers=session_headers)).status_code == 401
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": owner.json()["refresh_token"]})
+        assert refreshed.status_code == 401
