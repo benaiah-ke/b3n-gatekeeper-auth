@@ -7299,6 +7299,77 @@ async def test_client_tokens_never_fall_back_to_the_issuer_audience():
 
 
 @pytest.mark.asyncio
+async def test_app_sessions_stored_with_the_issuer_audience_refresh_to_the_client_audience():
+    from jose import jwt as jose_jwt
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        created = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "MCP",
+                "public": True,
+                "redirect_uris": ["https://mcp.example.com/callback"],
+                "audiences": [],
+                "mcp_resource_uri": "https://mcp.example.com/mcp",
+                "scopes": ["openid", "auth:read"],
+            },
+        )
+        client_id = created.json()["client_id"]
+        params = {
+            "response_type": "code",
+            "client_id": client_id,
+            "redirect_uri": "https://mcp.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "redirect_uri": "https://mcp.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        session_id = jose_jwt.get_unverified_claims(exchanged.json()["access_token"])["session_id"]
+        async with async_session_factory() as db:
+            stored = await db.get(Session, session_id)
+            stored.audience = settings.issuer  # an app session stored before the deploy
+            await db.commit()
+        ac.cookies.clear()
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": exchanged.json()["refresh_token"]})
+        assert refreshed.status_code == 200
+        app_token = refreshed.json()["access_token"]
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(app_token)["aud"])
+        app_headers = {"Authorization": f"Bearer {app_token}"}
+        assert (await ac.get("/api/v1/oauth/authorize/context", headers=app_headers, params=params)).status_code == 401
+
+        hosted = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "client_id": client_id,
+                "audience": settings.issuer,
+            },
+        )
+        ac.cookies.clear()
+        hosted_refresh = await ac.post("/api/v1/auth/refresh", json={"refresh_token": hosted.json()["refresh_token"]})
+        hosted_token = hosted_refresh.json()["access_token"]
+        assert jose_jwt.get_unverified_claims(hosted_token)["aud"] == settings.issuer
+        hosted_context = await ac.get(
+            "/api/v1/oauth/authorize/context", headers={"Authorization": f"Bearer {hosted_token}"}, params=params
+        )
+        assert hosted_context.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_device_grants_need_a_hosted_approver_and_a_public_or_authenticated_client():
     async with await client() as ac:
         owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})

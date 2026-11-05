@@ -759,6 +759,10 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
         requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
     scopes = capped_session_scopes(requested_scopes, selected_org)
     audience = session.audience or (client_default_audience(client) if client else settings.issuer)
+    # Only the hosted UI's own logins (they always carry a device cookie hash) keep the issuer audience for a
+    # client. Code and device flow sessions never store one, so an app session stored with the issuer is narrowed.
+    if client and audience == settings.issuer and not session.device_id_hash:
+        audience = client_default_audience(client)
     refresh.used_at = now_utc()
     new_refresh_secret = new_opaque_token("gkr")
     new_refresh = RefreshToken(
