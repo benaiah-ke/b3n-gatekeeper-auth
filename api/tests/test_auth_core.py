@@ -7453,3 +7453,32 @@ async def test_scim_deactivation_cannot_disable_platform_admins_or_owners(monkey
         disabled = dict((await db.execute(select(User.email, User.disabled))).all())
     assert disabled["platform@example.com"] is False
     assert disabled["t-owner@example.com"] is False
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_flags_mcp_only_clients():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        created = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={
+                "name": "MCP",
+                "public": True,
+                "redirect_uris": ["https://mcp.example.com/callback"],
+                "audiences": [],
+                "mcp_resource_uri": "https://mcp.example.com/mcp",
+                "scopes": ["openid"],
+            },
+        )
+        assert created.status_code == 200
+    long_ago = services.now_utc() - timedelta(days=30)
+    async with async_session_factory() as db:
+        row = await db.get(main_module.AuthClient, created.json()["id"])
+        row.created_at = long_ago
+        for user in (await db.execute(select(User))).scalars():
+            user.created_at = long_ago
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    assert sweep["owned_orgs"] == []
+    assert created.json()["client_id"] in {row["client_id"] for row in sweep["clients"]}

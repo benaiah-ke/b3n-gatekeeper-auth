@@ -172,7 +172,7 @@ async def incident_sweep(since: datetime) -> dict[str, list[dict]]:
             for client in (await db.execute(select(AuthClient).order_by(AuthClient.created_at))).scalars()
             if client.org_id in owned_org_ids
             or client.created_at >= since
-            or not (client.audiences or client.mcp_resource_uri)
+            or not client.audiences
             or flagged_audiences.intersection(client.audiences or [])
             or PRIVILEGED_SCOPES.intersection(client.scopes or [])
             or client.verified_at
