@@ -199,6 +199,17 @@ docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
   python -m app.ops bootstrap-owner --email owner@example.com
 ```
 
+List API tokens whose stored scopes exceed what their owner's role allows today,
+then revoke the owned ones. Tokens without an owner that hold `*`, `admin:*` or
+`token:*` are listed as `review` and left for you to decide:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops overscoped-tokens
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops overscoped-tokens --revoke
+```
+
 ## Setup Checklist
 
 - `/account` shows an owner role for the bootstrap org.

@@ -5644,6 +5644,48 @@ async def test_token_administration_stays_in_the_callers_org(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_operator_command_revokes_tokens_that_exceed_the_owners_role():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        viewer = await register(ac, json={"email": "viewer@example.com", "password": password})
+        org_id = owner.json()["orgs"][0]["id"]
+
+        async def mint(user_id: str | None, token_type: str, scopes: list[str]):
+            async with async_session_factory() as db:
+                token, raw = await services.create_api_token(
+                    db,
+                    name=f"{token_type} token",
+                    token_type_value=token_type,
+                    org_id=org_id,
+                    user_id=user_id,
+                    project_id=None,
+                    client_id=None,
+                    scopes=scopes,
+                    audiences=[],
+                    expires_at=None,
+                )
+                await db.commit()
+                return token.id, raw
+
+        escalated_id, escalated_raw = await mint(viewer.json()["user"]["id"], "personal", ["admin:*", "auth:read"])
+        await mint(viewer.json()["user"]["id"], "personal", ["auth:read"])
+        await mint(owner.json()["user"]["id"], "admin", ["*"])
+        unowned_id, _unowned_raw = await mint(None, "service", ["*"])
+
+        listed = await ops.overscoped_tokens()
+        assert {(item["id"], item["action"]) for item in listed} == {(escalated_id, "revoke"), (unowned_id, "review")}
+        assert next(item for item in listed if item["id"] == escalated_id)["excess"] == ["admin:*"]
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {escalated_raw}"})
+        assert me.status_code == 200
+
+        await ops.overscoped_tokens(revoke=True)
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {escalated_raw}"})
+        assert me.status_code == 401
+        assert [item["id"] for item in await ops.overscoped_tokens()] == [unowned_id]
+
+
+@pytest.mark.asyncio
 async def test_api_token_validation_returns_product_metadata_and_policy_checks():
     async with await client() as ac:
         owner = await register(
