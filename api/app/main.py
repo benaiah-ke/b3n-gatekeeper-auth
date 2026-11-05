@@ -175,6 +175,7 @@ from app.services import (
     audit,
     authenticate_password,
     cap_scopes,
+    client_ip,
     create_api_token,
     create_one_time_code,
     create_session_tokens,
@@ -1069,7 +1070,7 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
 async def login(body: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     await enforce_rate_limit(
         db,
-        key=f"login:{str(body.email).lower()}:{request.client.host if request.client else 'unknown'}",
+        key=f"login:{str(body.email).lower()}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=300,
     )
@@ -1784,7 +1785,7 @@ async def passkey_registration_options(
     rp_id, _origins = require_webauthn_configuration()
     await enforce_rate_limit(
         db,
-        key=f"passkey-register:{user.id}:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-register:{user.id}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=3600,
     )
@@ -1920,7 +1921,7 @@ async def passkey_authentication_options(
         validate_audience(client, payload.audience)
     await enforce_rate_limit(
         db,
-        key=f"passkey-auth:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-auth:{client_ip(request) or 'unknown'}",
         limit=30,
         window_seconds=300,
     )
@@ -1961,7 +1962,7 @@ async def verify_passkey_authentication(
     rp_id, origins = require_webauthn_configuration()
     await enforce_rate_limit(
         db,
-        key=f"passkey-auth-verify:{request.client.host if request.client else 'unknown'}",
+        key=f"passkey-auth-verify:{client_ip(request) or 'unknown'}",
         limit=30,
         window_seconds=300,
     )
@@ -4259,7 +4260,7 @@ async def accept_invitation(
     email = str(body.email).lower()
     await enforce_rate_limit(
         db,
-        key=f"invitation-accept:{email}:{request.client.host if request.client else 'unknown'}",
+        key=f"invitation-accept:{email}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=300,
     )
@@ -5958,7 +5959,7 @@ async def enforce_device_approval_rate_limit(
 ) -> None:
     await enforce_rate_limit(
         db,
-        key=f"device-approval:{user.id}:{request.client.host if request.client else 'unknown'}",
+        key=f"device-approval:{user.id}:{client_ip(request) or 'unknown'}",
         limit=20,
         window_seconds=300,
     )

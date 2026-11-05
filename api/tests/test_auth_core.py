@@ -25,6 +25,7 @@ from app.models import (
     Identity,
     Membership,
     OneTimeCode,
+    RateLimitBucket,
     Role,
     Session,
     User,
@@ -2927,6 +2928,42 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         )
         assert revoked_login_replay.status_code == 400
         assert revoked_login_replay.json()["detail"] == "Passkey ceremony expired or already used"
+
+
+def test_client_ip_trusts_forwarded_headers_only_from_trusted_proxies(monkeypatch):
+    def fake_request(peer: str, headers: dict[str, str]):
+        return SimpleNamespace(client=SimpleNamespace(host=peer), headers=headers)
+
+    forwarded = {"x-forwarded-for": "203.0.113.9, 10.0.0.1"}
+    assert services.client_ip(fake_request("172.18.0.6", forwarded)) == "172.18.0.6"
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "172.18.0.0/16")
+    assert services.client_ip(fake_request("172.18.0.6", forwarded)) == "203.0.113.9"
+    assert services.client_ip(fake_request("198.51.100.20", forwarded)) == "198.51.100.20"
+    with_cf = {**forwarded, "cf-connecting-ip": "2001:db8::7"}
+    assert services.client_ip(fake_request("172.18.0.6", with_cf)) == "2001:db8::7"
+    assert services.client_ip(fake_request("172.18.0.6", {"x-forwarded-for": "not-an-ip"})) == "172.18.0.6"
+    assert services.client_ip(None) is None
+
+
+@pytest.mark.asyncio
+async def test_audit_session_and_rate_limit_record_the_real_client_ip(monkeypatch):
+    monkeypatch.setattr(settings, "trusted_proxy_cidrs", "127.0.0.0/8")
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        login = await ac.post(
+            "/api/v1/auth/login",
+            headers={"X-Forwarded-For": "203.0.113.9"},
+            json={"email": "owner@example.com", "password": "correct horse battery"},
+        )
+        assert login.status_code == 200
+        session_id = decode_access_token(login.json()["access_token"])["session_id"]
+
+    async with async_session_factory() as db:
+        assert (await db.get(Session, session_id)).ip_address == "203.0.113.9"
+        login_event = (await db.execute(select(AuditEvent).where(AuditEvent.action == "auth.login"))).scalar_one()
+        assert login_event.ip_address == "203.0.113.9"
+        bucket_keys = set((await db.execute(select(RateLimitBucket.key))).scalars())
+        assert "login:owner@example.com:203.0.113.9" in bucket_keys
 
 
 @pytest.mark.asyncio

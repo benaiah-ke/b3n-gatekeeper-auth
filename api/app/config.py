@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 from functools import lru_cache
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -91,11 +92,27 @@ class Settings(BaseSettings):
     enable_dynamic_client_registration: bool = False
     mcp_default_scopes: str = "mcp:tools,mcp:resources"
 
+    # Comma-separated proxy CIDRs whose X-Forwarded-For / CF-Connecting-IP headers are trusted. Empty trusts nothing.
+    trusted_proxy_cidrs: str = ""
+
     cookie_name: str = "gk_session"
     refresh_cookie_name: str = "gk_refresh"
     device_cookie_name: str = "gk_device"
     cookie_secure: bool = False
     cookie_domain: str = ""
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def _validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        for item in value.split(","):
+            if item.strip():
+                ipaddress.ip_network(item.strip(), strict=False)
+        return value
+
+    @property
+    def trusted_proxy_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+        items = [item.strip() for item in self.trusted_proxy_cidrs.split(",") if item.strip()]
+        return [ipaddress.ip_network(item, strict=False) for item in items]
 
     @property
     def issuer(self) -> str:

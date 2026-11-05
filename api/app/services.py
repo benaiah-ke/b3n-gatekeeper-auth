@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import secrets
 import smtplib
 import ssl
@@ -114,6 +115,24 @@ def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = No
     return sorted(derived_scopes or {"auth:read"})
 
 
+def client_ip(request: Request | None) -> str | None:
+    """Real client IP: forwarded headers count only when the TCP peer is a trusted proxy."""
+    if not request or not request.client:
+        return None
+    peer = request.client.host
+    try:
+        trusted = any(ipaddress.ip_address(peer) in network for network in settings.trusted_proxy_networks)
+    except ValueError:
+        return peer
+    if not trusted:
+        return peer
+    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "").split(",")[0]
+    try:
+        return str(ipaddress.ip_address(forwarded.strip()))
+    except ValueError:
+        return peer
+
+
 async def audit(
     db: AsyncSession,
     action: str,
@@ -132,7 +151,7 @@ async def audit(
             action=action,
             target_type=target_type,
             target_id=target_id,
-            ip_address=request.client.host if request and request.client else None,
+            ip_address=client_ip(request),
             details=details or {},
         )
     )
@@ -461,7 +480,7 @@ async def create_session_tokens(
         client_id=client.id if client else None,
         token_hash=token_hash(session_secret),
         device_id_hash=device_id_hash,
-        ip_address=request.client.host if request and request.client else None,
+        ip_address=client_ip(request),
         user_agent=request.headers.get("user-agent") if request else None,
         amr=list(amr or []),
         trusted_at=trusted_at,
