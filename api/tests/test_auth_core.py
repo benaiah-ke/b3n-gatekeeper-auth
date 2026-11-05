@@ -28,6 +28,7 @@ from app.models import (
     InstallClaim,
     Membership,
     OneTimeCode,
+    Organization,
     RateLimitBucket,
     Role,
     Session,
@@ -6756,3 +6757,70 @@ async def test_password_reset_revokes_sessions_and_api_tokens():
         assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
         refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": owner.json()["refresh_token"]})
         assert refreshed.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_org_admins_cannot_take_over_owner_or_platform_admin_accounts(monkeypatch):
+    password = "correct horse battery"
+    new_password = {"Operations": [{"op": "replace", "path": "password", "value": "attacker chosen secret"}]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        attempts = (
+            ("patch", f"/scim/v2/Users/{owner_id}", new_password),
+            ("post", f"/api/v1/users/{owner_id}/mfa/totp/reset", None),
+            ("patch", f"/api/v1/users/{owner_id}", {"display_name": "Taken"}),
+            ("post", f"/api/v1/users/{owner_id}/delete", {"dry_run": True}),
+            ("post", f"/api/v1/users/{owner_id}/sessions/revoke", None),
+        )
+        for method, path, body in attempts:
+            response = await getattr(ac, method)(path, headers=admin_headers, **({"json": body} if body else {}))
+            assert response.status_code == 403, path
+        stolen = await ac.post(
+            "/api/v1/auth/login", json={"email": "owner@example.com", "password": "attacker chosen secret"}
+        )
+        assert stolen.status_code == 401
+
+        async with async_session_factory() as db:
+            roles = {(role.org_id, role.name): role.id for role in (await db.execute(select(Role))).scalars()}
+            second = Organization(name="Second", slug="second")
+            db.add(second)
+            await db.flush()
+            for name in ("owner", "admin"):
+                permissions = ["*"] if name == "owner" else ["admin:*", "auth:*"]
+                role = Role(org_id=second.id, name=name, permissions=permissions)
+                db.add(role)
+                await db.flush()
+                roles[(second.id, name)] = role.id
+            people = {}
+            for email, role_name in (("tenant-owner@example.com", "owner"), ("tenant-admin@example.com", "admin")):
+                user = await services.create_user(db, email=email, password=password)
+                db.add(Membership(org_id=second.id, user_id=user.id, role_id=roles[(second.id, role_name)]))
+                people[role_name] = user.id
+            platform = await services.create_user(db, email="platform@example.com", password=password)
+            await db.commit()
+        tenant_admin = await ac.post(
+            "/api/v1/auth/login", json={"email": "tenant-admin@example.com", "password": password}
+        )
+        tenant_headers = {"Authorization": f"Bearer {tenant_admin.json()['access_token']}"}
+        tenant_takeover = await ac.patch(f"/scim/v2/Users/{people['owner']}", headers=tenant_headers, json=new_password)
+        assert tenant_takeover.status_code == 403
+
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        adopted = await ac.post(
+            "/api/v1/users/provision", headers=admin_headers, json={"email": "platform@example.com", "org_id": org_id}
+        )
+        assert adopted.status_code == 403
+
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        member_id = member.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        reset = await ac.post(f"/api/v1/users/{member_id}/mfa/totp/reset", headers=owner_headers)
+        assert reset.status_code == 200
+        renamed = await ac.patch(f"/api/v1/users/{member_id}", headers=owner_headers, json={"display_name": "Co-owner"})
+        assert renamed.status_code == 200

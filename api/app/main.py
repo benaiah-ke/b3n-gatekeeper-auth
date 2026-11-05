@@ -2454,6 +2454,17 @@ async def ensure_user_admin_visible(
     return visible_org_ids
 
 
+async def ensure_target_not_above_caller(db: AsyncSession, *, user_id: str, principal: Principal) -> None:
+    """Changing an owner's or platform admin's account would let a lesser admin take it over or lock it out."""
+    if await is_platform_admin(db, principal.user_id):
+        return
+    if await is_platform_admin(db, user_id):
+        raise HTTPException(status_code=403, detail="Only a platform admin can change this account")
+    for org in await org_roles(db, user_id):
+        if org.role == "owner":
+            await require_org_owner(db, principal, org.id)
+
+
 async def ensure_account_wide_change_allowed(
     db: AsyncSession,
     *,
@@ -2462,9 +2473,10 @@ async def ensure_account_wide_change_allowed(
     visible_org_ids: list[str] | None,
 ) -> None:
     """Passwords, MFA and suspension are account-wide, so an org admin may change them only for
-    accounts that belong to no organization outside the admin's own."""
+    accounts that belong to no organization outside the admin's own, and never for an account above them."""
     if await is_platform_admin(db, principal.user_id):
         return
+    await ensure_target_not_above_caller(db, user_id=user_id, principal=principal)
     membership_org_ids = set(await user_membership_org_ids(db, user_id=user_id))
     if visible_org_ids is None or membership_org_ids - set(visible_org_ids):
         raise HTTPException(status_code=403, detail="User belongs to another organization")
@@ -4119,6 +4131,7 @@ async def revoke_admin_user_sessions(
         principal=principal,
         org_ids=visible_org_ids if visible_org_ids is not None else [principal.org_id],
     )
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     revoked_count = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
@@ -4193,6 +4206,7 @@ async def delete_user_admin(
     if principal.user_id == user.id:
         raise HTTPException(status_code=400, detail="Use self-service account deactivation for the current user")
     visible_org_ids = await ensure_user_admin_visible(db, user_id=user.id, principal=principal)
+    await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=visible_org_ids)
     policy_org_ids = await ensure_user_hard_delete_policy(db, user_id=user.id, visible_org_ids=visible_org_ids)
     await require_admin_step_up_for_orgs(
         db,
@@ -4813,6 +4827,8 @@ async def revoke_session(
         raise HTTPException(status_code=404, detail="Session not found")
     if "*" not in principal.scopes and principal.user_id != session.user_id:
         raise HTTPException(status_code=403, detail="Session ownership required")
+    if principal.user_id != session.user_id:
+        await ensure_target_not_above_caller(db, user_id=session.user_id, principal=principal)
     session.revoked_at = now_utc()
     result = await db.execute(
         select(RefreshToken).where(
@@ -7117,6 +7133,8 @@ async def token_admin_org_allowed(db: AsyncSession, principal: Principal, org_id
 
 
 async def ensure_token_mutation_allowed(db: AsyncSession, *, token: ApiToken, principal: Principal) -> None:
+    if token.user_id and token.user_id != principal.user_id:
+        await ensure_target_not_above_caller(db, user_id=token.user_id, principal=principal)
     if can_admin_tokens(principal) and await token_admin_org_allowed(db, principal, token.org_id):
         return
     if (
