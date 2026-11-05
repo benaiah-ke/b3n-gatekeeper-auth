@@ -663,6 +663,66 @@ async def test_org_admin_cannot_update_another_organization(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_client_scopes_are_capped_to_the_creators_permissions(monkeypatch):
+    password = "correct horse battery"
+    body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+        await ac.put(
+            f"/api/v1/users/{admin.json()['user']['id']}/membership",
+            headers=bearer(owner_token),
+            json={"org_id": bootstrap_id, "role": "admin", "status": "active"},
+        )
+        admin_token = (
+            await ac.post("/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password})
+        ).json()["access_token"]
+
+        for scopes in (["admin:*"], ["*"], ["api:read"], ["token:*"]):
+            denied = await ac.post("/api/v1/clients", headers=bearer(admin_token), json={**body, "scopes": scopes})
+            assert denied.status_code == 403
+        allowed = await ac.post(
+            "/api/v1/clients",
+            headers=bearer(admin_token),
+            json={**body, "scopes": ["openid", "auth:read", "mcp:tools"]},
+        )
+        assert allowed.status_code == 200
+        widened = await ac.patch(
+            f"/api/v1/clients/{allowed.json()['id']}", headers=bearer(admin_token), json={"scopes": ["token:*"]}
+        )
+        assert widened.status_code == 403
+
+        second = await ac.post("/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers=bearer(switched.json()["access_token"]),
+            json={"email": "tenant@example.com", "org_id": second.json()["id"], "role": "owner"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant_token = (
+            await ac.post(
+                "/api/v1/auth/invitations/accept",
+                json={"email": "tenant@example.com", "password": password, "token": invite.json()["token"]},
+            )
+        ).json()["access_token"]
+        for scopes, expected in ((["*"], 403), (["admin:*"], 403), (["api:read"], 200)):
+            created = await ac.post("/api/v1/clients", headers=bearer(tenant_token), json={**body, "scopes": scopes})
+            assert created.status_code == expected
+
+        platform = await ac.post("/api/v1/clients", headers=bearer(owner_token), json={**body, "scopes": ["admin:*"]})
+        assert platform.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
         signup = await register(

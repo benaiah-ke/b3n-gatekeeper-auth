@@ -4859,6 +4859,15 @@ async def require_platform_admin(db: AsyncSession, principal: Principal) -> None
         raise HTTPException(status_code=403, detail="Platform admin required")
 
 
+async def ensure_client_scopes_allowed(
+    db: AsyncSession, *, principal: Principal, org_id: str | None, scopes: list[str]
+) -> None:
+    """A client can only carry scopes its creator holds; * and admin:* need a platform admin."""
+    if {"*", "admin:*"}.intersection(scopes):
+        await require_platform_admin(db, principal)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=scopes)
+
+
 def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
     reserved = settings.reserved_audience_set
     return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
@@ -6680,6 +6689,7 @@ async def create_client(
             raise HTTPException(status_code=409, detail="client_id already exists")
     org_id = await client_create_org_id(db, principal, body.org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    await ensure_client_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
     secret = None
     secret_hash = None
     if not body.public:
@@ -6753,6 +6763,8 @@ async def update_client(
         body.audiences, body.mcp_resource_uri
     ):
         await require_platform_admin(db, principal)
+    if body.scopes is not None:
+        await ensure_client_scopes_allowed(db, principal=principal, org_id=client.org_id, scopes=body.scopes)
     if body.name is not None:
         client.name = body.name
     if "description" in body.model_fields_set:
@@ -6936,7 +6948,7 @@ async def ensure_token_scopes_allowed(
             permissions = result.scalar_one_or_none() or []
         allowed = cap_scopes(allowed, permissions)
     if len(allowed) != len(set(scopes)):
-        raise HTTPException(status_code=403, detail="Requested token scope is not allowed for this account")
+        raise HTTPException(status_code=403, detail="Requested scope is not allowed for this account")
     return scopes
 
 
