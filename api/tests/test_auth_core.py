@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from datetime import timedelta
 from types import SimpleNamespace
@@ -9,14 +10,15 @@ from urllib.parse import parse_qs, urlparse
 os.environ.setdefault("APP_ENV", "test")
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 
+import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from webauthn.helpers import bytes_to_base64url
 from webauthn.helpers.structs import CredentialDeviceType
 
+from app import alerts, security, services
 from app import main as main_module
-from app import security, services
 from app.config import settings
 from app.database import Base, async_session_factory, engine
 from app.main import app
@@ -5551,3 +5553,96 @@ async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
         )
         assert revoked.status_code == 200
         assert revoked.json()["status"] == "revoked"
+
+
+@pytest.mark.asyncio
+async def test_security_alert_is_sent_through_sendy_in_the_background(monkeypatch):
+    sent: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(202, json={"data": {"id": "email-1"}})
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    for key, recipient in (("", "ops@example.com"), ("test-sendy-key", "")):
+        monkeypatch.setattr(settings, "sendy_api_key", key)
+        monkeypatch.setattr(settings, "alert_email_to", recipient)
+        alerts.send_security_alert("Skipped", ["Action: none"], "gatekeeper-skip")
+        assert not alerts._pending
+
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    alerts.send_security_alert("Role set\r\nto owner", ["Action: user.membership.update"], "gatekeeper-audit-1")
+    assert alerts._pending
+    await asyncio.gather(*alerts._pending)
+
+    assert len(sent) == 1
+    request = sent[0]
+    assert request.method == "POST"
+    assert str(request.url) == "https://usesendy.com/api/v1/emails"
+    assert request.headers["authorization"] == "Bearer test-sendy-key"
+    assert request.headers["content-type"] == "application/vnd.api+json"
+    assert request.headers["accept"] == "application/vnd.api+json"
+    assert request.headers["idempotency-key"] == "gatekeeper-audit-1"
+    assert json.loads(request.content) == {
+        "data": {
+            "type": "emails",
+            "attributes": {
+                "from": settings.alert_email_from,
+                "to": "ops@example.com",
+                "subject": "[GateKeeper] Role set to owner",
+                "text": "Action: user.membership.update",
+            },
+        }
+    }
+
+    def fail(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("sendy unreachable")
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(fail))
+    alerts.send_security_alert("Unreachable", ["Action: none"], "gatekeeper-audit-2")
+    await asyncio.gather(*alerts._pending)
+
+
+@pytest.mark.asyncio
+async def test_security_events_queue_alerts_without_secret_values(monkeypatch):
+    sent: list[dict] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        sent.append({"key": request.headers["idempotency-key"], **json.loads(request.content)["data"]["attributes"]})
+        return httpx.Response(202)
+
+    monkeypatch.setattr(alerts, "_transport", httpx.MockTransport(accept))
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    monkeypatch.setattr(settings, "alert_email_to", "ops@example.com")
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        token = await ac.post(
+            "/api/v1/tokens",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"name": "automation", "token_type": "personal", "scopes": ["admin:*"]},
+        )
+        assert token.status_code == 200
+        for _attempt in range(2):
+            refused = await ac.post("/api/v1/auth/signup", json={"email": "intruder@example.com", "password": password})
+            assert refused.status_code == 403
+        await asyncio.gather(*alerts._pending)
+
+    by_subject = {item["subject"]: item for item in sent}
+    assert {
+        "[GateKeeper] User created",
+        "[GateKeeper] Privileged login from a new IP",
+        "[GateKeeper] API token created",
+        "[GateKeeper] Signup refused",
+    }.issubset(by_subject)
+    token_alert = by_subject["[GateKeeper] API token created"]["text"]
+    assert "Actor: owner@example.com" in token_alert
+    assert "Client IP: 127.0.0.1" in token_alert
+    assert "scopes: admin:*" in token_alert
+    assert "Time (UTC): " in token_alert
+    refusal_keys = [item["key"] for item in sent if item["subject"] == "[GateKeeper] Signup refused"]
+    assert len(refusal_keys) == 2 and len(set(refusal_keys)) == 1
+    for item in sent:
+        assert token.json()["token"] not in item["text"]
+        assert password not in item["text"]
+        assert owner.json()["access_token"] not in item["text"]

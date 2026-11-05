@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     smtp_use_tls: bool = True
     email_dev_mode: bool = True
 
+    # Security alert emails through Sendy. Alerts are off until both the key and the recipient are set.
+    sendy_api_key: str = ""
+    sendy_api_url: str = "https://usesendy.com"
+    alert_email_from: str = "B3n Alerts <alerts@notification.b3n.in>"
+    alert_email_to: str = ""
+
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/api/v1/auth/oauth/google/callback"

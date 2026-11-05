@@ -2156,6 +2156,7 @@ async def setup_totp(principal: Principal = Depends(current_principal), db: Asyn
 @app.post("/api/v1/auth/mfa/totp/enable", response_model=TotpEnableRead)
 async def enable_totp(
     body: TotpVerifyRequest,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2176,6 +2177,7 @@ async def enable_totp(
         target_type="user",
         target_id=user.id,
         details={"recovery_codes_issued": len(recovery_codes)},
+        request=request,
     )
     await db.commit()
     return TotpEnableRead(
@@ -2218,6 +2220,7 @@ async def regenerate_recovery_codes(
 @app.post("/api/v1/auth/mfa/totp/disable", response_model=MfaStatusRead)
 async def disable_totp(
     body: TotpVerifyRequest,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -2247,6 +2250,7 @@ async def disable_totp(
         actor_user_id=user.id,
         target_type="user",
         target_id=user.id,
+        request=request,
     )
     await db.commit()
     return MfaStatusRead(
@@ -3038,6 +3042,7 @@ async def scim_apply_user_state(
             "email": user.email,
             "role": role.name,
             "status": membership.status,
+            "membership_changed": membership_changed,
             "active": not user.disabled and membership.status == "active",
             "password_updated": password_changed,
             "external_id_updated": external_id is not SCIM_UNSET,
@@ -3612,6 +3617,16 @@ async def scim_create_user(
         )
         db.add(user)
         await db.flush()
+        await audit(
+            db,
+            "user.create",
+            org_id=org.id,
+            actor_user_id=principal.user_id,
+            target_type="user",
+            target_id=user.id,
+            details={"email": email, "via": "scim"},
+            request=request,
+        )
     membership, role, _revoked_sessions = await scim_apply_user_state(
         db,
         user=user,
@@ -3863,6 +3878,7 @@ async def provision_user(
             "status": body.status,
             "created_user": created_user,
             "created_membership": created_membership,
+            "membership_changed": membership_changed,
             "disabled": user.disabled,
             "revoked_sessions": revoked_sessions,
         },
@@ -3945,6 +3961,7 @@ async def update_user_admin(
 async def update_user_membership(
     user_id: str,
     body: UserMembershipUpdate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -3983,6 +4000,7 @@ async def update_user_membership(
         target_type="membership",
         target_id=membership.id,
         details={"user_id": user.id, "role": role.name, "status": body.status, "revoked_sessions": revoked_count},
+        request=request,
     )
     await db.commit()
     await db.refresh(user)
@@ -4021,6 +4039,7 @@ async def revoke_admin_user_sessions(
 @app.post("/api/v1/users/{user_id}/mfa/totp/reset", response_model=UserMfaResetResponse)
 async def reset_admin_user_totp(
     user_id: str,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -4051,6 +4070,7 @@ async def reset_admin_user_totp(
             "totp_was_pending": had_pending_totp,
             "revoked_sessions": revoked_count,
         },
+        request=request,
     )
     await db.commit()
     await db.refresh(user)
@@ -4386,6 +4406,7 @@ async def accept_invitation(
         target_type="invitation",
         target_id=invitation.id,
         details={"email": email, "role": role.name},
+        request=request,
     )
     await db.commit()
     set_session_cookie(response, access)
@@ -6359,6 +6380,7 @@ def org_read(org: Organization) -> OrgRead:
 @app.post("/api/v1/orgs", response_model=OrgRead)
 async def create_org(
     body: OrgCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6386,6 +6408,7 @@ async def create_org(
         target_type="organization",
         target_id=org.id,
         details={"creator_owner": bool(principal.user_id)},
+        request=request,
     )
     await db.commit()
     if principal.user_id:
@@ -6588,6 +6611,7 @@ async def list_clients(
 @app.post("/api/v1/clients")
 async def create_client(
     body: ClientCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6649,6 +6673,7 @@ async def create_client(
             "scopes": client.scopes,
             "require_mfa": client.require_mfa,
         },
+        request=request,
     )
     await db.commit()
     payload = client_read(client).model_dump()
@@ -6661,6 +6686,7 @@ async def create_client(
 async def update_client(
     client_id: str,
     body: ClientUpdate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6718,6 +6744,7 @@ async def update_client(
         actor_user_id=principal.user_id,
         target_type="client",
         target_id=client.id,
+        request=request,
     )
     await db.commit()
     await db.refresh(client)
@@ -6727,6 +6754,7 @@ async def update_client(
 @app.post("/api/v1/clients/{client_id}/rotate-secret")
 async def rotate_client_secret(
     client_id: str,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6750,6 +6778,7 @@ async def rotate_client_secret(
         actor_user_id=principal.user_id,
         target_type="client",
         target_id=client.id,
+        request=request,
     )
     await db.commit()
     payload = client_read(client).model_dump()
@@ -7001,6 +7030,7 @@ async def list_tokens(
 @app.post("/api/v1/tokens", response_model=TokenRead)
 async def create_token(
     body: TokenCreate,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -7042,6 +7072,8 @@ async def create_token(
         actor_user_id=principal.user_id,
         target_type="token",
         target_id=token.id,
+        details={"token_type": token.token_type, "scopes": token.scopes or []},
+        request=request,
     )
     await db.commit()
     await db.refresh(token)
@@ -7084,6 +7116,7 @@ async def revoke_api_token(
 @app.post("/api/v1/tokens/{token_id}/rotate", response_model=TokenRead)
 async def rotate_api_token(
     token_id: str,
+    request: Request,
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
@@ -7115,7 +7148,13 @@ async def rotate_api_token(
         actor_user_id=principal.user_id,
         target_type="token",
         target_id=token.id,
-        details={"replaces": existing.id, "previous_hint": existing.token_hint},
+        details={
+            "replaces": existing.id,
+            "previous_hint": existing.token_hint,
+            "token_type": token.token_type,
+            "scopes": token.scopes or [],
+        },
+        request=request,
     )
     await db.commit()
     await db.refresh(token)

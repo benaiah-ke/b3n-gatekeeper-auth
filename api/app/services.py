@@ -13,6 +13,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.alerts import send_security_alert
 from app.config import settings
 from app.models import (
     ApiToken,
@@ -27,6 +28,7 @@ from app.models import (
     Session,
     User,
     WebAuthnCredential,
+    uuid_str,
 )
 from app.schemas import OrgRead, UserRead
 from app.security import (
@@ -53,6 +55,46 @@ DEFAULT_ORG_ROLES = [
 IDENTITY_SCOPES = {"openid", "profile", "email", "offline_access"}
 # Self-service baseline for sessions that are not bound to an organization.
 BASELINE_PERMISSIONS = ["auth:read"]
+PRIVILEGED_ROLES = {"owner", "admin", "operator"}
+SECURITY_ALERT_SUBJECTS = {
+    "user.create": "User created",
+    "org.create": "Organization created",
+    "client.create": "OAuth client created",
+    "client.update": "OAuth client updated",
+    "client.secret.rotate": "OAuth client secret rotated",
+    "mfa.totp.disable": "Authenticator MFA disabled",
+    "user.mfa.totp.reset": "Authenticator MFA reset by an admin",
+    "mfa.passkey.revoke": "Passkey removed",
+    "mfa.totp.enable": "Authenticator MFA added",
+    "mfa.passkey.register": "Passkey added",
+    "auth.signup.refused": "Signup refused",
+    "auth.email_code.refused": "Email code refused",
+    "auth.invitation.refused": "Invitation signup refused",
+    "auth.oauth.signup.refused": "Federated signup refused",
+    "auth.login.new_ip": "Privileged login from a new IP",
+}
+ROLE_ALERT_ACTIONS = {
+    "user.membership.update",
+    "user.provision",
+    "invitation.accept",
+    "scim.user.upsert",
+    "scim.user.replace",
+    "scim.user.patch",
+}
+# Only these audit detail keys are copied into alert emails, so secrets never leave the database.
+ALERT_DETAIL_KEYS = (
+    "email",
+    "role",
+    "roles",
+    "scopes",
+    "token_type",
+    "client_id",
+    "audiences",
+    "public",
+    "provider",
+    "purpose",
+    "signup_mode",
+)
 
 
 def amr_satisfies_mfa(amr: list[str] | None) -> bool:
@@ -133,6 +175,44 @@ def client_ip(request: Request | None) -> str | None:
         return peer
 
 
+def security_alert_subject(action: str, details: dict[str, Any]) -> str | None:
+    if action in SECURITY_ALERT_SUBJECTS:
+        return SECURITY_ALERT_SUBJECTS[action]
+    if action == "user.provision" and details.get("created_user"):
+        return "User created"
+    role = details.get("role")
+    if action in ROLE_ALERT_ACTIONS and role in PRIVILEGED_ROLES and details.get("membership_changed", True):
+        return f"Role set to {role}"
+    group = details.get("display_name")
+    if action.startswith("scim.group.") and group in PRIVILEGED_ROLES and details.get("changed_members"):
+        return f"Role set to {group}"
+    if action in {"token.create", "token.rotate"} and set(details.get("scopes") or []) - {"auth:read"}:
+        return "API token created"
+    return None
+
+
+async def queue_security_alert(db: AsyncSession, event: AuditEvent, subject: str) -> None:
+    actor = await db.get(User, event.actor_user_id) if event.actor_user_id else None
+    now = now_utc()
+    key = f"gatekeeper-{event.id}"
+    if event.action.endswith(".refused"):
+        # One email per source IP per hour, however many attempts it makes.
+        key = f"gatekeeper-{event.action}-{event.ip_address or 'unknown'}-{now:%Y%m%d%H}"
+    lines = [
+        f"Action: {event.action}",
+        f"Actor: {actor.email if actor else 'none'}",
+        f"Target: {event.target_type or '-'} {event.target_id or ''}".rstrip(),
+        f"Organization: {event.org_id or '-'}",
+        f"Client IP: {event.ip_address or 'unknown'}",
+        f"Time (UTC): {now:%Y-%m-%d %H:%M:%S}",
+    ]
+    for detail_key in ALERT_DETAIL_KEYS:
+        value = (event.details or {}).get(detail_key)
+        if value not in (None, "", []):
+            lines.append(f"{detail_key}: {', '.join(map(str, value)) if isinstance(value, list) else value}")
+    send_security_alert(subject, lines, key)
+
+
 async def audit(
     db: AsyncSession,
     action: str,
@@ -144,17 +224,20 @@ async def audit(
     details: dict[str, Any] | None = None,
     request: Request | None = None,
 ) -> None:
-    db.add(
-        AuditEvent(
-            org_id=org_id,
-            actor_user_id=actor_user_id,
-            action=action,
-            target_type=target_type,
-            target_id=target_id,
-            ip_address=client_ip(request),
-            details=details or {},
-        )
+    event = AuditEvent(
+        id=uuid_str(),
+        org_id=org_id,
+        actor_user_id=actor_user_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        ip_address=client_ip(request),
+        details=details or {},
     )
+    db.add(event)
+    subject = security_alert_subject(action, details or {})
+    if subject:
+        await queue_security_alert(db, event, subject)
 
 
 async def enforce_rate_limit(
@@ -471,6 +554,29 @@ async def create_session_tokens(
     if scopes is None:
         scopes = derive_membership_scopes(memberships, org_id)
     scopes = capped_session_scopes(scopes, selected_org)
+    login_ip = client_ip(request)
+    privileged_roles = sorted({org.role for org in memberships if org.role in PRIVILEGED_ROLES})
+    if login_ip and privileged_roles:
+        seen = await db.execute(
+            select(Session.id)
+            .where(
+                Session.user_id == user.id,
+                Session.ip_address == login_ip,
+                Session.created_at >= now_utc() - timedelta(days=30),
+            )
+            .limit(1)
+        )
+        if seen.scalar_one_or_none() is None:
+            await audit(
+                db,
+                "auth.login.new_ip",
+                org_id=org_id,
+                actor_user_id=user.id,
+                target_type="user",
+                target_id=user.id,
+                details={"roles": privileged_roles},
+                request=request,
+            )
     session_secret = new_opaque_token("gks")
     refresh_secret = new_opaque_token("gkr")
     issued_at = now_utc()
@@ -480,7 +586,7 @@ async def create_session_tokens(
         client_id=client.id if client else None,
         token_hash=token_hash(session_secret),
         device_id_hash=device_id_hash,
-        ip_address=client_ip(request),
+        ip_address=login_ip,
         user_agent=request.headers.get("user-agent") if request else None,
         amr=list(amr or []),
         trusted_at=trusted_at,
