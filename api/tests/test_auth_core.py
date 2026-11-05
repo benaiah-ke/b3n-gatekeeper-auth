@@ -6960,3 +6960,26 @@ async def test_scim_group_add_cannot_demote_an_owner():
             await db.execute(select(Membership.role_id).where(Membership.user_id == member_id))
         ).scalar_one()
     assert role_id == roles["owner"]
+
+
+@pytest.mark.asyncio
+async def test_only_owners_change_org_policy_or_prune_the_audit_log():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        for policy in (
+            {"audit_retention_days": 1},
+            {"trusted_device_mfa_bypass": True},
+            {"session_idle_timeout_minutes": 5},
+            {"allow_user_hard_delete": True},
+        ):
+            changed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json=policy)
+            assert changed.status_code == 403, policy
+        same = await ac.patch(
+            f"/api/v1/orgs/{org_id}", headers=admin_headers, json={"name": "Renamed", "require_mfa": False}
+        )
+        assert same.status_code == 200
+        retention = await ac.patch(f"/api/v1/orgs/{org_id}", headers=owner_headers, json={"audit_retention_days": 30})
+        assert retention.status_code == 200
+        prune = {"org_id": org_id, "dry_run": False}
+        assert (await ac.post("/api/v1/audit/prune", headers=admin_headers, json=prune)).status_code == 403
+        assert (await ac.post("/api/v1/audit/prune", headers=owner_headers, json=prune)).status_code == 200

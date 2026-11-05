@@ -6665,9 +6665,9 @@ async def update_org(
         raise HTTPException(status_code=404, detail="Organization not found")
     await setup_resource_org_id(db, principal, org.id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
-    if (body.require_mfa is not None and body.require_mfa != org.require_mfa) or (
-        body.admin_step_up_mfa_required is not None
-        and body.admin_step_up_mfa_required != org.admin_step_up_mfa_required
+    # Everything but the name is security policy (MFA, trust, idle timeout, audit retention, hard delete).
+    if any(
+        field != "name" and getattr(body, field) != getattr(org, field) for field in body.model_fields_set
     ):
         await require_org_owner(db, principal, org.id)
     revoked_sessions = 0
@@ -7536,6 +7536,7 @@ async def prune_audit(
     if not org_id:
         raise HTTPException(status_code=400, detail="Organization is required")
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    await require_org_owner(db, principal, org_id)
     org = await db.get(Organization, org_id)
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
