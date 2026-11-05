@@ -6258,6 +6258,7 @@ async def introspect(token: str = Form(...), db: AsyncSession = Depends(get_db))
         "org_id": claims.get("org_id"),
         "org_slug": claims.get("org_slug"),
         "org_role": claims.get("org_role"),
+        "roles": claims.get("roles", []),
         "permissions": claims.get("permissions", []),
         "amr": claims.get("amr", []),
     }

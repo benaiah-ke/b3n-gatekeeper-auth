@@ -25,6 +25,7 @@ class Principal:
     mfa_totp_enabled: bool | None = None
     mfa_passkey_enabled: bool | None = None
     permissions: list[str] = field(default_factory=list)
+    roles: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +101,8 @@ class GateKeeperVerifier:
             raise HTTPException(status_code=401, detail="Invalid GateKeeper token") from exc
         permissions_claim = claims.get("permissions", [])
         permissions = permissions_claim if isinstance(permissions_claim, list) else []
+        roles_claim = claims.get("roles", [])
+        roles = roles_claim if isinstance(roles_claim, list) else []
         return Principal(
             subject=str(claims.get("sub", "")),
             scopes=str(claims.get("scope", "")).split(),
@@ -113,6 +116,7 @@ class GateKeeperVerifier:
             mfa_totp_enabled=claims.get("mfa_totp_enabled"),
             mfa_passkey_enabled=claims.get("mfa_passkey_enabled"),
             permissions=[str(permission) for permission in permissions],
+            roles=[str(role) for role in roles],
         )
 
     async def validate_api_token(

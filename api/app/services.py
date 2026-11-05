@@ -491,6 +491,7 @@ async def create_session_tokens(
     }
     if amr:
         extra_claims["amr"] = amr
+    extra_claims["roles"] = [selected_org.role] if selected_org and selected_org.role else []
     if selected_org:
         extra_claims.update(
             {
@@ -642,6 +643,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     }
     if session.amr:
         extra_claims["amr"] = session.amr
+    extra_claims["roles"] = [selected_org.role] if selected_org and selected_org.role else []
     if selected_org:
         extra_claims.update(
             {

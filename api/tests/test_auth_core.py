@@ -4519,7 +4519,50 @@ async def test_authorize_can_issue_personal_tokens_for_clients_without_required_
         claims = decode_access_token(token.json()["access_token"], audience="personal-api")
         assert claims["org_id"] is None
         assert "org_role" not in claims
+        assert claims["roles"] == []
         assert "permissions" not in claims
+
+
+@pytest.mark.asyncio
+async def test_user_access_tokens_carry_role_claims_and_service_tokens_do_not():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_claims = decode_access_token(owner.json()["access_token"])
+        assert owner_claims["roles"] == ["owner"]
+        assert owner_claims["org_role"] == "owner"
+
+        await register(ac, json={"email": "viewer@example.com", "password": password})
+        viewer = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"},
+        )
+        viewer_claims = decode_access_token(viewer.json()["access_token"], audience="gatekeeper-api")
+        assert viewer_claims["roles"] == ["viewer"]
+        assert viewer_claims["org_role"] == "viewer"
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": viewer.json()["refresh_token"]})
+        assert decode_access_token(refreshed.json()["access_token"])["roles"] == ["viewer"]
+        introspected = await ac.post("/oauth/introspect", data={"token": refreshed.json()["access_token"]})
+        assert introspected.json()["roles"] == ["viewer"]
+
+        service_client = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"name": "Worker", "public": False, "audiences": ["worker-api"], "scopes": ["auth:read"]},
+        )
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": service_client.json()["client_id"],
+                "client_secret": service_client.json()["client_secret"],
+            },
+        )
+        assert service.status_code == 200
+        service_claims = decode_access_token(service.json()["access_token"], audience="worker-api")
+        assert service_claims["token_type"] == "service"
+        assert "roles" not in service_claims
+        assert "org_role" not in service_claims
 
 
 @pytest.mark.asyncio

@@ -68,11 +68,16 @@ Session-bound user JWTs include:
 - `org_id`: selected organization when the token is organization-bound.
 - `org_slug`, `org_role`, and `permissions`: active membership claims for the
   selected organization.
+- `roles`: the user's role names in the token's organization (empty when the
+  token has no organization). Enforce roles from this claim or `org_role`.
 - `azp`: OAuth client id when issued for a client.
-- `scope`: OAuth scopes granted to this token.
+- `scope`: OAuth scopes granted to this token. Scopes are always capped to the
+  permissions of the user's role in the token's organization, so a client that
+  lists a scope does not grant it to users whose role lacks it.
 
 Personal-account tokens for clients that do not require organization membership
-can intentionally omit `org_id`, `org_role`, and `permissions`.
+can intentionally omit `org_id`, `org_role`, and `permissions`, and carry an
+empty `roles` list. Service tokens from client credentials carry no role claims.
 
 ## Product Policy
 
