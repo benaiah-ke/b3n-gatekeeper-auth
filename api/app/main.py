@@ -169,10 +169,12 @@ from app.security import (
     verify_totp_code,
 )
 from app.services import (
+    BASELINE_PERMISSIONS,
     active_passkey_count,
     add_default_org_roles,
     audit,
     authenticate_password,
+    cap_scopes,
     create_api_token,
     create_one_time_code,
     create_session_tokens,
@@ -1002,7 +1004,7 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
         verified=False,
     )
     device_id = current_or_new_device_id(request)
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1018,7 +1020,7 @@ async def signup(body: SignupRequest, request: Request, response: Response, db: 
         access_token=access,
         refresh_token=refresh,
         expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join(derive_membership_scopes(orgs)),
+        scope=" ".join(scopes),
         user=user_read(user),
         orgs=orgs,
     )
@@ -1069,7 +1071,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
     scopes = validate_scopes(client, body.scope or "") if client else derive_membership_scopes(orgs, effective_org_id)
     selected_audience = validate_audience(client, body.audience) if client else None
     audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1166,7 +1168,7 @@ async def switch_session_org(
         trusted_device=await principal_trusted_device_active(db, principal),
     )
     device_id = current_or_new_device_id(request)
-    access, refresh_token, session, _refresh_model = await create_session_tokens(
+    access, refresh_token, session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -1981,7 +1983,7 @@ async def verify_passkey_authentication(
     selected_audience = validate_audience(client, requested_audience) if client else None
     audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
     device_id = current_or_new_device_id(request)
-    access, refresh_token, _session, _refresh_model = await create_session_tokens(
+    access, refresh_token, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -4287,7 +4289,7 @@ async def accept_invitation(
         db.add(Membership(org_id=invitation.org_id, user_id=user.id, role_id=role.id, status="active"))
     invitation.accepted_at = now_utc()
     invitation.accepted_user_id = user.id
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -4310,7 +4312,7 @@ async def accept_invitation(
         access_token=access,
         refresh_token=refresh,
         expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join((role.permissions or []) or ["auth:read"]),
+        scope=" ".join(scopes),
         user=user_read(user),
         orgs=await org_roles(db, user.id),
     )
@@ -4351,7 +4353,9 @@ async def verify_email_code(
         user = await create_user(db, email=str(body.email), password=None, verified=True)
     if body.purpose == "verify_email":
         user.email_verified = True
-    access, refresh, _session, _refresh_model = await create_session_tokens(db, user, request=request, amr=["email"])
+    access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
+        db, user, request=request, amr=["email"]
+    )
     orgs = await org_roles(db, user.id)
     await audit(db, f"auth.email_code.{body.purpose}", actor_user_id=user.id, request=request)
     await db.commit()
@@ -4361,7 +4365,7 @@ async def verify_email_code(
         access_token=access,
         refresh_token=refresh,
         expires_in=settings.access_token_ttl_seconds,
-        scope=" ".join(derive_membership_scopes(orgs)),
+        scope=" ".join(scopes),
         user=user_read(user),
         orgs=orgs,
     )
@@ -5152,7 +5156,7 @@ async def complete_oauth_provider_callback(
                 email=email,
             )
         )
-    access, refresh, _session, _refresh_model = await create_session_tokens(
+    access, refresh, _session, _refresh_model, _scopes = await create_session_tokens(
         db,
         user,
         request=request,
@@ -5632,7 +5636,7 @@ async def oauth_token(
             trusted_device=TRUSTED_DEVICE_AMR in (auth_code.amr or []),
         )
         auth_code.used_at = now_utc()
-        access, refresh, _session, _refresh_model = await create_session_tokens(
+        access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
             db,
             user,
             client=client,
@@ -5648,7 +5652,7 @@ async def oauth_token(
             "refresh_token": refresh,
             "token_type": "Bearer",
             "expires_in": settings.access_token_ttl_seconds,
-            "scope": auth_code.scope,
+            "scope": " ".join(scopes),
         }
 
     if grant_type == "refresh_token":
@@ -5718,7 +5722,7 @@ async def oauth_token(
             amr=grant.amr or [],
             trusted_device=TRUSTED_DEVICE_AMR in (grant.amr or []),
         )
-        access, refresh, _session, _refresh_model = await create_session_tokens(
+        access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
             db,
             user,
             client=client,
@@ -5733,7 +5737,7 @@ async def oauth_token(
             "refresh_token": refresh,
             "token_type": "Bearer",
             "expires_in": settings.access_token_ttl_seconds,
-            "scope": grant.scope,
+            "scope": " ".join(scopes),
         }
 
     raise HTTPException(status_code=400, detail="Unsupported grant_type")
@@ -6686,14 +6690,32 @@ async def ensure_user_org_membership(db: AsyncSession, *, user_id: str, org_id: 
         raise HTTPException(status_code=403, detail="Organization membership required")
 
 
-def ensure_personal_token_scopes(principal: Principal, scopes: list[str]) -> list[str]:
-    requested = scopes or ["auth:read"]
-    if "*" in principal.scopes or "token:*" in principal.scopes:
-        return requested
-    allowed = set(principal.scopes)
-    if not set(requested).issubset(allowed):
+async def ensure_token_scopes_allowed(
+    db: AsyncSession,
+    *,
+    principal: Principal,
+    org_id: str | None,
+    scopes: list[str],
+) -> list[str]:
+    # token:* lets a caller manage tokens; it never lets the caller mint scopes it does not hold.
+    allowed = cap_scopes(scopes, principal.scopes)
+    if principal.user_id:
+        permissions = BASELINE_PERMISSIONS
+        if org_id:
+            result = await db.execute(
+                select(Role.permissions)
+                .join(Membership, Membership.role_id == Role.id)
+                .where(
+                    Membership.user_id == principal.user_id,
+                    Membership.org_id == org_id,
+                    Membership.status == "active",
+                )
+            )
+            permissions = result.scalar_one_or_none() or []
+        allowed = cap_scopes(allowed, permissions)
+    if len(allowed) != len(set(scopes)):
         raise HTTPException(status_code=403, detail="Requested token scope is not allowed for this account")
-    return requested
+    return scopes
 
 
 async def ensure_token_mutation_allowed(db: AsyncSession, *, token: ApiToken, principal: Principal) -> None:
@@ -6850,7 +6872,9 @@ async def create_token(
             await ensure_user_org_membership(db, user_id=user.id, org_id=org_id)
             await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = user.id
-        scopes = ensure_personal_token_scopes(principal, body.scopes)
+        scopes = await ensure_token_scopes_allowed(
+            db, principal=principal, org_id=org_id, scopes=body.scopes or ["auth:read"]
+        )
     else:
         if not can_admin_tokens(principal):
             raise HTTPException(status_code=403, detail="Token administration scope required")
@@ -6859,7 +6883,7 @@ async def create_token(
             await ensure_user_org_membership(db, user_id=principal.user_id, org_id=org_id)
         await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = principal.user_id if body.token_type == "admin" else None
-        scopes = body.scopes
+        scopes = await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
     token, raw = await create_api_token(
         db,
         name=body.name,
@@ -6931,6 +6955,7 @@ async def rotate_api_token(
         raise HTTPException(status_code=400, detail="Token is already revoked")
     await ensure_token_mutation_allowed(db, token=existing, principal=principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=existing.org_id)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=existing.org_id, scopes=existing.scopes or [])
     existing.revoked_at = now_utc()
     token, raw = await create_api_token(
         db,

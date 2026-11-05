@@ -1877,7 +1877,7 @@ async def test_cannot_unlink_only_federated_sign_in_method():
             )
             db.add(identity)
             await db.flush()
-            access, _refresh, _session, _refresh_model = await services.create_session_tokens(
+            access, _refresh, _session, _refresh_model, _scopes = await services.create_session_tokens(
                 db,
                 user,
                 bind_default_org=False,
@@ -4761,6 +4761,89 @@ async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
         assert owner_tokens.status_code == 200
         owner_token_ids = {token["id"] for token in owner_tokens.json()}
         assert {owner_service.json()["id"], viewer_token["id"], rotated.json()["id"]}.issubset(owner_token_ids)
+
+
+@pytest.mark.asyncio
+async def test_token_scopes_are_capped_to_role_permissions_on_every_issuance_path():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await ac.post("/api/v1/auth/signup", json={"email": "owner@example.com", "password": password})
+        assert owner.status_code == 200
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        viewer = await ac.post("/api/v1/auth/signup", json={"email": "viewer@example.com", "password": password})
+        assert viewer.status_code == 200
+        viewer_id = viewer.json()["user"]["id"]
+
+        for scope in (None, "auth:read token:* mcp:*", "token:*"):
+            payload = {"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"}
+            if scope:
+                payload["scope"] = scope
+            login = await ac.post("/api/v1/auth/login", json=payload)
+            assert login.status_code == 200
+            assert login.json()["scope"] == "auth:read"
+            claims = decode_access_token(login.json()["access_token"], audience="gatekeeper-api")
+            assert claims["scope"] == "auth:read"
+        viewer_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+
+        refreshed = await ac.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": login.json()["refresh_token"]},
+        )
+        assert refreshed.status_code == 200
+        assert refreshed.json()["scope"] == "auth:read"
+        assert decode_access_token(refreshed.json()["access_token"])["scope"] == "auth:read"
+
+        for token_type in ("personal", "service", "admin"):
+            for scopes in (["admin:*"], ["token:*"], ["*"], ["admin:*", "auth:read", "token:*", "mcp:*"]):
+                denied = await ac.post(
+                    "/api/v1/tokens",
+                    headers=viewer_headers,
+                    json={"name": "escalation", "token_type": token_type, "org_id": org_id, "scopes": scopes},
+                )
+                assert denied.status_code == 403
+
+        roles = await ac.get(f"/api/v1/roles?org_id={org_id}", headers=owner_headers)
+        operator_role = next(role for role in roles.json() if role["name"] == "operator")
+        promoted = await ac.put(
+            f"/api/v1/users/{viewer_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role_id": operator_role["id"], "status": "active"},
+        )
+        assert promoted.status_code == 200
+        operator_login = await ac.post(
+            "/api/v1/auth/login",
+            json={"email": "viewer@example.com", "password": password, "client_id": "gatekeeper-cli"},
+        )
+        assert operator_login.status_code == 200
+        assert set(operator_login.json()["scope"].split()) == {"auth:read", "token:*", "mcp:*"}
+        operator_headers = {"Authorization": f"Bearer {operator_login.json()['access_token']}"}
+
+        for scopes in (["admin:*"], ["*"]):
+            denied = await ac.post(
+                "/api/v1/tokens",
+                headers=operator_headers,
+                json={"name": "operator escalation", "token_type": "service", "org_id": org_id, "scopes": scopes},
+            )
+            assert denied.status_code == 403
+        allowed = await ac.post(
+            "/api/v1/tokens",
+            headers=operator_headers,
+            json={"name": "operator mcp", "token_type": "service", "org_id": org_id, "scopes": ["mcp:tools"]},
+        )
+        assert allowed.status_code == 200
+
+        owner_admin_token = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "owner admin", "token_type": "admin", "org_id": org_id, "scopes": ["*"]},
+        )
+        assert owner_admin_token.status_code == 200
+        operator_rotate = await ac.post(
+            f"/api/v1/tokens/{owner_admin_token.json()['id']}/rotate",
+            headers=operator_headers,
+        )
+        assert operator_rotate.status_code == 403
 
 
 @pytest.mark.asyncio

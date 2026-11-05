@@ -48,6 +48,10 @@ DEFAULT_ORG_ROLES = [
     ("operator", ["auth:read", "token:*", "mcp:*"]),
     ("viewer", ["auth:read"]),
 ]
+# OIDC identity scopes carry no permissions, so role capping lets them through.
+IDENTITY_SCOPES = {"openid", "profile", "email", "offline_access"}
+# Self-service baseline for sessions that are not bound to an organization.
+BASELINE_PERMISSIONS = ["auth:read"]
 
 
 def amr_satisfies_mfa(amr: list[str] | None) -> bool:
@@ -83,6 +87,23 @@ def trusted_device_mfa_bypass_allowed(client: AuthClient | None, org: Organizati
     if org_requires_mfa and not org.trusted_device_mfa_bypass:
         return False
     return True
+
+
+def scope_granted(scope: str, permissions: list[str]) -> bool:
+    granted = set(permissions)
+    if scope in IDENTITY_SCOPES or "*" in granted or scope in granted:
+        return True
+    prefix, separator, _rest = scope.partition(":")
+    return bool(separator) and f"{prefix}:*" in granted
+
+
+def cap_scopes(requested: list[str], permissions: list[str]) -> list[str]:
+    return [scope for scope in dict.fromkeys(requested) if scope_granted(scope, permissions)]
+
+
+def capped_session_scopes(requested: list[str], selected_org: OrgRead | None) -> list[str]:
+    permissions = (selected_org.permissions or []) if selected_org else BASELINE_PERMISSIONS
+    return cap_scopes(requested, permissions) or cap_scopes(BASELINE_PERMISSIONS, permissions)
 
 
 def derive_membership_scopes(memberships: list[OrgRead], org_id: str | None = None) -> list[str]:
@@ -421,7 +442,7 @@ async def create_session_tokens(
     device_id_hash: str | None = None,
     trusted_at=None,
     trusted_until=None,
-) -> tuple[str, str, Session, RefreshToken]:
+) -> tuple[str, str, Session, RefreshToken, list[str]]:
     memberships = await org_roles(db, user.id)
     if org_id is None and bind_default_org:
         org_id = memberships[0].id if memberships else None
@@ -430,6 +451,7 @@ async def create_session_tokens(
         raise HTTPException(status_code=403, detail="Organization membership required")
     if scopes is None:
         scopes = derive_membership_scopes(memberships, org_id)
+    scopes = capped_session_scopes(scopes, selected_org)
     session_secret = new_opaque_token("gks")
     refresh_secret = new_opaque_token("gkr")
     issued_at = now_utc()
@@ -480,13 +502,13 @@ async def create_session_tokens(
     access = create_access_token(
         subject=user.id,
         audience=audience or settings.issuer,
-        scopes=scopes or ["auth:read"],
+        scopes=scopes,
         token_type="user",
         client_id=client.client_id if client else None,
         org_id=org_id,
         extra=extra_claims,
     )
-    return access, refresh_secret, session, refresh
+    return access, refresh_secret, session, refresh, scopes
 
 
 async def revoke_session_with_refresh_tokens(
@@ -592,10 +614,8 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
             refresh.revoked_at = refresh.revoked_at or session.revoked_at
             await db.commit()
             raise HTTPException(status_code=401, detail="MFA required for this session")
-    derived_scopes = set(selected_org.permissions if selected_org else [])
-    if not derived_scopes:
-        derived_scopes = {permission for org in memberships for permission in org.permissions}
-    scopes = client.scopes if client else sorted(derived_scopes or {"auth:read"})
+    requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
+    scopes = capped_session_scopes(requested_scopes, selected_org)
     audience = (
         client.audiences[0]
         if client and client.audiences
