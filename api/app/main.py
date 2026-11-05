@@ -4863,6 +4863,8 @@ async def revoke_session(
     if "*" not in principal.scopes and principal.user_id != session.user_id:
         raise HTTPException(status_code=403, detail="Session ownership required")
     if principal.user_id != session.user_id:
+        # The * scope only reaches users of the caller's own org.
+        await ensure_user_admin_visible(db, user_id=session.user_id, principal=principal)
         await ensure_target_not_above_caller(db, user_id=session.user_id, principal=principal)
     session.revoked_at = now_utc()
     result = await db.execute(

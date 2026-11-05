@@ -7482,3 +7482,28 @@ async def test_incident_sweep_flags_mcp_only_clients():
     sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
     assert sweep["owned_orgs"] == []
     assert created.json()["client_id"] in {row["client_id"] for row in sweep["clients"]}
+
+
+@pytest.mark.asyncio
+async def test_star_scope_cannot_revoke_sessions_in_other_orgs():
+    password = "correct horse battery"
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": password})
+        member = await register(ac, json={"email": "member@example.com", "password": password})
+        member_session = decode_access_token(member.json()["access_token"])["session_id"]
+        async with async_session_factory() as db:
+            tenant = Organization(name="Tenant", slug="tenant")
+            db.add(tenant)
+            await db.flush()
+            roles = await services.add_default_org_roles(db, tenant)
+            tenant_owner = await services.create_user(db, email="t-owner@example.com", password=password)
+            db.add(Membership(org_id=tenant.id, user_id=tenant_owner.id, role_id=roles["owner"].id))
+            await db.commit()
+        login = await ac.post("/api/v1/auth/login", json={"email": "t-owner@example.com", "password": password})
+        assert login.json()["scope"] == "*"
+        revoked = await ac.delete(
+            f"/api/v1/sessions/{member_session}", headers={"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
+        assert revoked.status_code in (403, 404)
+        member_headers = {"Authorization": f"Bearer {member.json()['access_token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=member_headers)).status_code == 200
