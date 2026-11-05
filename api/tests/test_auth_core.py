@@ -723,6 +723,23 @@ async def test_client_scopes_are_capped_to_the_creators_permissions(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_service_principals_list_only_their_own_org():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        service = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "automation", "token_type": "service", "scopes": ["auth:read"]},
+        )
+        listed = await ac.get("/api/v1/orgs", headers={"Authorization": f"Bearer {service.json()['token']}"})
+        assert listed.status_code == 200
+        assert [org["id"] for org in listed.json()] == [bootstrap_id]
+
+
+@pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
         signup = await register(

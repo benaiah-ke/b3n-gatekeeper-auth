@@ -6422,8 +6422,9 @@ def client_read(client: AuthClient) -> ClientRead:
 async def list_orgs(principal: Principal = Depends(current_principal), db: AsyncSession = Depends(get_db)):
     if principal.user_id:
         return await org_roles(db, principal.user_id)
-    result = await db.execute(select(Organization).order_by(Organization.name))
-    return [org_read(o) for o in result.scalars()]
+    # Service principals see only the organization their credential belongs to.
+    org = await db.get(Organization, principal.org_id) if principal.org_id else None
+    return [org_read(org)] if org else []
 
 
 def org_read(org: Organization) -> OrgRead:
