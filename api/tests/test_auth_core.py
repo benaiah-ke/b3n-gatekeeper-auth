@@ -3614,7 +3614,7 @@ async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert bootstrap_admin.status_code == 200
-        assert bootstrap_admin.json()["orgs"][0]["role"] == "owner"
+        assert bootstrap_admin.json()["orgs"][0]["role"] == "viewer"
 
         viewer = await register(
             ac,
@@ -3628,6 +3628,39 @@ async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert duplicate.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_new_accounts_get_no_default_bootstrap_membership(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        assert [org["role"] for org in owner.json()["orgs"]] == ["owner"]
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        second_org = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        assert second_org.status_code == 200
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": second_org.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"email": "invited@example.com", "org_id": second_org.json()["id"], "role": "operator"},
+        )
+        assert invite.status_code == 200
+
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        accepted = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "invited@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        assert accepted.status_code == 200
+        assert [(org["id"], org["role"]) for org in accepted.json()["orgs"]] == [(second_org.json()["id"], "operator")]
+
+    async with async_session_factory() as db:
+        for email in ("plain@example.com", str(settings.bootstrap_admin_email)):
+            user = await services.create_user(db, email=email, password=password)
+            assert await services.org_roles(db, user.id) == []
 
 
 @pytest.mark.asyncio

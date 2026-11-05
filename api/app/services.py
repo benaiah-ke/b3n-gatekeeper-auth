@@ -386,6 +386,7 @@ async def create_user(
     existing = await db.execute(select(User).where(User.email == normalized))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="Email already exists")
+    first_user = (await db.execute(select(User.id).limit(1))).scalar_one_or_none() is None
     user = User(
         email=normalized,
         display_name=display_name,
@@ -395,25 +396,24 @@ async def create_user(
     db.add(user)
     await db.flush()
 
-    bootstrap_org = await ensure_bootstrap(db)
-    needs_first_owner = not await org_has_owner(db, bootstrap_org.id)
-    if normalized == str(settings.bootstrap_admin_email).lower() or needs_first_owner:
-        role_name = "owner"
-    else:
-        role_name = "viewer"
-    result = await db.execute(
-        select(Role).where(Role.org_id == bootstrap_org.id, Role.name == role_name)
-    )
-    role = result.scalar_one()
-    db.add(Membership(org_id=bootstrap_org.id, user_id=user.id, role_id=role.id, status="active"))
+    # New accounts get no organization by default. Only the first owner of an empty install, or the
+    # configured bootstrap admin while the bootstrap org has no owner, joins the bootstrap org.
+    bootstrap_org_id = None
+    if first_user or normalized == str(settings.bootstrap_admin_email).lower():
+        bootstrap_org = await ensure_bootstrap(db)
+        if first_user or not await org_has_owner(db, bootstrap_org.id):
+            result = await db.execute(select(Role).where(Role.org_id == bootstrap_org.id, Role.name == "owner"))
+            role = result.scalar_one()
+            db.add(Membership(org_id=bootstrap_org.id, user_id=user.id, role_id=role.id, status="active"))
+            bootstrap_org_id = bootstrap_org.id
     await audit(
         db,
         "user.create",
-        org_id=bootstrap_org.id,
+        org_id=bootstrap_org_id,
         actor_user_id=user.id,
         target_type="user",
         target_id=user.id,
-        details={"role": role_name, "first_owner": needs_first_owner},
+        details={"role": "owner" if bootstrap_org_id else None, "first_owner": first_user},
     )
     await db.commit()
     await db.refresh(user)
