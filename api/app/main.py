@@ -3048,11 +3048,14 @@ async def scim_assign_group_member(
         db.add(membership)
     user.disabled = False
     if changed:
+        await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
         await revoke_user_sessions(db, user_id=user.id)
     return changed
 
 
-async def scim_remove_group_member(db: AsyncSession, *, org: Organization, role: Role, user_id: str) -> bool:
+async def scim_remove_group_member(
+    db: AsyncSession, *, org: Organization, role: Role, user_id: str, principal: Principal
+) -> bool:
     result = await db.execute(
         select(User, Membership)
         .join(Membership, Membership.user_id == User.id)
@@ -3066,6 +3069,7 @@ async def scim_remove_group_member(db: AsyncSession, *, org: Organization, role:
         return False
     if role.name == "owner":
         await ensure_other_active_owner(db, org_id=org.id, user_id=user.id)
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     membership.status = "revoked"
     await revoke_user_sessions(db, user_id=user.id)
     return True
@@ -3119,7 +3123,10 @@ async def scim_apply_user_state(
     if password is not SCIM_UNSET:
         await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     if display_name is not SCIM_UNSET:
-        user.display_name = str(display_name).strip() or None if display_name is not None else None
+        new_display_name = str(display_name).strip() or None if display_name is not None else None
+        if new_display_name != user.display_name:
+            await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
+        user.display_name = new_display_name
     password_changed = False
     if password is not SCIM_UNSET:
         user.password_hash = hash_password(str(password))
@@ -3161,6 +3168,7 @@ async def scim_apply_user_state(
     disabled_changed = previous_disabled != user.disabled
     revoked_sessions = 0
     if membership_changed or disabled_changed or password_changed:
+        await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
         revoked_sessions = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
@@ -3558,7 +3566,7 @@ async def scim_replace_group(
     current_member_ids = set(current_result.scalars())
     changed_members = 0
     for member_id in sorted(current_member_ids - desired_member_ids):
-        if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     for member_id in sorted(desired_member_ids - current_member_ids):
         if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
@@ -3639,7 +3647,7 @@ async def scim_patch_group(
             )
             current_member_ids = set(current_result.scalars())
             for member_id in sorted(current_member_ids - desired_member_ids):
-                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
             for member_id in sorted(desired_member_ids - current_member_ids):
                 if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
@@ -3655,7 +3663,7 @@ async def scim_patch_group(
                 )
                 member_ids = list(current_result.scalars())
             for member_id in member_ids:
-                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_remove_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
         else:
             for member_id in member_ids:

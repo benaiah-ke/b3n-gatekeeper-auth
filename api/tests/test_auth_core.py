@@ -7527,6 +7527,54 @@ async def test_scim_deactivation_cannot_disable_platform_admins_or_owners(monkey
 
 
 @pytest.mark.asyncio
+async def test_scim_cannot_revoke_or_rename_an_owner_who_joined_a_tenant():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_id = owner.json()["user"]["id"]
+        await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": password})
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            db.add(Membership(org_id=tenant_id, user_id=owner_id, role_id=tenant_roles["viewer"]))
+            await db.commit()
+
+        async def live_sessions() -> int:
+            async with async_session_factory() as db:
+                live = select(Session.id).where(Session.user_id == owner_id, Session.revoked_at.is_(None))
+                return len((await db.execute(live)).all())
+
+        assert await live_sessions() == 2
+        members = [{"value": owner_id}]
+        removed = await ac.patch(
+            f"/scim/v2/Groups/{tenant_roles['viewer']}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "remove", "path": "members", "value": members}]},
+        )
+        assert removed.status_code == 403
+        moved = await ac.patch(
+            f"/scim/v2/Groups/{tenant_roles['admin']}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": members}]},
+        )
+        assert moved.status_code == 403
+        deleted = await ac.delete(f"/scim/v2/Users/{owner_id}", headers=tenant_headers)
+        assert deleted.status_code == 403
+        renamed = await ac.patch(
+            f"/scim/v2/Users/{owner_id}",
+            headers=tenant_headers,
+            json={"Operations": [{"op": "replace", "path": "displayName", "value": "Taken Over"}]},
+        )
+        assert renamed.status_code == 403
+        assert await live_sessions() == 2
+    async with async_session_factory() as db:
+        assert (await db.get(User, owner_id)).display_name != "Taken Over"
+        status = await db.scalar(
+            select(Membership.status).where(Membership.user_id == owner_id, Membership.org_id == tenant_id)
+        )
+        assert status == "active"
+
+
+@pytest.mark.asyncio
 async def test_incident_sweep_flags_mcp_only_clients():
     async with await client() as ac:
         owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
