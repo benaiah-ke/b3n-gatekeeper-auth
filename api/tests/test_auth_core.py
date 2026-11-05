@@ -5488,6 +5488,65 @@ async def test_token_scopes_are_capped_to_role_permissions_on_every_issuance_pat
 
 
 @pytest.mark.asyncio
+async def test_token_administration_stays_in_the_callers_org(monkeypatch):
+    password = "correct horse battery"
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        target = await ac.post(
+            "/api/v1/tokens",
+            headers=bearer(owner_token),
+            json={"name": "bootstrap service", "token_type": "service", "scopes": ["auth:read"]},
+        )
+        second = await ac.post("/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        tenant_service = await ac.post(
+            "/api/v1/tokens",
+            headers=bearer(switched.json()["access_token"]),
+            json={"name": "second automation", "token_type": "service", "scopes": ["token:*", "auth:read"]},
+        )
+        async with async_session_factory() as db:
+            _orgless, orgless_raw = await services.create_api_token(
+                db,
+                name="legacy automation",
+                token_type_value="service",
+                org_id=None,
+                user_id=None,
+                project_id=None,
+                client_id=None,
+                scopes=["token:*", "auth:read"],
+                audiences=[],
+                expires_at=None,
+            )
+            await db.commit()
+
+        for raw in (orgless_raw, tenant_service.json()["token"]):
+            headers = bearer(raw)
+            assert (await ac.get("/api/v1/tokens", headers=headers, params={"org_id": bootstrap_id})).status_code == 403
+            created = await ac.post(
+                "/api/v1/tokens",
+                headers=headers,
+                json={"name": "cross org", "token_type": "service", "org_id": bootstrap_id, "scopes": ["auth:read"]},
+            )
+            assert created.status_code == 403
+            assert (await ac.post(f"/api/v1/tokens/{target.json()['id']}/rotate", headers=headers)).status_code == 403
+            assert (await ac.delete(f"/api/v1/tokens/{target.json()['id']}", headers=headers)).status_code == 403
+        assert (await ac.get("/api/v1/tokens", headers=bearer(orgless_raw))).status_code == 403
+
+        own_org = await ac.get("/api/v1/tokens", headers=bearer(tenant_service.json()["token"]))
+        assert own_org.status_code == 200
+        platform_revoke = await ac.delete(f"/api/v1/tokens/{tenant_service.json()['id']}", headers=bearer(owner_token))
+        assert platform_revoke.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_api_token_validation_returns_product_metadata_and_policy_checks():
     async with await client() as ac:
         owner = await register(

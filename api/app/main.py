@@ -6940,10 +6940,15 @@ async def ensure_token_scopes_allowed(
     return scopes
 
 
+async def token_admin_org_allowed(db: AsyncSession, principal: Principal, org_id: str | None) -> bool:
+    """Token administration stays inside the caller's current org; anything else needs a platform admin."""
+    if principal.org_id and org_id == principal.org_id:
+        return True
+    return await is_platform_admin(db, principal.user_id)
+
+
 async def ensure_token_mutation_allowed(db: AsyncSession, *, token: ApiToken, principal: Principal) -> None:
-    if can_admin_tokens(principal):
-        if token.org_id and principal.org_id:
-            await ensure_user_org_membership(db, user_id=principal.user_id, org_id=token.org_id)
+    if can_admin_tokens(principal) and await token_admin_org_allowed(db, principal, token.org_id):
         return
     if (
         principal.auth_type == "user"
@@ -7065,9 +7070,9 @@ async def list_tokens(
     if can_admin_tokens(principal):
         query = select(ApiToken)
         selected_org_id = org_id or principal.org_id
+        if not await token_admin_org_allowed(db, principal, selected_org_id):
+            raise HTTPException(status_code=403, detail="Token administration is limited to the current organization")
         if selected_org_id:
-            if principal.user_id:
-                await ensure_user_org_membership(db, user_id=principal.user_id, org_id=selected_org_id)
             query = query.where(ApiToken.org_id == selected_org_id)
         result = await db.execute(query.order_by(ApiToken.created_at.desc()))
         return [token_read(token) for token in result.scalars()]
@@ -7102,8 +7107,8 @@ async def create_token(
         if not can_admin_tokens(principal):
             raise HTTPException(status_code=403, detail="Token administration scope required")
         org_id = body.org_id or principal.org_id
-        if org_id and principal.user_id:
-            await ensure_user_org_membership(db, user_id=principal.user_id, org_id=org_id)
+        if not await token_admin_org_allowed(db, principal, org_id):
+            raise HTTPException(status_code=403, detail="Token administration is limited to the current organization")
         await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = principal.user_id if body.token_type == "admin" else None
         scopes = await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
