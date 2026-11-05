@@ -7296,3 +7296,80 @@ async def test_client_tokens_never_fall_back_to_the_issuer_audience():
         service_headers = {"Authorization": f"Bearer {service.json()['access_token']}"}
         assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
         assert "code=" in await approve_consent(ac, owner_headers, params)
+
+
+@pytest.mark.asyncio
+async def test_device_grants_need_a_hosted_approver_and_a_public_or_authenticated_client():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        owner_id = owner.json()["user"]["id"]
+
+        async def start_and_approve(headers: dict[str, str]):
+            device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+            approved = await ac.post(
+                "/api/v1/auth/device/approve",
+                headers=headers,
+                json={"user_code": device.json()["user_code"], "approve": True},
+            )
+            return device, approved
+
+        device, approved = await start_and_approve(owner_headers)
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        pat = await ac.post("/api/v1/tokens", headers=owner_headers, json={"name": "pat", "token_type": "personal"})
+        ac.cookies.clear()
+        for raw in (cli.json()["access_token"], pat.json()["token"]):
+            _device, refused = await start_and_approve({"Authorization": f"Bearer {raw}"})
+            assert refused.status_code == 401
+            options = await ac.post(
+                "/api/v1/auth/device/passkey/options",
+                headers={"Authorization": f"Bearer {raw}"},
+                json={"user_code": _device.json()["user_code"]},
+            )
+            assert options.status_code == 401
+
+        confidential = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "Backend",
+                "public": False,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["backend-api"],
+                "scopes": ["openid", "auth:read"],
+            },
+        )
+        started = await ac.post("/oauth/device_authorization", json={"client_id": confidential.json()["client_id"]})
+        assert started.status_code == 400
+        async with async_session_factory() as db:
+            db.add(
+                main_module.DeviceGrant(
+                    device_code_hash=security.token_hash("gkd_legacy"),
+                    user_code_hash=security.token_hash("LEGACY-CODE"),
+                    user_code_hint="LEGA",
+                    client_id=confidential.json()["id"],
+                    scope="openid",
+                    user_id=owner_id,
+                    amr=["pwd"],
+                    expires_at=services.now_utc() + timedelta(minutes=5),
+                    approved_at=services.now_utc(),
+                )
+            )
+            await db.commit()
+        exchange = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "device_code": "gkd_legacy",
+            "client_id": confidential.json()["client_id"],
+        }
+        assert (await ac.post("/oauth/token", data=exchange)).status_code == 401
+        assert (await ac.post("/oauth/token", data={**exchange, "client_secret": "wrong"})).status_code == 401
+        secret = confidential.json()["client_secret"]
+        assert (await ac.post("/oauth/token", data={**exchange, "client_secret": secret})).status_code == 200

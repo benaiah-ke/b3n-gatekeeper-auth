@@ -1317,6 +1317,13 @@ async def me(principal: Principal = Depends(current_principal), db: AsyncSession
     }
 
 
+async def require_hosted_session_user(principal: Principal, db: AsyncSession) -> User:
+    """Device approval hands a client the approver's account, so only a hosted GateKeeper session may do it."""
+    if not hosted_session_principal(principal):
+        raise HTTPException(status_code=401, detail="Sign in to GateKeeper to approve this device")
+    return await require_session_user(principal, db)
+
+
 async def require_session_user(principal: Principal, db: AsyncSession) -> User:
     if principal.auth_type != "user" or not principal.user_id or not principal.session_id:
         raise HTTPException(status_code=403, detail="Session-bound user token required")
@@ -6111,6 +6118,12 @@ async def oauth_token(
         if not device_code or not client_id:
             raise HTTPException(status_code=400, detail="Missing device_code fields")
         client = await get_client_by_client_id(db, client_id)
+        if not client.public and (
+            not client_secret
+            or not client.client_secret_hash
+            or not verify_password(client_secret, client.client_secret_hash)
+        ):
+            raise HTTPException(status_code=401, detail="Invalid client credentials")
         result = await db.execute(
             select(DeviceGrant).where(DeviceGrant.device_code_hash == token_hash(device_code))
         )
@@ -6159,6 +6172,8 @@ async def oauth_token(
 @app.post("/oauth/device_authorization")
 async def device_authorization(body: DeviceAuthorizationRequest, db: AsyncSession = Depends(get_db)):
     client = await get_client_by_client_id(db, body.client_id)
+    if not client.public:
+        raise HTTPException(status_code=400, detail="Device authorization is only for public clients")
     scopes = validate_scopes(client, body.scope)
     validate_audience(client, body.audience)
     device_code = new_opaque_token("gkd")
@@ -6294,7 +6309,7 @@ async def device_passkey_options(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     rp_id, _origins = require_webauthn_configuration()
     await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
@@ -6335,7 +6350,7 @@ async def verify_device_passkey(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     rp_id, origins = require_webauthn_configuration()
     challenge, expected_challenge = await consume_webauthn_challenge(
         db,
@@ -6422,7 +6437,7 @@ async def approve_device(
     principal: Principal = Depends(current_principal),
     db: AsyncSession = Depends(get_db),
 ):
-    user = await require_session_user(principal, db)
+    user = await require_hosted_session_user(principal, db)
     await enforce_device_approval_rate_limit(db, user=user, request=request)
     grant = await active_device_grant(db, body.user_code)
     if body.approve:
