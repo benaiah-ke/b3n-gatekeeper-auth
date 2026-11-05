@@ -7373,3 +7373,59 @@ async def test_device_grants_need_a_hosted_approver_and_a_public_or_authenticate
         assert (await ac.post("/oauth/token", data={**exchange, "client_secret": "wrong"})).status_code == 401
         secret = confidential.json()["client_secret"]
         assert (await ac.post("/oauth/token", data={**exchange, "client_secret": secret})).status_code == 200
+
+
+async def second_tenant_with_admin(ac: AsyncClient, password: str = "correct horse battery"):
+    """A second org whose only member is its admin, who is not a platform admin."""
+    async with async_session_factory() as db:
+        tenant = Organization(name="Tenant", slug="tenant")
+        db.add(tenant)
+        await db.flush()
+        roles = await services.add_default_org_roles(db, tenant)
+        admin = await services.create_user(db, email="tenant-admin@example.com", password=password)
+        db.add(Membership(org_id=tenant.id, user_id=admin.id, role_id=roles["admin"].id))
+        await db.commit()
+        tenant_id, role_ids = tenant.id, {name: role.id for name, role in roles.items()}
+    login = await ac.post("/api/v1/auth/login", json={"email": "tenant-admin@example.com", "password": password})
+    return {"Authorization": f"Bearer {login.json()['access_token']}"}, tenant_id, role_ids
+
+
+@pytest.mark.asyncio
+async def test_tenant_admins_cannot_pull_existing_accounts_into_their_org(monkeypatch):
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        owner_id = owner.json()["user"]["id"]
+        tenant_headers, tenant_id, tenant_roles = await second_tenant_with_admin(ac)
+        async with async_session_factory() as db:
+            orphan = await services.create_user(db, email="orphan@example.com", password="correct horse battery")
+            platform = await services.create_user(db, email="platform@example.com", password="correct horse battery")
+            await db.commit()
+        monkeypatch.setattr(settings, "platform_admin_user_ids", platform.id)
+        for user_id in (owner_id, orphan.id, platform.id):
+            pulled = await ac.put(
+                f"/api/v1/users/{user_id}/membership",
+                headers=tenant_headers,
+                json={"org_id": tenant_id, "role": "viewer", "status": "active"},
+            )
+            assert pulled.status_code == 403, user_id
+        assert (await ac.get("/api/v1/auth/me", headers=owner_headers)).status_code == 200
+
+        async with async_session_factory() as db:
+            db.add(Membership(org_id=tenant_id, user_id=owner_id, role_id=tenant_roles["viewer"]))
+            await db.commit()
+        touched = await ac.put(
+            f"/api/v1/users/{owner_id}/membership",
+            headers=tenant_headers,
+            json={"org_id": tenant_id, "role": "viewer", "status": "active"},
+        )
+        assert touched.status_code == 403
+        assert (await ac.get("/api/v1/auth/me", headers=owner_headers)).status_code == 200
+
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        adopted = await ac.put(
+            f"/api/v1/users/{orphan.id}/membership",
+            headers=owner_headers,
+            json={"org_id": bootstrap_id, "role": "viewer", "status": "active"},
+        )
+        assert adopted.status_code == 200

@@ -2550,13 +2550,11 @@ async def ensure_role_assignable(
 
 
 async def ensure_attach_allowed(db: AsyncSession, *, user_id: str, principal: Principal, org_id: str) -> None:
-    """An existing account that belongs to other orgs joins through an invitation, not provisioning or SCIM."""
-    try:
-        await ensure_account_wide_change_allowed(db, user_id=user_id, principal=principal, visible_org_ids=[org_id])
-    except HTTPException as exc:
-        raise HTTPException(
-            status_code=403, detail="User belongs to another organization; send an invitation instead"
-        ) from exc
+    """An existing account joins another org only by accepting an invitation. Pulling it in through membership
+    updates, provisioning or SCIM would give that org's admins account-wide powers over it (an account with no
+    memberships at all included), so only platform admins may."""
+    if not await is_platform_admin(db, principal.user_id):
+        raise HTTPException(status_code=403, detail="This account already exists; send an invitation instead")
 
 
 async def resolve_org_role(
@@ -3093,8 +3091,6 @@ async def scim_apply_user_state(
         select(Membership).where(Membership.user_id == user.id, Membership.org_id == org.id)
     )
     membership = membership_result.scalar_one_or_none()
-    if membership is None:
-        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
     current_role = await db.get(Role, membership.role_id) if membership else None
     role = current_role
     if role_name is not SCIM_UNSET or not role:
@@ -3746,6 +3742,10 @@ async def scim_create_user(
     password = scim_password(body)
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
+    if user and not await db.scalar(
+        select(Membership.id).where(Membership.user_id == user.id, Membership.org_id == org.id)
+    ):
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
     if not user:
         user = User(
             email=email,
@@ -4128,6 +4128,8 @@ async def update_user_membership(
         select(Membership).where(Membership.user_id == user_id, Membership.org_id == org_id)
     )
     membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org_id)
     current_role = await db.get(Role, membership.role_id) if membership else None
     await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
@@ -4139,6 +4141,8 @@ async def update_user_membership(
     else:
         membership = Membership(org_id=org_id, user_id=user.id, role_id=role.id, status=body.status)
         db.add(membership)
+    # Revoking sessions is account-wide, so an account above the caller is left alone.
+    await ensure_target_not_above_caller(db, user_id=user.id, principal=principal)
     revoked_count = await revoke_user_sessions(db, user_id=user.id)
     await audit(
         db,
