@@ -46,6 +46,16 @@ At minimum, replace:
 - `POSTGRES_PASSWORD` or the external `DATABASE_URL`.
 - `BOOTSTRAP_ADMIN_EMAIL`.
 - SMTP settings before relying on email verification, reset, or invitations.
+- `TRUSTED_PROXY_CIDRS` with your reverse proxy network so audit logs, sessions
+  and rate limits see the real client IP. The proxy must overwrite, not append
+  to, `X-Forwarded-For` and drop any client-sent `CF-Connecting-IP` unless it
+  sits behind Cloudflare.
+- `SENDY_API_KEY` and `ALERT_EMAIL_TO` to receive security alert emails.
+
+Security defaults: `SIGNUP_MODE=closed` (no open signup mode exists),
+`PLATFORM_ADMIN_USER_IDS` empty (bootstrap org owners only), and
+`RESERVED_AUDIENCES` listing first-party audiences that only platform admins may
+put on OAuth clients.
 
 By default, `JWT_KEY_DIR=/data/keys` makes the API generate and persist an RSA
 signing keypair in the `gatekeeper-api-data` Docker volume. Operators who manage
@@ -148,11 +158,11 @@ curl -sf https://auth.example.com/oauth/jwks.json
 After `/version` returns 200:
 
 1. Open `https://auth.example.com/signup` and create the first account. On a
-   fresh install, the first successful signup becomes owner because no active
-   owner exists yet.
-2. Sign in as the configured `BOOTSTRAP_ADMIN_EMAIL` as well if you want that
-   address to be an owner. Later non-admin signups join the bootstrap org as
-   viewers until an owner grants broader access.
+   fresh install, the first successful signup becomes owner. Signup is closed
+   for everyone after that.
+2. Add people with `/users` provisioning or SCIM. With `SIGNUP_MODE=invite`,
+   invitations can also create accounts. New accounts join only the
+   organization they were added to.
 3. Open `https://auth.example.com/account` and confirm the owner state, issuer,
    JWKS URL, SMTP mode, and setup checklist.
 4. Create your first protected API resource with an audience such as

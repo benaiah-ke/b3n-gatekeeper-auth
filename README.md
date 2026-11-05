@@ -94,9 +94,9 @@ development.
 
 After the API and UI are running:
 
-1. Open `/signup` and create the first account. If no active owner exists in
-   the bootstrap org, this successful signup becomes owner. The
-   `BOOTSTRAP_ADMIN_EMAIL` account is also granted owner when it signs up.
+1. Open `/signup` and create the first account. On an empty install this
+   signup becomes owner; signup is closed after that. Add people through
+   provisioning, SCIM, or invitations with `SIGNUP_MODE=invite`.
 2. Open `/account` and follow the setup console. A viewer account can inspect
    state, but an owner is required to create clients, projects, roles, and
    tokens.
