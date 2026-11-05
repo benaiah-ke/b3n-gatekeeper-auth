@@ -589,6 +589,8 @@ async def create_session_tokens(
         ip_address=login_ip,
         user_agent=request.headers.get("user-agent") if request else None,
         amr=list(amr or []),
+        scopes=scopes,
+        audience=audience or settings.issuer,
         trusted_at=trusted_at,
         trusted_until=trusted_until,
         last_seen_at=issued_at,
@@ -740,13 +742,12 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
             refresh.revoked_at = refresh.revoked_at or session.revoked_at
             await db.commit()
             raise HTTPException(status_code=401, detail="MFA required for this session")
-    requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
+    if session.scopes is not None:
+        requested_scopes = list(session.scopes)
+    else:  # sessions created before scopes were stored
+        requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
     scopes = capped_session_scopes(requested_scopes, selected_org)
-    audience = (
-        client.audiences[0]
-        if client and client.audiences
-        else settings.issuer
-    )
+    audience = session.audience or (client.audiences[0] if client and client.audiences else settings.issuer)
     refresh.used_at = now_utc()
     new_refresh_secret = new_opaque_token("gkr")
     new_refresh = RefreshToken(

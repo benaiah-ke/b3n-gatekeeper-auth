@@ -187,6 +187,9 @@ class Session(Base, TimestampMixin):
     trusted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     trusted_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     amr: Mapped[list[str]] = mapped_column(MutableList.as_mutable(json_type()), default=list)
+    # Scopes and audience granted at login, so refresh never widens them.
+    scopes: Mapped[list[str] | None] = mapped_column(json_type(), nullable=True)
+    audience: Mapped[Any] = mapped_column(json_type(), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

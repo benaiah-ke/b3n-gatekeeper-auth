@@ -165,6 +165,42 @@ async def test_email_code_never_creates_accounts():
 
 
 @pytest.mark.asyncio
+async def test_refresh_keeps_the_scopes_and_audience_granted_at_login():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        product = await ac.post(
+            "/api/v1/clients",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={
+                "name": "Product",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["product-api"],
+                "scopes": ["auth:read", "mcp:tools", "mcp:resources"],
+            },
+        )
+        login = {"email": "owner@example.com", "password": password, "client_id": product.json()["client_id"]}
+
+        narrow = await ac.post("/api/v1/auth/login", json={**login, "scope": "mcp:tools"})
+        assert narrow.json()["scope"] == "mcp:tools"
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": narrow.json()["refresh_token"]})
+        assert refreshed.json()["scope"] == "mcp:tools"
+        assert decode_access_token(refreshed.json()["access_token"], audience="product-api")["scope"] == "mcp:tools"
+        oauth_refreshed = await ac.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token", "refresh_token": refreshed.json()["refresh_token"]},
+        )
+        assert oauth_refreshed.json()["scope"] == "mcp:tools"
+
+        hosted_ui = await ac.post("/api/v1/auth/login", json={**login, "audience": settings.issuer})
+        ui_refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": hosted_ui.json()["refresh_token"]})
+        assert decode_access_token(ui_refreshed.json()["access_token"])["aud"] == settings.issuer
+        me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {ui_refreshed.json()['access_token']}"})
+        assert me.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_refresh_can_rotate_from_browser_refresh_cookie():
     async with await client() as ac:
         signup = await register(
@@ -3428,7 +3464,8 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
 
         refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": trusted_login.json()["refresh_token"]})
         assert refreshed.status_code == 200
-        refreshed_claims = decode_access_token(refreshed.json()["access_token"], audience="trusted-api")
+        refreshed_claims = decode_access_token(refreshed.json()["access_token"])
+        assert refreshed_claims["aud"] == settings.issuer
         assert refreshed_claims["amr"] == ["pwd", "trusted_device"]
 
         disabled_policy = await ac.patch(
