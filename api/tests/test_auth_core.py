@@ -6824,3 +6824,80 @@ async def test_org_admins_cannot_take_over_owner_or_platform_admin_accounts(monk
         assert reset.status_code == 200
         renamed = await ac.patch(f"/api/v1/users/{member_id}", headers=owner_headers, json={"display_name": "Co-owner"})
         assert renamed.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_consent_accepts_only_hosted_sessions():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid", "auth:*", "admin:*", "token:*"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:* admin:* token:*",
+            "audience": "x-api",
+        }
+        api_token = await ac.post(
+            "/api/v1/tokens", headers=owner_headers, json={"name": "narrow", "token_type": "personal"}
+        )
+        device = await ac.post(
+            "/oauth/device_authorization", json={"client_id": "gatekeeper-cli", "scope": "auth:read"}
+        )
+        await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=owner_headers,
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        product = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "owner@example.com",
+                "password": "correct horse battery",
+                "client_id": app_client.json()["client_id"],
+            },
+        )
+        ac.cookies.clear()
+        outsiders = [api_token.json()["token"], cli.json()["access_token"], product.json()["access_token"]]
+
+        async def refused(raw: str) -> None:
+            headers = {"Authorization": f"Bearer {raw}"}
+            context = await ac.get("/api/v1/oauth/authorize/context", headers=headers, params=params)
+            assert context.status_code == 401
+            got = await ac.get("/oauth/authorize", headers=headers, params=params)
+            assert got.status_code == 302 and urlparse(got.headers["location"]).path == "/login"
+            posted = await ac.post(
+                "/oauth/authorize", headers=headers, json={**params, "approve": True, "consent_nonce": "0" * 64}
+            )
+            assert urlparse(posted.json()["redirect_to"]).path == "/login"
+
+        for raw in outsiders:
+            await refused(raw)
+        approved = await approve_consent(ac, owner_headers, params)
+        assert "code=" in approved
+        for raw in outsiders:
+            await refused(raw)
+        ac.cookies.clear()
+        remembered = await ac.get("/oauth/authorize", headers=owner_headers, params=params)
+        assert "code=" in remembered.headers["location"]

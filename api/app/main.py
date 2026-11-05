@@ -5522,13 +5522,26 @@ async def oauth_provider_callback(
     return await complete_oauth_provider_callback(provider_id, code, state, request, db, principal=principal)
 
 
+def hosted_session_principal(principal: Principal | None) -> Principal | None:
+    """Only a hosted GateKeeper session may authorize apps. API, CLI and product tokens are treated as signed out,
+    because a code for a client can carry far wider scopes than the token that asked for it."""
+    if (
+        principal
+        and principal.auth_type == "user"
+        and principal.session_id
+        and (principal.claims or {}).get("aud") == settings.issuer
+    ):
+        return principal
+    return None
+
+
 def consent_nonce(principal: Principal, client: AuthClient, redirect_uri: str, code_challenge: str) -> str:
     """Proof that the hosted consent page for this exact request was shown to this session."""
     message = "|".join(
         [
             "oauth-consent",
             principal.user_id or "",
-            principal.session_id or principal.token_id or "",
+            principal.session_id or "",
             client.client_id,
             redirect_uri,
             code_challenge,
@@ -5593,6 +5606,7 @@ async def oauth_authorize(
     validate_redirect(client, redirect_uri)
     selected_audience = validate_audience(client, audience)
     scopes = validate_scopes(client, scope)
+    principal = hosted_session_principal(principal)
     if not principal:
         login_url = f"{settings.ui_url.rstrip('/')}/login?{urlencode({'redirect': oauth_authorize_path(request)})}"
         return RedirectResponse(login_url, status_code=302)
@@ -5728,8 +5742,8 @@ async def oauth_authorize_context(
 ):
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Unsupported response_type")
-    if not principal.user_id:
-        raise HTTPException(status_code=403, detail="User-bound authorization required")
+    if not hosted_session_principal(principal):
+        raise HTTPException(status_code=401, detail="Sign in to GateKeeper to review this app")
     client = await get_client_by_client_id(db, client_id)
     validate_redirect(client, redirect_uri)
     selected_audience = validate_audience(client, audience)
