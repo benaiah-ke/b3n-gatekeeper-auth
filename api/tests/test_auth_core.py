@@ -6934,3 +6934,29 @@ async def test_clients_without_an_audience_need_a_platform_admin():
         assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
         platform = await ac.post("/api/v1/clients", headers=owner_headers, json={**body, "scopes": ["auth:read"]})
         assert platform.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_scim_group_add_cannot_demote_an_owner():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "co-owner@example.com", "password": "correct horse battery"})
+        member_id = member.json()["user"]["id"]
+        promoted = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
+        roles = {role["name"]: role["id"] for role in (await ac.get("/api/v1/roles", headers=owner_headers)).json()}
+        demoted = await ac.patch(
+            f"/scim/v2/Groups/{roles['viewer']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member_id}]}]},
+        )
+        assert demoted.status_code == 403
+    async with async_session_factory() as db:
+        role_id = (
+            await db.execute(select(Membership.role_id).where(Membership.user_id == member_id))
+        ).scalar_one()
+    assert role_id == roles["owner"]

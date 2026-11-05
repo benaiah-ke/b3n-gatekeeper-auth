@@ -2994,6 +2994,7 @@ async def scim_assign_group_member(
     if user.disabled:
         await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role, current_role=current_role)
     changed = (
         membership is None
         or membership.role_id != role.id
