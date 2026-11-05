@@ -6307,3 +6307,106 @@ async def test_consent_needs_a_session_bound_nonce_and_post_and_only_platform_ad
         location = urlparse(await approve_consent(ac, owner_headers, params))
         assert f"{location.scheme}://{location.netloc}{location.path}" == "https://app.example.com/callback"
         assert parse_qs(location.query)["code"][0].startswith("gkc_")
+
+
+@pytest.mark.asyncio
+async def test_org_admins_cannot_hand_out_roles_or_policies_above_their_own():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "member@example.com", "password": "correct horse battery"})
+        member_id = member.json()["user"]["id"]
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        superuser = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "superuser", "permissions": ["*"]}
+        )
+        assert superuser.status_code == 200
+
+        for role in ({"role": "owner"}, {"role_id": superuser.json()["id"]}, {"role": "operator"}):
+            promoted = await ac.put(
+                f"/api/v1/users/{member_id}/membership",
+                headers=admin_headers,
+                json={"org_id": org_id, "status": "active", **role},
+            )
+            assert promoted.status_code == 403
+            invited = await ac.post(
+                "/api/v1/invitations",
+                headers=admin_headers,
+                json={"email": "new@example.com", "org_id": org_id, **role},
+            )
+            assert invited.status_code == 403
+            provisioned = await ac.post(
+                "/api/v1/users/provision",
+                headers=admin_headers,
+                json={"email": "new@example.com", "org_id": org_id, **role},
+            )
+            assert provisioned.status_code == 403
+        demoted = await ac.put(
+            f"/api/v1/users/{owner_id}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "viewer", "status": "active"},
+        )
+        assert demoted.status_code == 403
+        peer = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "admin", "status": "active"},
+        )
+        assert peer.status_code == 200
+
+        for name, permissions, expected in (
+            ("support", ["*"], 403),
+            ("support", ["token:*"], 403),
+            ("Owner", ["auth:read"], 400),
+            (" ADMIN ", ["auth:read"], 400),
+            ("oper-ator", ["auth:read"], 400),
+            ("support", ["auth:read"], 200),
+        ):
+            created = await ac.post(
+                "/api/v1/roles",
+                headers=admin_headers,
+                json={"org_id": org_id, "name": name, "permissions": permissions},
+            )
+            assert created.status_code == expected
+
+        roles = {role["name"]: role["id"] for role in (await ac.get("/api/v1/roles", headers=owner_headers)).json()}
+        renamed_owner = await ac.put(
+            f"/scim/v2/Groups/{roles['owner']}", headers=admin_headers, json={"displayName": "former", "members": []}
+        )
+        assert renamed_owner.status_code == 403
+        renamed_admin = await ac.patch(
+            f"/scim/v2/Groups/{roles['admin']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "displayName", "value": "Owner"}]},
+        )
+        assert renamed_admin.status_code == 400
+        lookalike = await ac.post("/scim/v2/Groups", headers=admin_headers, json={"displayName": "OWNER"})
+        assert lookalike.status_code == 400
+        owner_group = await ac.patch(
+            f"/scim/v2/Groups/{roles['owner']}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member_id}]}]},
+        )
+        assert owner_group.status_code == 403
+        scim_owner = await ac.patch(
+            f"/scim/v2/Users/{member_id}",
+            headers=admin_headers,
+            json={"Operations": [{"op": "replace", "path": "roles", "value": [{"value": "owner"}]}]},
+        )
+        assert scim_owner.status_code == 403
+
+        for policy in ({"require_mfa": True}, {"admin_step_up_mfa_required": True}):
+            changed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json=policy)
+            assert changed.status_code == 403
+        renamed = await ac.patch(f"/api/v1/orgs/{org_id}", headers=admin_headers, json={"name": "Renamed"})
+        assert renamed.status_code == 200
+        owner_promotes = await ac.put(
+            f"/api/v1/users/{member_id}/membership",
+            headers=owner_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert owner_promotes.status_code == 200
+
+    async with async_session_factory() as db:
+        actions = set((await db.execute(select(AuditEvent.action))).scalars())
+    assert "role.create" in actions
+

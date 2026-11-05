@@ -2468,6 +2468,35 @@ async def ensure_account_wide_change_allowed(
         raise HTTPException(status_code=403, detail="User belongs to another organization")
 
 
+RESERVED_ROLE_NAMES = {"owner", "admin", "operator"}
+
+
+def ensure_custom_role_name(name: str) -> None:
+    # Resource servers and the platform-admin check read role names, so look-alikes of the built-in roles are refused.
+    if re.sub(r"[^a-z]", "", name.lower()) in RESERVED_ROLE_NAMES:
+        raise HTTPException(status_code=400, detail="Role name is reserved")
+
+
+async def require_org_owner(db: AsyncSession, principal: Principal, org_id: str) -> None:
+    if await is_platform_admin(db, principal.user_id):
+        return
+    caller_orgs = await org_roles(db, principal.user_id) if principal.user_id else []
+    if not any(org.id == org_id and org.role == "owner" for org in caller_orgs):
+        raise HTTPException(status_code=403, detail="Organization owner required")
+
+
+async def ensure_role_assignable(
+    db: AsyncSession, *, principal: Principal, org_id: str, role: Role, current_role: Role | None = None
+) -> None:
+    """Callers hand out only roles their own permissions cover, and only owners or platform admins touch owners."""
+    if role.name == "owner" or (current_role is not None and current_role.name == "owner"):
+        await require_org_owner(db, principal, org_id)
+    try:
+        await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=role.permissions or [])
+    except HTTPException as exc:
+        raise HTTPException(status_code=403, detail="Role grants more than your own permissions") from exc
+
+
 async def resolve_org_role(
     db: AsyncSession,
     *,
@@ -3013,6 +3042,8 @@ async def scim_apply_user_state(
         if membership and active is SCIM_UNSET
         else ("active" if scim_bool(active) else "revoked")
     )
+    if membership is None or role.id != membership.role_id or target_status != membership.status:
+        await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if target_status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org.id, user_id=user.id)
@@ -3385,6 +3416,7 @@ async def scim_create_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     display_name = scim_group_display_name(body)
+    ensure_custom_role_name(display_name)
     existing = await db.execute(select(Role).where(Role.org_id == org.id, Role.name == display_name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3435,8 +3467,11 @@ async def scim_replace_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     role = await scim_group_role(db, role_id=group_id, org_id=org.id)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     display_name = scim_group_display_name(body)
     if display_name != role.name:
+        ensure_custom_role_name(role.name)
+        ensure_custom_role_name(display_name)
         duplicate = await db.execute(select(Role.id).where(Role.org_id == org.id, Role.name == display_name))
         if duplicate.scalar_one_or_none():
             raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3484,6 +3519,7 @@ async def scim_patch_group(
     org = await scim_selected_org(db, principal, org_id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     role = await scim_group_role(db, role_id=group_id, org_id=org.id)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     operations = body.get("Operations") or body.get("operations")
     if not isinstance(operations, list):
         raise HTTPException(status_code=422, detail="SCIM PatchOp Operations array is required")
@@ -3506,6 +3542,8 @@ async def scim_patch_group(
                 raise HTTPException(status_code=400, detail="SCIM group displayName is required")
             display_name = scim_group_display_name({"displayName": value})
             if display_name != role.name:
+                ensure_custom_role_name(role.name)
+                ensure_custom_role_name(display_name)
                 duplicate = await db.execute(select(Role.id).where(Role.org_id == org.id, Role.name == display_name))
                 if duplicate.scalar_one_or_none():
                     raise HTTPException(status_code=409, detail="SCIM group already exists")
@@ -3877,6 +3915,7 @@ async def provision_user(
     membership = membership_result.scalar_one_or_none()
     created_membership = membership is None
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if body.status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org_id, user_id=user.id)
@@ -4016,6 +4055,7 @@ async def update_user_membership(
     )
     membership = membership_result.scalar_one_or_none()
     current_role = await db.get(Role, membership.role_id) if membership else None
+    await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
         if body.status != "active" or role.name != "owner":
             await ensure_other_active_owner(db, org_id=org_id, user_id=user.id)
@@ -4270,6 +4310,7 @@ async def create_invitation(
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
     role = await invitation_role(db, org_id=org.id, role_id=body.role_id, role_name=body.role)
+    await ensure_role_assignable(db, principal=principal, org_id=org.id, role=role)
     email = str(body.email).lower()
     revoked_at = now_utc()
     existing_result = await db.execute(
@@ -6549,6 +6590,11 @@ async def update_org(
         raise HTTPException(status_code=404, detail="Organization not found")
     await setup_resource_org_id(db, principal, org.id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
+    if (body.require_mfa is not None and body.require_mfa != org.require_mfa) or (
+        body.admin_step_up_mfa_required is not None
+        and body.admin_step_up_mfa_required != org.admin_step_up_mfa_required
+    ):
+        await require_org_owner(db, principal, org.id)
     revoked_sessions = 0
     if body.name is not None:
         org.name = body.name
@@ -6675,6 +6721,7 @@ async def list_projects(
 @app.post("/api/v1/roles")
 async def create_role(
     body: RoleCreate,
+    request: Request,
     principal: Principal = Depends(require_scopes(["admin:*"])),
     db: AsyncSession = Depends(get_db),
 ):
@@ -6682,8 +6729,21 @@ async def create_role(
     if not org_id:
         raise HTTPException(status_code=400, detail="Organization is required")
     await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
+    ensure_custom_role_name(body.name)
+    await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.permissions)
     role = Role(org_id=org_id, name=body.name, permissions=body.permissions)
     db.add(role)
+    await db.flush()
+    await audit(
+        db,
+        "role.create",
+        org_id=org_id,
+        actor_user_id=principal.user_id,
+        target_type="role",
+        target_id=role.id,
+        details={"role": role.name, "scopes": role.permissions},
+        request=request,
+    )
     await db.commit()
     return {"id": role.id, "org_id": role.org_id, "name": role.name, "permissions": role.permissions}
 
