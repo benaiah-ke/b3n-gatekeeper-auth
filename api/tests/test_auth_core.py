@@ -7022,3 +7022,41 @@ async def test_consent_post_without_a_session_returns_to_the_same_authorize_requ
         consent = urlparse(resumed.headers["location"])
         assert consent.path == "/authorize"
         assert parse_qs(consent.query)["state"] == ["keep-me"]
+
+
+@pytest.mark.asyncio
+async def test_migration_turns_off_email_linking_on_existing_providers():
+    import importlib.util
+    from pathlib import Path
+
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.models import OAuthProvider
+
+    path = Path(__file__).resolve().parents[1] / "alembic" / "versions" / "20261105_0023_disable_email_linking.py"
+    spec = importlib.util.spec_from_file_location("migration_0023", path)
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+
+    async with async_session_factory() as db:
+        db.add(
+            OAuthProvider(
+                provider_id="legacy",
+                name="Legacy",
+                authorization_url="https://login.example.com/authorize",
+                token_url="https://login.example.com/token",
+                userinfo_url="https://login.example.com/userinfo",
+                allow_email_linking=True,
+            )
+        )
+        await db.commit()
+
+    def upgrade(connection) -> None:
+        with Operations.context(MigrationContext.configure(connection)):
+            migration.upgrade()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(upgrade)
+    async with async_session_factory() as db:
+        assert (await db.execute(select(OAuthProvider.allow_email_linking))).scalars().all() == [False]
