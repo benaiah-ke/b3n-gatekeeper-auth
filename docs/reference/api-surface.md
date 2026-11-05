@@ -30,7 +30,7 @@ product wants to own its own auth screens, use the provider APIs directly.
 | `POST /api/v1/auth/signup` | Provider API | Creates the first owner of an empty install. Returns 403 after that; accounts come from provisioning, SCIM, or invitations in `SIGNUP_MODE=invite`. |
 | `POST /api/v1/auth/login` | Provider API | Product-owned password signin. Accepts optional `client_id`, `totp_code`, and recovery code; passkey-enrolled accounts cannot downgrade to password-only signin. |
 | `POST /api/v1/auth/refresh` | Provider API | Rotate a refresh token and issue a new access token. |
-| `POST /api/v1/auth/session/switch-org` | Provider API | Issue a fresh session token for a selected organization, optional client, scope, and audience. |
+| `POST /api/v1/auth/session/switch-org` | Provider API | Issue a fresh hosted session token for a selected organization. Hosted sessions only; no client, scope, or audience changes. |
 | `POST /api/v1/auth/logout` | Provider API | Revoke the current session/refresh family when called with a session-bound token. |
 | `GET /api/v1/auth/me` | Provider API | Current user, memberships, and claims. |
 | `PATCH /api/v1/auth/me` | Provider API | Self-service profile update. |

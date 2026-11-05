@@ -1194,31 +1194,20 @@ async def switch_session_org(
     db: AsyncSession = Depends(get_db),
 ):
     user = await require_session_user(principal, db)
+    # Only hosted GateKeeper sessions switch orgs. They always carry their full role, so re-deriving the role in the
+    # target org widens nothing; CLI, client-bound and narrowed tokens would be widened, so they sign in again.
+    current = await db.get(Session, principal.session_id)
+    if not current or current.client_id or (principal.claims or {}).get("aud") != settings.issuer:
+        raise HTTPException(status_code=403, detail="Organization switching is limited to hosted sessions")
+    if body.client_id or body.scope or (body.audience and body.audience != settings.issuer):
+        raise HTTPException(status_code=400, detail="Organization switching keeps the session's client and scopes")
     memberships = await org_roles(db, user.id)
     selected_org = next((org for org in memberships if org.id == body.org_id), None)
     if not selected_org:
         raise HTTPException(status_code=403, detail="Organization membership required")
-
-    client = await get_client_by_client_id(db, body.client_id) if body.client_id else None
-    if client and client.org_id and client.org_id != selected_org.id:
-        raise HTTPException(status_code=403, detail="Client is bound to another organization")
-
-    if client:
-        scopes = validate_scopes(client, body.scope or "")
-        audience = validate_audience(client, body.audience) or (
-            client.audiences[0] if client.audiences else settings.issuer
-        )
-    else:
-        if body.audience and body.audience != settings.issuer:
-            raise HTTPException(status_code=400, detail="client_id is required for custom audience")
-        if body.scope:
-            scopes = [item for item in body.scope.split() if item]
-            allowed_scopes = set(selected_org.permissions or [])
-            if "*" not in allowed_scopes and not set(scopes).issubset(allowed_scopes):
-                raise HTTPException(status_code=400, detail="Invalid scope")
-        else:
-            scopes = derive_membership_scopes(memberships, selected_org.id)
-        audience = settings.issuer
+    client = None
+    scopes = derive_membership_scopes(memberships, selected_org.id)
+    audience = settings.issuer
 
     amr = principal_amr(principal)
     await enforce_client_and_org_mfa_policy(

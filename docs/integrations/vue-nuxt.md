@@ -204,16 +204,12 @@ await auth.loginWithPassword({
 })
 ```
 
-Use `switchOrg` when a product needs to move the active account context without
-forcing a new signin:
+`switchOrg` works only with a hosted GateKeeper session (no client, issuer
+audience) and returns that session's full role in the selected org. Product
+tokens cannot switch; run the OAuth flow again with the new `org_id`:
 
 ```ts
-await auth.switchOrg({
-  orgId,
-  clientId: 'gkc_product_client',
-  audience: 'example-api',
-  scope: 'api:read',
-})
+await auth.switchOrg({ orgId })
 ```
 
 Products that expose API extensions can let signed-in users create

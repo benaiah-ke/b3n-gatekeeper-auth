@@ -547,19 +547,13 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
                 "audience": "second-product-api",
             },
         )
-        assert switched.status_code == 200
-        assert switched.json()["scope"] == "api:read"
-        switched_claims = decode_access_token(switched.json()["access_token"], audience="second-product-api")
+        assert switched.status_code == 400
+        switched_claims = decode_access_token(second_access)
         assert switched_claims["org_id"] == second_org["id"]
         assert switched_claims["org_slug"] == "second-product"
         assert switched_claims["org_role"] == "owner"
         assert switched_claims["permissions"] == ["*"]
 
-        product_token_setup = await ac.get(
-            "/api/v1/setup/status",
-            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
-        )
-        assert product_token_setup.status_code == 401
         setup = await ac.get(
             "/api/v1/setup/status",
             headers={"Authorization": f"Bearer {second_access}"},
@@ -6134,3 +6128,61 @@ async def test_security_events_queue_alerts_without_secret_values(monkeypatch):
         assert token.json()["token"] not in item["text"]
         assert password not in item["text"]
         assert owner.json()["access_token"] not in item["text"]
+
+
+@pytest.mark.asyncio
+async def test_switch_org_is_limited_to_hosted_sessions_and_never_widens_a_token():
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_token = owner.json()["access_token"]
+        second = await ac.post(
+            "/api/v1/orgs", headers=bearer(owner_token), json={"name": "Second", "slug": "second"}
+        )
+        assert second.status_code == 200
+
+        device = await ac.post(
+            "/oauth/device_authorization", json={"client_id": "gatekeeper-cli", "scope": "auth:read"}
+        )
+        approved = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=bearer(owner_token),
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert cli.json()["scope"] == "auth:read"
+        widened = await ac.post(
+            "/api/v1/auth/session/switch-org",
+            headers=bearer(cli.json()["access_token"]),
+            json={"org_id": second.json()["id"]},
+        )
+        assert widened.status_code == 403
+        assert widened.json()["detail"] == "Organization switching is limited to hosted sessions"
+
+        for extra in ({"client_id": "gatekeeper-cli"}, {"audience": "gatekeeper-api"}, {"scope": "auth:read"}):
+            changed = await ac.post(
+                "/api/v1/auth/session/switch-org",
+                headers=bearer(owner_token),
+                json={"org_id": second.json()["id"], **extra},
+            )
+            assert changed.status_code == 400
+
+        hosted = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=bearer(owner_token), json={"org_id": second.json()["id"]}
+        )
+        assert hosted.status_code == 200
+        claims = decode_access_token(hosted.json()["access_token"])
+        assert claims["org_id"] == second.json()["id"]
+        assert claims["aud"] == settings.issuer
+        assert claims.get("azp") is None
+        assert claims["scope"] == "*"
