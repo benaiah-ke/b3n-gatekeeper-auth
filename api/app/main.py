@@ -6371,6 +6371,7 @@ async def update_org(
     org = await db.get(Organization, org_id)
     if not org:
         raise HTTPException(status_code=404, detail="Organization not found")
+    await setup_resource_org_id(db, principal, org.id)
     await require_admin_step_up_for_org(db, principal=principal, org_id=org.id)
     revoked_sessions = 0
     if body.name is not None:

@@ -515,6 +515,35 @@ async def test_platform_admin_gates_orgs_reserved_audience_clients_and_providers
 
 
 @pytest.mark.asyncio
+async def test_org_admin_cannot_update_another_organization(monkeypatch):
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        bootstrap_id = owner.json()["orgs"][0]["id"]
+        second = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Second", "slug": "second"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": second.json()["id"]}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"email": "tenant@example.com", "org_id": second.json()["id"], "role": "owner"},
+        )
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        tenant = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "tenant@example.com", "password": password, "token": invite.json()["token"]},
+        )
+        tenant_headers = {"Authorization": f"Bearer {tenant.json()['access_token']}"}
+
+        denied = await ac.patch(f"/api/v1/orgs/{bootstrap_id}", headers=tenant_headers, json={"name": "Taken"})
+        assert denied.status_code == 403
+        own = await ac.patch(f"/api/v1/orgs/{second.json()['id']}", headers=tenant_headers, json={"name": "Mine"})
+        assert own.status_code == 200
+
+
+@pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
         signup = await register(
