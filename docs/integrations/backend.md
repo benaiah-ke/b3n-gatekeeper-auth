@@ -75,6 +75,13 @@ Session-bound user JWTs include:
   permissions of the user's role in the token's organization, so a client that
   lists a scope does not grant it to users whose role lacks it.
 
+GateKeeper's own API only accepts tokens whose audience is the issuer or
+`GATEKEEPER_API_AUDIENCE` (default `gatekeeper-api`). A token issued for your
+product audience is rejected there with 401, so product backends that proxy
+GateKeeper account endpoints must use a GateKeeper session token for those calls.
+Direct password and passkey logins may request `audience` set to the issuer to
+get that session token while still applying the client's login policy.
+
 Personal-account tokens for clients that do not require organization membership
 can intentionally omit `org_id`, `org_role`, and `permissions`, and carry an
 empty `roles` list. Service tokens from client credentials carry no role claims.

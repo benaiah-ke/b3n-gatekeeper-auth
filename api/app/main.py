@@ -430,6 +430,14 @@ async def issue_oauth_authorization_code(
     return RedirectResponse(f"{redirect_uri}?{urlencode(query)}", status_code=302)
 
 
+def login_audience(client: AuthClient | None, requested: str | None) -> str:
+    """Direct logins may always ask for a GateKeeper session; other audiences must belong to the client."""
+    if requested and requested in settings.gatekeeper_audience_set:
+        return requested
+    selected = validate_audience(client, requested) if client else None
+    return selected or (client.audiences[0] if client and client.audiences else settings.issuer)
+
+
 def has_capability(values: list[str], *accepted: str) -> bool:
     value_set = set(values)
     if "*" in value_set:
@@ -1110,8 +1118,7 @@ async def login(body: LoginRequest, request: Request, response: Response, db: As
     )
     orgs = await org_roles(db, user.id)
     scopes = validate_scopes(client, body.scope or "") if client else derive_membership_scopes(orgs, effective_org_id)
-    selected_audience = validate_audience(client, body.audience) if client else None
-    audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
+    audience = login_audience(client, body.audience)
     access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
         db,
         user,
@@ -1919,7 +1926,7 @@ async def passkey_authentication_options(
     if payload.client_id:
         client = await get_client_by_client_id(db, payload.client_id)
         validate_scopes(client, payload.scope or "")
-        validate_audience(client, payload.audience)
+        login_audience(client, payload.audience)
     await enforce_rate_limit(
         db,
         key=f"passkey-auth:{client_ip(request) or 'unknown'}",
@@ -2021,8 +2028,7 @@ async def verify_passkey_authentication(
     )
     orgs = await org_roles(db, user.id)
     scopes = validate_scopes(client, requested_scope) if client else derive_membership_scopes(orgs, effective_org_id)
-    selected_audience = validate_audience(client, requested_audience) if client else None
-    audience = selected_audience or (client.audiences[0] if client and client.audiences else settings.issuer)
+    audience = login_audience(client, requested_audience)
     device_id = current_or_new_device_id(request)
     access, refresh_token, _session, _refresh_model, scopes = await create_session_tokens(
         db,

@@ -67,6 +67,8 @@ class Settings(BaseSettings):
     # Neither mode allows open self-service signup after the first owner of an empty install.
     signup_mode: Literal["closed", "invite"] = "closed"
 
+    # GateKeeper's own API accepts only tokens for this audience or the issuer.
+    gatekeeper_api_audience: str = "gatekeeper-api"
     # Platform admins are active owners of the bootstrap org plus these comma-separated user IDs.
     platform_admin_user_ids: str = ""
     # Only platform admins may create or change OAuth clients that target these audiences.
@@ -127,6 +129,10 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def gatekeeper_audience_set(self) -> set[str]:
+        return {self.issuer, self.gatekeeper_api_audience}
 
     @property
     def platform_admin_user_id_set(self) -> set[str]:

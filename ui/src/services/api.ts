@@ -354,6 +354,9 @@ export const api = {
   unlinkIdentity(id: string) {
     return request<{ status: string; id: string }>(`/api/v1/auth/identities/${id}`, { method: 'DELETE' })
   },
+  discovery() {
+    return request<{ issuer: string }>('/.well-known/openid-configuration')
+  },
   oauthProviders() {
     return request<OAuthProvider[]>('/api/v1/auth/oauth/providers')
   },

@@ -39,6 +39,15 @@ const oauthLoginContext = computed(() => {
     return {}
   }
 })
+// The hosted UI keeps the client's login policy but asks for a GateKeeper session token,
+// because GateKeeper's own API rejects tokens issued for other audiences.
+async function hostedLoginContext() {
+  const context = oauthLoginContext.value
+  if (!('clientId' in context) || !context.clientId) return context
+  const { issuer } = await api.discovery()
+  return { ...context, audience: issuer }
+}
+
 const signupRoute = computed(() =>
   redirectTarget.value ? { path: '/signup', query: { redirect: redirectTarget.value } } : '/signup',
 )
@@ -77,7 +86,7 @@ async function signInWithPasskey() {
   error.value = ''
   passkeyLoading.value = true
   try {
-    const options = await api.passkeyAuthenticationOptions(oauthLoginContext.value)
+    const options = await api.passkeyAuthenticationOptions(await hostedLoginContext())
     const credential = await startAuthentication({ optionsJSON: options.public_key })
     await api.authenticateWithPasskey(options.challenge_id, credential)
     await finishSignIn()
@@ -92,7 +101,7 @@ async function submit() {
   error.value = ''
   loading.value = true
   try {
-    await api.login(email.value, password.value, totpCode.value, recoveryCode.value, oauthLoginContext.value)
+    await api.login(email.value, password.value, totpCode.value, recoveryCode.value, await hostedLoginContext())
     await finishSignIn()
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Sign in failed'

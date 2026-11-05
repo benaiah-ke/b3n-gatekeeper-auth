@@ -236,6 +236,7 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
                 "email": "operator@example.com",
                 "password": "correct horse battery",
                 "client_id": created_client["client_id"],
+                "audience": settings.issuer,
             },
         )
         assert app_login.status_code == 200
@@ -428,9 +429,14 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
         assert switched_claims["org_role"] == "owner"
         assert switched_claims["permissions"] == ["*"]
 
-        setup = await ac.get(
+        product_token_setup = await ac.get(
             "/api/v1/setup/status",
             headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+        )
+        assert product_token_setup.status_code == 401
+        setup = await ac.get(
+            "/api/v1/setup/status",
+            headers={"Authorization": f"Bearer {second_access}"},
         )
         assert setup.status_code == 200
         assert setup.json()["org"]["id"] == second_org["id"]
@@ -3207,6 +3213,21 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
         assert mfa_claims["amr"] == ["pwd", "otp"]
         assert set(mfa_claims["scope"].split()) == {"openid", "profile", "email", "api:read"}
 
+        ui_login = await ac.post(
+            "/api/v1/auth/login",
+            json={
+                "email": "admin@example.com",
+                "password": "correct horse battery",
+                "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
+                "totp_code": totp_code(secret),
+            },
+        )
+        assert ui_login.status_code == 200
+        ui_access = ui_login.json()["access_token"]
+        product_me = await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {mfa_payload['access_token']}"})
+        assert product_me.status_code == 401
+
         refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": mfa_payload["refresh_token"]})
         assert refreshed.status_code == 200
         refreshed_claims = decode_access_token(refreshed.json()["access_token"], audience="mfa-api")
@@ -3214,7 +3235,7 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
 
         approved = await ac.get(
             "/oauth/authorize",
-            headers={"Authorization": f"Bearer {mfa_payload['access_token']}"},
+            headers={"Authorization": f"Bearer {ui_access}"},
             params={
                 "response_type": "code",
                 "client_id": created.json()["client_id"],
@@ -3256,7 +3277,7 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
 
         mfa_approve = await ac.post(
             "/api/v1/auth/device/approve",
-            headers={"Authorization": f"Bearer {mfa_payload['access_token']}"},
+            headers={"Authorization": f"Bearer {ui_access}"},
             json={"user_code": device.json()["user_code"], "approve": True},
         )
         assert mfa_approve.status_code == 200
@@ -3353,11 +3374,12 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
                 "email": "owner@example.com",
                 "password": "correct horse battery",
                 "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
                 "totp_code": totp_code(secret),
             },
         )
         assert mfa_login.status_code == 200
-        mfa_claims = decode_access_token(mfa_login.json()["access_token"], audience="trusted-api")
+        mfa_claims = decode_access_token(mfa_login.json()["access_token"])
         trusted = await ac.patch(
             f"/api/v1/sessions/{mfa_claims['session_id']}/device",
             headers={"Authorization": f"Bearer {mfa_login.json()['access_token']}"},
@@ -3391,10 +3413,11 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
                 "email": "owner@example.com",
                 "password": "correct horse battery",
                 "client_id": created.json()["client_id"],
+                "audience": settings.issuer,
             },
         )
         assert trusted_login.status_code == 200
-        trusted_claims = decode_access_token(trusted_login.json()["access_token"], audience="trusted-api")
+        trusted_claims = decode_access_token(trusted_login.json()["access_token"])
         assert trusted_claims["amr"] == ["pwd", "trusted_device"]
         current_session = await ac.get(
             "/api/v1/sessions",
@@ -4683,6 +4706,79 @@ async def test_user_access_tokens_carry_role_claims_and_service_tokens_do_not():
         assert service_claims["token_type"] == "service"
         assert "roles" not in service_claims
         assert "org_role" not in service_claims
+
+
+@pytest.mark.asyncio
+async def test_gatekeeper_api_accepts_only_its_own_token_audiences():
+    password = "correct horse battery"
+
+    def bearer(token: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {token}"}
+
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_token = owner.json()["access_token"]
+        assert decode_access_token(owner_token)["aud"] == settings.issuer
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(owner_token))).status_code == 200
+
+        sentinel = await ac.post(
+            "/api/v1/clients",
+            headers=bearer(owner_token),
+            json={
+                "name": "Sentinel",
+                "public": False,
+                "redirect_uris": ["https://sentinel.example.com/callback"],
+                "audiences": ["sentinel-api"],
+                "scopes": ["auth:read"],
+            },
+        )
+        assert sentinel.status_code == 200
+        sentinel_client_id = sentinel.json()["client_id"]
+        login = {"email": "owner@example.com", "password": password, "client_id": sentinel_client_id}
+        product = await ac.post("/api/v1/auth/login", json=login)
+        assert decode_access_token(product.json()["access_token"], audience="sentinel-api")
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(product.json()["access_token"]))).status_code == 401
+
+        hosted_ui = await ac.post("/api/v1/auth/login", json={**login, "audience": settings.issuer})
+        assert hosted_ui.status_code == 200
+        assert decode_access_token(hosted_ui.json()["access_token"])["aud"] == settings.issuer
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(hosted_ui.json()["access_token"]))).status_code == 200
+
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": sentinel_client_id,
+                "client_secret": sentinel.json()["client_secret"],
+            },
+        )
+        assert (await ac.get("/api/v1/orgs", headers=bearer(service.json()["access_token"]))).status_code == 401
+
+        device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+        approved = await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=bearer(owner_token),
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        assert approved.status_code == 200
+        cli = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert decode_access_token(cli.json()["access_token"])["aud"] == ["gatekeeper-api"]
+        assert (await ac.get("/api/v1/auth/me", headers=bearer(cli.json()["access_token"]))).status_code == 200
+
+        for audiences, expected in (([], 200), (["gatekeeper-api"], 200), (["sentinel-api"], 401)):
+            api_token = await ac.post(
+                "/api/v1/tokens",
+                headers=bearer(owner_token),
+                json={"name": "bound token", "token_type": "personal", "audiences": audiences},
+            )
+            assert (await ac.get("/api/v1/auth/me", headers=bearer(api_token.json()["token"]))).status_code == expected
 
 
 @pytest.mark.asyncio

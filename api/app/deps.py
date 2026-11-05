@@ -48,6 +48,7 @@ async def current_principal(
             not api_token
             or api_token.revoked_at
             or (api_token.expires_at and api_token.expires_at <= now_utc())
+            or (api_token.audiences and not settings.gatekeeper_audience_set.intersection(api_token.audiences))
         ):
             raise HTTPException(status_code=401, detail="Invalid API token")
         if api_token.user_id:
@@ -69,6 +70,11 @@ async def current_principal(
         claims = decode_access_token(raw)
     except ValueError as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
+    # Tokens minted for other resource servers (sentinel-api, product APIs) are not GateKeeper credentials.
+    audience = claims.get("aud")
+    audiences = {audience} if isinstance(audience, str) else set(audience or [])
+    if not settings.gatekeeper_audience_set.intersection(audiences):
+        raise HTTPException(status_code=401, detail="Invalid access token")
     scope = str(claims.get("scope", "")).split()
     token_type = str(claims.get("token_type", "access"))
     subject = str(claims.get("sub", ""))
