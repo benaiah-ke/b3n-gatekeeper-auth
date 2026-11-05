@@ -2498,6 +2498,8 @@ async def ensure_role_assignable(
     db: AsyncSession, *, principal: Principal, org_id: str, role: Role, current_role: Role | None = None
 ) -> None:
     """Callers hand out only roles their own permissions cover, and only owners or platform admins touch owners."""
+    if await is_platform_admin(db, principal.user_id):
+        return
     if role.name == "owner" or (current_role is not None and current_role.name == "owner"):
         await require_org_owner(db, principal, org_id)
     try:

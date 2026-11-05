@@ -7130,3 +7130,17 @@ async def test_rotating_an_api_token_rechecks_its_bindings():
             await db.commit()
         rotated = await ac.post(f"/api/v1/tokens/{legacy.id}/rotate", headers=owner_headers)
         assert rotated.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_platform_admins_may_assign_any_role(monkeypatch):
+    async with await client() as ac:
+        _owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        member = await register(ac, json={"email": "member@example.com", "password": "correct horse battery"})
+        monkeypatch.setattr(settings, "platform_admin_user_ids", admin_id)
+        promoted = await ac.put(
+            f"/api/v1/users/{member.json()['user']['id']}/membership",
+            headers=admin_headers,
+            json={"org_id": org_id, "role": "owner", "status": "active"},
+        )
+        assert promoted.status_code == 200
