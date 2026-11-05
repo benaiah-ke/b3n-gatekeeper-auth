@@ -7230,3 +7230,69 @@ async def test_password_reset_and_change_close_pending_codes_grants_and_tokens()
         assert (await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {other}"})).status_code == 401
         token_headers = {"Authorization": f"Bearer {api_token.json()['token']}"}
         assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_client_tokens_never_fall_back_to_the_issuer_audience():
+    from jose import jwt as jose_jwt
+
+    mcp = {
+        "name": "MCP",
+        "redirect_uris": ["https://mcp.example.com/callback"],
+        "audiences": [],
+        "mcp_resource_uri": "https://mcp.example.com/mcp",
+        "scopes": ["openid", "auth:read"],
+    }
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        mcp_only = await ac.post("/api/v1/clients", headers=admin_headers, json={**mcp, "public": True})
+        assert mcp_only.status_code == 403
+        own = await ac.post(
+            "/api/v1/clients", headers=admin_headers, json={**mcp, "public": True, "audiences": ["mine-api"]}
+        )
+        emptied = await ac.patch(
+            f"/api/v1/clients/{own.json()['id']}",
+            headers=admin_headers,
+            json={"audiences": [], "mcp_resource_uri": "https://mcp.example.com/mcp"},
+        )
+        assert emptied.status_code == 403
+
+        public = await ac.post("/api/v1/clients", headers=owner_headers, json={**mcp, "public": True})
+        params = {
+            "response_type": "code",
+            "client_id": public.json()["client_id"],
+            "redirect_uri": "https://mcp.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid auth:read",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": public.json()["client_id"],
+                "redirect_uri": "https://mcp.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        app_token = exchanged.json()["access_token"]
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(app_token)["aud"])
+        app_headers = {"Authorization": f"Bearer {app_token}"}
+        assert (await ac.get("/api/v1/oauth/authorize/context", headers=app_headers, params=params)).status_code == 401
+        refreshed = await ac.post("/api/v1/auth/refresh", json={"refresh_token": exchanged.json()["refresh_token"]})
+        assert settings.issuer not in str(jose_jwt.get_unverified_claims(refreshed.json()["access_token"])["aud"])
+
+        confidential = await ac.post("/api/v1/clients", headers=owner_headers, json={**mcp, "public": False})
+        service = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "client_credentials",
+                "client_id": confidential.json()["client_id"],
+                "client_secret": confidential.json()["client_secret"],
+            },
+        )
+        service_headers = {"Authorization": f"Bearer {service.json()['access_token']}"}
+        assert (await ac.get("/api/v1/orgs", headers=service_headers)).status_code == 401
+        assert "code=" in await approve_consent(ac, owner_headers, params)

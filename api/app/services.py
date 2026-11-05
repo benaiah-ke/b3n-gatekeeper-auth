@@ -564,6 +564,7 @@ async def create_session_tokens(
     if scopes is None:
         scopes = derive_membership_scopes(memberships, org_id)
     scopes = capped_session_scopes(scopes, selected_org)
+    audience = audience or (client_default_audience(client) if client else settings.issuer)
     login_ip = client_ip(request)
     privileged_roles = sorted({org.role for org in memberships if org.role in PRIVILEGED_ROLES})
     if login_ip and privileged_roles:
@@ -757,7 +758,7 @@ async def rotate_refresh_token(db: AsyncSession, refresh_token: str) -> tuple[st
     else:  # sessions created before scopes were stored
         requested_scopes = list(client.scopes or []) if client else derive_membership_scopes(memberships, org_id)
     scopes = capped_session_scopes(requested_scopes, selected_org)
-    audience = session.audience or (client.audiences[0] if client and client.audiences else settings.issuer)
+    audience = session.audience or (client_default_audience(client) if client else settings.issuer)
     refresh.used_at = now_utc()
     new_refresh_secret = new_opaque_token("gkr")
     new_refresh = RefreshToken(
@@ -822,6 +823,12 @@ async def get_client_by_client_id(db: AsyncSession, client_id: str) -> AuthClien
 def validate_redirect(client: AuthClient, redirect_uri: str) -> None:
     if redirect_uri not in (client.redirect_uris or []):
         raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+
+
+def client_default_audience(client: AuthClient) -> list[str] | str:
+    """Audience for a client's tokens when none was asked for. Never the issuer: that audience marks hosted
+    GateKeeper sessions, which alone may authorize apps and switch orgs."""
+    return list(client.audiences or []) or client.mcp_resource_uri or settings.gatekeeper_api_audience
 
 
 def validate_audience(client: AuthClient, audience: str | None) -> str | None:

@@ -179,6 +179,7 @@ from app.services import (
     audit,
     authenticate_password,
     cap_scopes,
+    client_default_audience,
     client_ip,
     create_api_token,
     create_one_time_code,
@@ -433,8 +434,10 @@ def login_audience(client: AuthClient | None, requested: str | None) -> str:
     """Direct logins may always ask for a GateKeeper session; other audiences must belong to the client."""
     if requested and requested in settings.gatekeeper_audience_set:
         return requested
-    selected = validate_audience(client, requested) if client else None
-    return selected or (client.audiences[0] if client and client.audiences else settings.issuer)
+    if not client:
+        return settings.issuer
+    default = client_default_audience(client)
+    return validate_audience(client, requested) or (default[0] if isinstance(default, list) else default)
 
 
 def has_capability(values: list[str], *accepted: str) -> bool:
@@ -4970,8 +4973,8 @@ async def ensure_client_scopes_allowed(
 
 def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
     # GateKeeper's own audiences (the issuer included) are always reserved: tokens for them act on GateKeeper.
-    # A client with no audience gets issuer-audience tokens, so it counts as reserved too.
-    if not audiences and not mcp_resource_uri:
+    # A client without audiences (MCP-only included) falls back to GateKeeper's own API audience, so it is reserved.
+    if not audiences:
         return True
     reserved = settings.reserved_audience_set | settings.gatekeeper_audience_set
     return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
@@ -6051,7 +6054,7 @@ async def oauth_token(
             client=client,
             org_id=auth_code.org_id,
             scopes=auth_code.scope.split(),
-            audience=auth_code.audience or client.audiences or settings.issuer,
+            audience=auth_code.audience or client_default_audience(client),
             bind_default_org=False,
             amr=auth_code.amr or [],
         )
@@ -6087,7 +6090,8 @@ async def oauth_token(
         ):
             raise HTTPException(status_code=401, detail="Invalid client credentials")
         scopes = validate_scopes(client, scope)
-        aud = validate_audience(client, audience) or (client.audiences[0] if client.audiences else settings.issuer)
+        default = client_default_audience(client)
+        aud = validate_audience(client, audience) or (default[0] if isinstance(default, list) else default)
         access = create_access_token(
             subject=client.client_id,
             audience=aud,
@@ -6137,7 +6141,7 @@ async def oauth_token(
             client=client,
             org_id=grant.org_id,
             scopes=grant.scope.split(),
-            audience=grant.audience or client.audiences or settings.issuer,
+            audience=grant.audience or client_default_audience(client),
             amr=grant.amr or [],
         )
         await db.commit()
