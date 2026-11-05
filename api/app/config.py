@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, EmailStr, Field
@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     webauthn_rp_name: str = "GateKeeper"
     webauthn_origins: str = ""
     webauthn_challenge_ttl_seconds: int = Field(default=300, ge=60, le=600)
+
+    # closed: only admin provisioning or SCIM creates accounts. invite: a valid invitation may also create one.
+    # Neither mode allows open self-service signup after the first owner of an empty install.
+    signup_mode: Literal["closed", "invite"] = "closed"
 
     bootstrap_admin_email: EmailStr = "admin@example.com"
     bootstrap_org_name: str = "Example Org"

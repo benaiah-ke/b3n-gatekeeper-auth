@@ -994,8 +994,47 @@ async def oauth_protected_resource_path(resource_path: str, db: AsyncSession = D
     return await mcp_metadata_for(resource_path, db)
 
 
+SIGNUP_CLOSED_DETAIL = "Sign up is closed. Ask an administrator to invite you."
+
+
+async def refuse_registration(
+    db: AsyncSession,
+    action: str,
+    *,
+    email: str,
+    request: Request | None,
+    details: dict[str, Any] | None = None,
+) -> None:
+    await audit(
+        db,
+        action,
+        target_type="email",
+        details={"email": email.strip().lower(), "signup_mode": settings.signup_mode, **(details or {})},
+        request=request,
+    )
+    await db.commit()
+
+
+async def pending_invitation_exists(db: AsyncSession, email: str) -> bool:
+    result = await db.execute(
+        select(Invitation.id)
+        .where(
+            Invitation.email == email.strip().lower(),
+            Invitation.accepted_at.is_(None),
+            Invitation.revoked_at.is_(None),
+            Invitation.expires_at > now_utc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
 @app.post("/api/v1/auth/signup", response_model=TokenResponse)
 async def signup(body: SignupRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
+    # Self-service signup only bootstraps the first owner of an empty install.
+    if (await db.execute(select(User.id).limit(1))).scalar_one_or_none():
+        await refuse_registration(db, "auth.signup.refused", email=str(body.email), request=request)
+        raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL)
     user = await create_user(
         db,
         email=str(body.email),
@@ -4268,6 +4307,14 @@ async def accept_invitation(
                 detail = "TOTP code required" if user.mfa_totp_enabled_at else "Passkey sign-in required"
                 raise HTTPException(status_code=401, detail=detail)
     else:
+        if settings.signup_mode != "invite":
+            await refuse_registration(
+                db, "auth.invitation.refused", email=email, request=request, details={"org_id": invitation.org_id}
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Sign in with an existing account to accept this invitation. Ask an administrator to add you.",
+            )
         if not body.password:
             raise HTTPException(status_code=422, detail="Password is required for a new account")
         user = await create_user(
@@ -4319,7 +4366,7 @@ async def accept_invitation(
 
 
 @app.post("/api/v1/auth/email-code/request")
-async def request_email_code(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+async def request_email_code(body: EmailCodeRequest, request: Request, db: AsyncSession = Depends(get_db)):
     await enforce_rate_limit(
         db,
         key=f"email-code:{str(body.email).lower()}:{body.purpose}",
@@ -4328,11 +4375,17 @@ async def request_email_code(body: EmailCodeRequest, db: AsyncSession = Depends(
     )
     user_result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = user_result.scalar_one_or_none()
+    if not user:
+        # Same response as a sent code so the endpoint cannot be used to discover accounts.
+        await refuse_registration(
+            db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
+        )
+        return {"status": "sent"}
     code = await create_one_time_code(
         db,
         email=str(body.email),
         purpose=body.purpose,
-        user_id=user.id if user else None,
+        user_id=user.id,
     )
     send_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
     await db.commit()
@@ -4350,7 +4403,10 @@ async def verify_email_code(
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = result.scalar_one_or_none()
     if not user:
-        user = await create_user(db, email=str(body.email), password=None, verified=True)
+        await refuse_registration(
+            db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
+        )
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     if body.purpose == "verify_email":
         user.email_verified = True
     access, refresh, _session, _refresh_model, scopes = await create_session_tokens(
@@ -5136,6 +5192,11 @@ async def complete_oauth_provider_callback(
     if not user:
         if provider.require_verified_email and not email_verified:
             raise HTTPException(status_code=403, detail="OAuth provider email must be verified before signup")
+        if settings.signup_mode != "invite" or not email_verified or not await pending_invitation_exists(db, email):
+            await refuse_registration(
+                db, "auth.oauth.signup.refused", email=email, request=request, details={"provider": provider.id}
+            )
+            raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL)
         user = await create_user(
             db,
             email=email,

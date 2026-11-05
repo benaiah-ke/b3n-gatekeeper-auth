@@ -20,7 +20,17 @@ from app import security, services
 from app.config import settings
 from app.database import Base, async_session_factory, engine
 from app.main import app
-from app.models import AuditEvent, Identity, Session, User, WebAuthnChallenge, WebAuthnCredential
+from app.models import (
+    AuditEvent,
+    Identity,
+    Membership,
+    OneTimeCode,
+    Role,
+    Session,
+    User,
+    WebAuthnChallenge,
+    WebAuthnCredential,
+)
 from app.security import create_access_token, decode_access_token, public_jwk, totp_code
 
 
@@ -42,6 +52,24 @@ async def reset_db():
 async def client():
     transport = ASGITransport(app=app)
     return AsyncClient(transport=transport, base_url="http://testserver")
+
+
+async def register(ac: AsyncClient, json: dict):
+    """Sign up the first owner; later accounts are created directly because signup is closed."""
+    async with async_session_factory() as db:
+        if not (await db.execute(select(User.id).limit(1))).scalar_one_or_none():
+            return await ac.post("/api/v1/auth/signup", json=json)
+        user = await services.create_user(
+            db, email=json["email"], password=json["password"], display_name=json.get("display_name")
+        )
+        if not await services.org_roles(db, user.id):
+            org = await services.ensure_bootstrap(db)
+            viewer = (
+                await db.execute(select(Role).where(Role.org_id == org.id, Role.name == "viewer"))
+            ).scalar_one()
+            db.add(Membership(org_id=org.id, user_id=user.id, role_id=viewer.id, status="active"))
+            await db.commit()
+    return await ac.post("/api/v1/auth/login", json={"email": json["email"], "password": json["password"]})
 
 
 @pytest.mark.asyncio
@@ -66,8 +94,8 @@ async def test_version_reports_release_metadata_when_configured(monkeypatch):
 @pytest.mark.asyncio
 async def test_signup_login_refresh_and_replay_detection():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery", "display_name": "Admin"},
         )
         assert signup.status_code == 200
@@ -92,10 +120,52 @@ async def test_signup_login_refresh_and_replay_detection():
 
 
 @pytest.mark.asyncio
+async def test_signup_is_closed_after_the_first_owner():
+    async with await client() as ac:
+        first = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "first@example.com", "password": "correct horse battery"},
+        )
+        assert first.status_code == 200
+        assert first.json()["orgs"][0]["role"] == "owner"
+        for email in ("outsider@example.com", str(settings.bootstrap_admin_email)):
+            refused = await ac.post("/api/v1/auth/signup", json={"email": email, "password": "correct horse battery"})
+            assert refused.status_code == 403
+
+    async with async_session_factory() as db:
+        assert set((await db.execute(select(User.email))).scalars()) == {"first@example.com"}
+        refusals = await db.execute(select(AuditEvent).where(AuditEvent.action == "auth.signup.refused"))
+        assert len(refusals.scalars().all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_email_code_never_creates_accounts():
+    async with await client() as ac:
+        requested = await ac.post("/api/v1/auth/email-code/request", json={"email": "stranger@example.com"})
+        assert requested.status_code == 200
+        assert requested.json() == {"status": "sent"}
+        async with async_session_factory() as db:
+            assert (await db.execute(select(OneTimeCode.id))).first() is None
+            stale_code = await services.create_one_time_code(db, email="stranger@example.com", purpose="login")
+            await db.commit()
+
+        for code in (stale_code, "WRONGCODE"):
+            verified = await ac.post(
+                "/api/v1/auth/email-code/verify",
+                json={"email": "stranger@example.com", "code": code},
+            )
+            assert verified.status_code == 401
+            assert verified.json()["detail"] == "Invalid or expired code"
+
+    async with async_session_factory() as db:
+        assert (await db.execute(select(User.id))).first() is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_can_rotate_from_browser_refresh_cookie():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -119,8 +189,8 @@ async def test_refresh_can_rotate_from_browser_refresh_cookie():
 @pytest.mark.asyncio
 async def test_first_signup_without_bootstrap_email_becomes_owner():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "operator@example.com",
                 "password": "correct horse battery",
@@ -181,8 +251,8 @@ async def test_first_signup_without_bootstrap_email_becomes_owner():
 @pytest.mark.asyncio
 async def test_client_create_accepts_operator_stable_client_id_and_rejects_duplicates():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -240,8 +310,8 @@ async def test_client_create_accepts_operator_stable_client_id_and_rejects_dupli
 @pytest.mark.asyncio
 async def test_client_create_rejects_reserved_or_non_normalized_stable_client_ids():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -267,8 +337,8 @@ async def test_client_create_rejects_reserved_or_non_normalized_stable_client_id
 @pytest.mark.asyncio
 async def test_org_creation_seeds_owner_membership_and_session_switching():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -363,8 +433,8 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
         assert setup.json()["org"]["id"] == second_org["id"]
         assert setup.json()["can_manage_clients"] is True
 
-        other_signup = await ac.post(
-            "/api/v1/auth/signup",
+        other_signup = await register(
+            ac,
             json={"email": "other@example.com", "password": "correct horse battery"},
         )
         assert other_signup.status_code == 200
@@ -380,8 +450,8 @@ async def test_org_creation_seeds_owner_membership_and_session_switching():
 @pytest.mark.asyncio
 async def test_client_management_is_scoped_to_current_organization():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -497,8 +567,8 @@ async def test_client_management_is_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_setup_resources_are_scoped_to_current_organization():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -644,16 +714,16 @@ async def test_setup_resources_are_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_admin_visibility_is_scoped_to_current_organization():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
         first_access = owner.json()["access_token"]
         first_org_id = owner.json()["orgs"][0]["id"]
 
-        first_only_user = await ac.post(
-            "/api/v1/auth/signup",
+        first_only_user = await register(
+            ac,
             json={"email": "first-only@example.com", "password": "correct horse battery"},
         )
         assert first_only_user.status_code == 200
@@ -799,8 +869,8 @@ async def test_admin_visibility_is_scoped_to_current_organization():
 @pytest.mark.asyncio
 async def test_audit_retention_policy_preview_and_prune():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert signup.status_code == 200
@@ -897,8 +967,8 @@ async def test_audit_retention_policy_preview_and_prune():
 async def test_self_service_profile_password_and_email_change(monkeypatch):
     monkeypatch.setattr(services, "new_code", lambda length=8: "ABC12345")
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert signup.status_code == 200
@@ -965,8 +1035,8 @@ async def test_self_service_profile_password_and_email_change(monkeypatch):
         other_login_access = new_password_login.json()["access_token"]
         assert new_password_login.json()["user"]["display_name"] == "Renamed Owner"
 
-        duplicate = await ac.post(
-            "/api/v1/auth/signup",
+        duplicate = await register(
+            ac,
             json={"email": "taken@example.com", "password": "correct horse battery"},
         )
         assert duplicate.status_code == 200
@@ -1030,8 +1100,8 @@ async def test_self_service_profile_password_and_email_change(monkeypatch):
 @pytest.mark.asyncio
 async def test_self_service_account_export_and_deactivation_policy():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1045,8 +1115,8 @@ async def test_self_service_account_export_and_deactivation_policy():
         )
         assert sole_owner_deactivate.status_code == 400
 
-        backup_owner = await ac.post(
-            "/api/v1/auth/signup",
+        backup_owner = await register(
+            ac,
             json={"email": "backup@example.com", "password": "correct horse battery"},
         )
         assert backup_owner.status_code == 200
@@ -1119,16 +1189,16 @@ async def test_self_service_account_export_and_deactivation_policy():
 @pytest.mark.asyncio
 async def test_admin_user_hard_delete_requires_org_policy_and_confirmation():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1195,8 +1265,8 @@ async def test_admin_user_hard_delete_requires_org_policy_and_confirmation():
 @pytest.mark.asyncio
 async def test_admin_user_provisioning_creates_and_updates_org_memberships():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1231,8 +1301,8 @@ async def test_admin_user_provisioning_creates_and_updates_org_memberships():
         )
         assert password_login.status_code == 401
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1268,8 +1338,8 @@ async def test_admin_user_provisioning_creates_and_updates_org_memberships():
 @pytest.mark.asyncio
 async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1323,8 +1393,8 @@ async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
         assert patched.json()["displayName"] == "SCIM Operator"
         assert patched.json()["roles"][0]["value"] == "operator"
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1349,8 +1419,8 @@ async def test_scim_v2_user_compatibility_crud_and_deprovisioning():
 @pytest.mark.asyncio
 async def test_scim_v2_user_password_operations_rotate_password_and_revoke_sessions():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1438,8 +1508,8 @@ async def test_scim_v2_user_password_operations_rotate_password_and_revoke_sessi
 @pytest.mark.asyncio
 async def test_scim_v2_bulk_supports_common_user_group_provisioning_operations():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1540,8 +1610,8 @@ async def test_scim_v2_bulk_supports_common_user_group_provisioning_operations()
 @pytest.mark.asyncio
 async def test_scim_v2_enterprise_user_mapping_round_trips_membership_scoped_attributes():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1625,16 +1695,16 @@ async def test_scim_v2_enterprise_user_mapping_round_trips_membership_scoped_att
 @pytest.mark.asyncio
 async def test_scim_v2_group_compatibility_assigns_and_removes_role_members():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        target = await ac.post(
-            "/api/v1/auth/signup",
+        target = await register(
+            ac,
             json={"email": "target@example.com", "password": "correct horse battery", "display_name": "Target"},
         )
         assert target.status_code == 200
@@ -1721,8 +1791,8 @@ async def test_scim_v2_group_compatibility_assigns_and_removes_role_members():
 @pytest.mark.asyncio
 async def test_scim_v2_lists_support_sorting_and_pagination():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "zz-owner@example.com", "password": "correct horse battery", "display_name": "Owner"},
         )
         assert owner.status_code == 200
@@ -1825,8 +1895,8 @@ async def test_scim_v2_lists_support_sorting_and_pagination():
 @pytest.mark.asyncio
 async def test_linked_identities_can_be_listed_and_safely_unlinked():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -1964,8 +2034,8 @@ async def test_install_owner_can_manage_database_oauth_providers(monkeypatch):
     monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
 
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -2015,6 +2085,13 @@ async def test_install_owner_can_manage_database_oauth_providers(monkeypatch):
         assert query["redirect_uri"] == [f"{settings.issuer}/api/v1/auth/oauth/db-login/callback"]
         assert query["scope"] == ["openid email"]
 
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {owner_access}"},
+            json={"email": "db-social@example.com", "org_id": owner.json()["orgs"][0]["id"], "role": "viewer"},
+        )
+        assert invite.status_code == 200
+        monkeypatch.setattr(settings, "signup_mode", "invite")
         callback = await ac.get(
             "/api/v1/auth/oauth/db-login/callback",
             params={"code": "provider-code", "state": started_payload["state"]},
@@ -2087,8 +2164,8 @@ async def test_env_managed_oauth_providers_are_admin_visible_read_only(monkeypat
     )
 
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -2161,6 +2238,25 @@ async def test_generic_oauth_callback_creates_federated_session(monkeypatch):
     async with await client() as ac:
         started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/sessions"})
         assert started.status_code == 200
+        refused = await ac.get(
+            "/api/v1/auth/oauth/example/callback",
+            params={"code": "provider-code", "state": started.json()["state"]},
+        )
+        assert refused.status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(User.id))).first() is None
+
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        invite = await ac.post(
+            "/api/v1/invitations",
+            headers={"Authorization": f"Bearer {owner.json()['access_token']}"},
+            json={"email": "social@example.com", "org_id": owner.json()["orgs"][0]["id"], "role": "viewer"},
+        )
+        assert invite.status_code == 200
+        monkeypatch.setattr(settings, "signup_mode", "invite")
+        ac.cookies.clear()
+
+        started = await ac.get("/api/v1/auth/oauth/example/start", params={"redirect": "/sessions"})
         callback = await ac.get(
             "/api/v1/auth/oauth/example/callback",
             params={"code": "provider-code", "state": started.json()["state"]},
@@ -2213,8 +2309,8 @@ async def test_logged_in_user_can_link_oauth_identity_with_session_bound_state(m
     monkeypatch.setattr(main_module, "fetch_oauth_provider_profile", fake_profile)
 
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2255,8 +2351,8 @@ async def test_logged_in_user_can_link_oauth_identity_with_session_bound_state(m
         assert me.json()["user"]["email"] == "owner@example.com"
 
     async with await client() as second_client:
-        second = await second_client.post(
-            "/api/v1/auth/signup",
+        second = await register(
+            second_client,
             json={"email": "second@example.com", "password": "correct horse battery"},
         )
         assert second.status_code == 200
@@ -2312,8 +2408,8 @@ async def test_oauth_callback_requires_verified_email_for_new_links(monkeypatch)
 @pytest.mark.asyncio
 async def test_totp_mfa_setup_login_enforcement_and_disable():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2488,8 +2584,8 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
     monkeypatch.setattr(main_module, "verify_authentication_response", fake_verify_authentication_response)
 
     async with await client() as ac:
-        inviter = await ac.post(
-            "/api/v1/auth/signup",
+        inviter = await register(
+            ac,
             json={"email": "inviter@example.com", "password": "correct horse battery"},
         )
         assert inviter.status_code == 200
@@ -2502,8 +2598,8 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
         )
         assert invitation.status_code == 200
 
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "passkey@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2740,8 +2836,8 @@ async def test_passkey_registration_login_management_and_replay_protection(monke
 @pytest.mark.asyncio
 async def test_failed_login_attempts_persist_rate_limit_counters():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "limited@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2764,8 +2860,8 @@ async def test_failed_login_attempts_persist_rate_limit_counters():
 @pytest.mark.asyncio
 async def test_passkey_management_requires_a_recent_session():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "reauth@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2810,8 +2906,8 @@ async def test_passkey_options_reject_invalid_origin_configuration(monkeypatch):
 @pytest.mark.asyncio
 async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -2991,8 +3087,8 @@ async def test_client_mfa_policy_enforces_login_oauth_refresh_and_device_flows()
 @pytest.mark.asyncio
 async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3111,8 +3207,8 @@ async def test_trusted_device_mfa_bypass_requires_policy_and_active_trust():
 @pytest.mark.asyncio
 async def test_admin_step_up_policy_requires_mfa_for_sensitive_org_mutations():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3216,8 +3312,8 @@ async def test_admin_step_up_policy_requires_mfa_for_sensitive_org_mutations():
 @pytest.mark.asyncio
 async def test_org_mfa_policy_enforces_org_clients_and_revokes_stale_sessions():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3331,8 +3427,8 @@ async def test_org_mfa_policy_enforces_org_clients_and_revokes_stale_sessions():
 @pytest.mark.asyncio
 async def test_admin_totp_reset_clears_mfa_and_revokes_sessions():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3388,10 +3484,10 @@ async def test_admin_totp_reset_clears_mfa_and_revokes_sessions():
 
 
 @pytest.mark.asyncio
-async def test_invitation_create_accept_reuse_and_revoke():
+async def test_invitation_create_accept_reuse_and_revoke(monkeypatch):
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -3432,6 +3528,15 @@ async def test_invitation_create_accept_reuse_and_revoke():
         )
         assert mismatch.status_code == 403
 
+        closed_mode = await ac.post(
+            "/api/v1/auth/invitations/accept",
+            json={"email": "invited@example.com", "password": "correct horse battery", "token": invite_token},
+        )
+        assert closed_mode.status_code == 403
+        async with async_session_factory() as db:
+            assert (await db.execute(select(User).where(User.email == "invited@example.com"))).first() is None
+
+        monkeypatch.setattr(settings, "signup_mode", "invite")
         accepted = await ac.post(
             "/api/v1/auth/invitations/accept",
             json={
@@ -3497,22 +3602,22 @@ async def test_invitation_create_accept_reuse_and_revoke():
 @pytest.mark.asyncio
 async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
     async with await client() as ac:
-        first = await ac.post(
-            "/api/v1/auth/signup",
+        first = await register(
+            ac,
             json={"email": "first@example.com", "password": "correct horse battery"},
         )
         assert first.status_code == 200
         assert first.json()["orgs"][0]["role"] == "owner"
 
-        bootstrap_admin = await ac.post(
-            "/api/v1/auth/signup",
+        bootstrap_admin = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert bootstrap_admin.status_code == 200
         assert bootstrap_admin.json()["orgs"][0]["role"] == "owner"
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
@@ -3522,15 +3627,15 @@ async def test_bootstrap_admin_subsequent_user_and_duplicate_roles():
             "/api/v1/auth/signup",
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
-        assert duplicate.status_code == 409
+        assert duplicate.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_cookie_auth_and_refresh_preserve_owner_scope(monkeypatch):
     monkeypatch.setattr(settings, "cookie_name", "gk_custom_session")
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -3603,8 +3708,8 @@ async def test_cookie_auth_and_refresh_preserve_owner_scope(monkeypatch):
 @pytest.mark.asyncio
 async def test_session_revocation_invalidates_access_and_refresh_tokens():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3633,8 +3738,8 @@ async def test_session_revocation_invalidates_access_and_refresh_tokens():
 @pytest.mark.asyncio
 async def test_org_idle_timeout_revokes_idle_session_and_refresh_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3674,8 +3779,8 @@ async def test_org_idle_timeout_revokes_idle_session_and_refresh_token():
 @pytest.mark.asyncio
 async def test_session_device_label_and_trust_are_self_service():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3711,8 +3816,8 @@ async def test_session_device_label_and_trust_are_self_service():
         assert listed_session["device_label"] == "Work laptop"
         assert listed_session["trusted"] is True
 
-        other = await ac.post(
-            "/api/v1/auth/signup",
+        other = await register(
+            ac,
             json={"email": "other@example.com", "password": "correct horse battery"},
         )
         assert other.status_code == 200
@@ -3738,8 +3843,8 @@ async def test_session_device_label_and_trust_are_self_service():
 @pytest.mark.asyncio
 async def test_logout_revokes_current_session_and_refresh_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3760,8 +3865,8 @@ async def test_logout_revokes_current_session_and_refresh_token():
 @pytest.mark.asyncio
 async def test_bulk_session_revocation_supports_other_devices_and_global_signout():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -3813,8 +3918,8 @@ async def test_bulk_session_revocation_supports_other_devices_and_global_signout
 @pytest.mark.asyncio
 async def test_bad_redirect_is_rejected_for_oauth_client():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -3852,8 +3957,8 @@ async def test_bad_redirect_is_rejected_for_oauth_client():
 @pytest.mark.asyncio
 async def test_client_metadata_urls_must_be_absolute_http_urls():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -3876,8 +3981,8 @@ async def test_client_metadata_urls_must_be_absolute_http_urls():
 @pytest.mark.asyncio
 async def test_authorize_redirects_unauthenticated_user_to_hosted_login():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -3923,8 +4028,8 @@ async def test_authorize_redirects_unauthenticated_user_to_hosted_login():
 @pytest.mark.asyncio
 async def test_authorize_requires_consent_before_issuing_code():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4079,8 +4184,8 @@ async def test_authorize_requires_consent_before_issuing_code():
 @pytest.mark.asyncio
 async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4227,8 +4332,8 @@ async def test_admin_can_review_and_revoke_oauth_grants_within_current_org():
 @pytest.mark.asyncio
 async def test_authorize_can_issue_personal_tokens_for_clients_without_required_org_membership():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4291,8 +4396,8 @@ async def test_authorize_can_issue_personal_tokens_for_clients_without_required_
 @pytest.mark.asyncio
 async def test_introspection_validates_jwts_and_rejects_invalid_tokens():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={
                 "email": "admin@example.com",
                 "password": "correct horse battery",
@@ -4321,8 +4426,8 @@ async def test_introspection_validates_jwts_and_rejects_invalid_tokens():
 @pytest.mark.asyncio
 async def test_introspection_honors_disabled_clients_for_opaque_and_service_jwts():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4433,8 +4538,8 @@ def test_jwt_key_dir_persists_signing_key(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_client_credentials_and_bad_audience():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4480,8 +4585,8 @@ async def test_client_credentials_and_bad_audience():
 @pytest.mark.asyncio
 async def test_device_flow_and_api_token_revocation():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "admin@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -4544,8 +4649,8 @@ async def test_device_flow_and_api_token_revocation():
 @pytest.mark.asyncio
 async def test_device_grant_accepts_only_one_concurrent_decision():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "device-race@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4575,8 +4680,8 @@ async def test_device_grant_accepts_only_one_concurrent_decision():
 @pytest.mark.asyncio
 async def test_device_approval_rate_limit_counts_invalid_user_codes():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "device-limited@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4602,8 +4707,8 @@ async def test_device_approval_rate_limit_counts_invalid_user_codes():
 @pytest.mark.asyncio
 async def test_user_jwt_is_session_bound_and_revocation_updates_introspection():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4636,8 +4741,8 @@ async def test_user_jwt_is_session_bound_and_revocation_updates_introspection():
 @pytest.mark.asyncio
 async def test_logout_revokes_current_session_token():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert signup.status_code == 200
@@ -4656,8 +4761,8 @@ async def test_logout_revokes_current_session_token():
 @pytest.mark.asyncio
 async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -4668,8 +4773,8 @@ async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
         owner_access = owner.json()["access_token"]
         org_id = owner.json()["orgs"][0]["id"]
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
@@ -4767,11 +4872,11 @@ async def test_personal_api_tokens_are_self_service_and_scoped_to_account():
 async def test_token_scopes_are_capped_to_role_permissions_on_every_issuance_path():
     password = "correct horse battery"
     async with await client() as ac:
-        owner = await ac.post("/api/v1/auth/signup", json={"email": "owner@example.com", "password": password})
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
         assert owner.status_code == 200
         owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
         org_id = owner.json()["orgs"][0]["id"]
-        viewer = await ac.post("/api/v1/auth/signup", json={"email": "viewer@example.com", "password": password})
+        viewer = await register(ac, json={"email": "viewer@example.com", "password": password})
         assert viewer.status_code == 200
         viewer_id = viewer.json()["user"]["id"]
 
@@ -4849,8 +4954,8 @@ async def test_token_scopes_are_capped_to_role_permissions_on_every_issuance_pat
 @pytest.mark.asyncio
 async def test_api_token_validation_returns_product_metadata_and_policy_checks():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={
                 "email": "owner@example.com",
                 "password": "correct horse battery",
@@ -4996,8 +5101,8 @@ async def test_api_token_validation_returns_product_metadata_and_policy_checks()
 @pytest.mark.asyncio
 async def test_client_token_management_and_audit_filters():
     async with await client() as ac:
-        signup = await ac.post(
-            "/api/v1/auth/signup",
+        signup = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         access = signup.json()["access_token"]
@@ -5120,8 +5225,8 @@ async def test_client_token_management_and_audit_filters():
 @pytest.mark.asyncio
 async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
     async with await client() as ac:
-        owner = await ac.post(
-            "/api/v1/auth/signup",
+        owner = await register(
+            ac,
             json={"email": "owner@example.com", "password": "correct horse battery"},
         )
         assert owner.status_code == 200
@@ -5130,8 +5235,8 @@ async def test_admin_user_lifecycle_role_assignment_and_session_revocation():
         owner_id = owner_payload["user"]["id"]
         org_id = owner_payload["orgs"][0]["id"]
 
-        viewer = await ac.post(
-            "/api/v1/auth/signup",
+        viewer = await register(
+            ac,
             json={"email": "viewer@example.com", "password": "correct horse battery"},
         )
         assert viewer.status_code == 200
