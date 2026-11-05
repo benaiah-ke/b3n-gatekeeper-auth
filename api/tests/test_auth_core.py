@@ -7144,3 +7144,89 @@ async def test_platform_admins_may_assign_any_role(monkeypatch):
             json={"org_id": org_id, "role": "owner", "status": "active"},
         )
         assert promoted.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_password_reset_and_change_close_pending_codes_grants_and_tokens():
+    password = "correct horse battery"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": password})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid",
+            "audience": "x-api",
+        }
+        code = parse_qs(urlparse(await approve_consent(ac, owner_headers, params)).query)["code"][0]
+        device = await ac.post("/oauth/device_authorization", json={"client_id": "gatekeeper-cli"})
+        await ac.post(
+            "/api/v1/auth/device/approve",
+            headers=owner_headers,
+            json={"user_code": device.json()["user_code"], "approve": True},
+        )
+        async with async_session_factory() as db:
+            reset_code = await services.create_one_time_code(
+                db, email="owner@example.com", purpose="reset_password", user_id=owner.json()["user"]["id"]
+            )
+            await db.commit()
+        reset = await ac.post(
+            "/api/v1/auth/password/reset/confirm",
+            json={"email": "owner@example.com", "code": reset_code, "new_password": "a brand new passphrase"},
+        )
+        assert reset.status_code == 200
+        exchanged = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": app_client.json()["client_id"],
+                "redirect_uri": "https://app.example.com/callback",
+                "code": code,
+                "code_verifier": "abc",
+            },
+        )
+        assert exchanged.status_code == 400
+        polled = await ac.post(
+            "/oauth/token",
+            data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": device.json()["device_code"],
+                "client_id": "gatekeeper-cli",
+            },
+        )
+        assert polled.status_code == 400
+
+        ac.cookies.clear()
+        login = {"email": "owner@example.com", "password": "a brand new passphrase"}
+        current = (await ac.post("/api/v1/auth/login", json=login)).json()["access_token"]
+        other = (await ac.post("/api/v1/auth/login", json=login)).json()["access_token"]
+        ac.cookies.clear()
+        api_token = await ac.post(
+            "/api/v1/tokens",
+            headers={"Authorization": f"Bearer {current}"},
+            json={"name": "cli", "token_type": "personal"},
+        )
+        changed = await ac.post(
+            "/api/v1/auth/password/change",
+            headers={"Authorization": f"Bearer {current}"},
+            json={"current_password": "a brand new passphrase", "new_password": "another new passphrase"},
+        )
+        assert changed.status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {current}"})).status_code == 200
+        assert (await ac.get("/api/v1/auth/me", headers={"Authorization": f"Bearer {other}"})).status_code == 401
+        token_headers = {"Authorization": f"Bearer {api_token.json()['token']}"}
+        assert (await ac.get("/api/v1/auth/me", headers=token_headers)).status_code == 401

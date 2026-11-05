@@ -696,12 +696,8 @@ async function changePassword() {
     })
     currentPassword.value = ''
     newPassword.value = ''
-    if (result.revoked_count) {
-      const sessions = result.revoked_count === 1 ? '1 other session' : `${result.revoked_count} other sessions`
-      passwordNotice.value = `Password updated. Revoked ${sessions}.`
-    } else {
-      passwordNotice.value = 'Password updated.'
-    }
+    const sessions = result.revoked_count === 1 ? '1 other session' : `${result.revoked_count} other sessions`
+    passwordNotice.value = `Password updated. We signed out ${sessions} and revoked your API tokens.`
   } catch (err) {
     error.value = err instanceof Error ? err.message : 'Could not change password'
   } finally {

@@ -1471,9 +1471,10 @@ async def change_password(
     if not verify_password(body.current_password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid current password")
     user.password_hash = hash_password(body.new_password)
-    revoked_count = 0
+    revoked = {}
     if body.revoke_other_sessions and principal.session_id:
-        revoked_count = await revoke_other_user_sessions(db, user_id=user.id, current_session_id=principal.session_id)
+        revoked = await revoke_user_credentials(db, user_id=user.id, keep_session_id=principal.session_id)
+    revoked_count = revoked.get("revoked_sessions", 0)
     await audit(
         db,
         "auth.password.change",
@@ -1481,6 +1482,7 @@ async def change_password(
         target_type="user",
         target_id=user.id,
         details={
+            **revoked,
             "revoked_count": revoked_count,
             "revoke_other_sessions": body.revoke_other_sessions,
             "current_session_kept": True,
@@ -2370,6 +2372,35 @@ async def revoke_user_sessions(db: AsyncSession, *, user_id: str) -> int:
     for refresh in refresh_result.scalars():
         refresh.revoked_at = refresh.revoked_at or revoked_at
     return revoked_count
+
+
+async def revoke_user_credentials(db: AsyncSession, *, user_id: str, keep_session_id: str | None = None) -> dict:
+    """After a password reset or change, close everything the old password could have opened: sessions (except the
+    one making the change), refresh tokens, API tokens, unused authorization codes and approved device grants."""
+    now = now_utc()
+    if keep_session_id:
+        sessions = await revoke_other_user_sessions(db, user_id=user_id, current_session_id=keep_session_id)
+    else:
+        sessions = await revoke_user_sessions(db, user_id=user_id)
+    tokens = await db.execute(
+        update(ApiToken).where(ApiToken.user_id == user_id, ApiToken.revoked_at.is_(None)).values(revoked_at=now)
+    )
+    codes = await db.execute(
+        update(OAuthAuthorizationCode)
+        .where(OAuthAuthorizationCode.user_id == user_id, OAuthAuthorizationCode.used_at.is_(None))
+        .values(used_at=now)
+    )
+    grants = await db.execute(
+        update(DeviceGrant)
+        .where(DeviceGrant.user_id == user_id, DeviceGrant.used_at.is_(None), DeviceGrant.denied_at.is_(None))
+        .values(denied_at=now)
+    )
+    return {
+        "revoked_sessions": sessions,
+        "revoked_tokens": tokens.rowcount or 0,
+        "revoked_codes": codes.rowcount or 0,
+        "denied_device_grants": grants.rowcount or 0,
+    }
 
 
 async def count_user_delete_artifacts(db: AsyncSession, *, user_id: str) -> dict[str, int]:
@@ -4642,19 +4673,8 @@ async def confirm_password_reset(
         raise HTTPException(status_code=404, detail="User not found")
     user.password_hash = hash_password(body.new_password)
     # A reset means the old password may be known to someone else, so everything it opened is closed.
-    revoked_sessions = await revoke_user_sessions(db, user_id=user.id)
-    tokens = await db.execute(select(ApiToken).where(ApiToken.user_id == user.id, ApiToken.revoked_at.is_(None)))
-    revoked_tokens = 0
-    for token in tokens.scalars():
-        token.revoked_at = now_utc()
-        revoked_tokens += 1
-    await audit(
-        db,
-        "auth.password.reset",
-        actor_user_id=user.id,
-        details={"revoked_sessions": revoked_sessions, "revoked_tokens": revoked_tokens},
-        request=request,
-    )
+    revoked = await revoke_user_credentials(db, user_id=user.id)
+    await audit(db, "auth.password.reset", actor_user_id=user.id, details=revoked, request=request)
     await db.commit()
     return {"status": "updated"}
 
