@@ -171,6 +171,7 @@ from app.security import (
 )
 from app.services import (
     BASELINE_PERMISSIONS,
+    SIGNUP_CLOSED_DETAIL,
     active_passkey_count,
     add_default_org_roles,
     audit,
@@ -1002,9 +1003,6 @@ async def oauth_protected_resource_root(db: AsyncSession = Depends(get_db)):
 @app.get("/.well-known/oauth-protected-resource/{resource_path:path}")
 async def oauth_protected_resource_path(resource_path: str, db: AsyncSession = Depends(get_db)):
     return await mcp_metadata_for(resource_path, db)
-
-
-SIGNUP_CLOSED_DETAIL = "Sign up is closed. Ask an administrator to invite you."
 
 
 async def refuse_registration(

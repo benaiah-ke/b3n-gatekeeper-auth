@@ -25,6 +25,7 @@ from app.main import app
 from app.models import (
     AuditEvent,
     Identity,
+    InstallClaim,
     Membership,
     OneTimeCode,
     RateLimitBucket,
@@ -139,6 +140,21 @@ async def test_signup_is_closed_after_the_first_owner():
         assert set((await db.execute(select(User.email))).scalars()) == {"first@example.com"}
         refusals = await db.execute(select(AuditEvent).where(AuditEvent.action == "auth.signup.refused"))
         assert len(refusals.scalars().all()) == 2
+
+
+@pytest.mark.asyncio
+async def test_first_signup_race_is_closed_by_a_database_claim():
+    async with async_session_factory() as db:
+        db.add(InstallClaim(name="first-owner", user_id="concurrent-signup"))
+        await db.commit()
+    async with await client() as ac:
+        late = await ac.post(
+            "/api/v1/auth/signup",
+            json={"email": "late@example.com", "password": "correct horse battery"},
+        )
+        assert late.status_code == 403
+    async with async_session_factory() as db:
+        assert (await db.execute(select(User.id))).first() is None
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from app.models import (
     ApiToken,
     AuditEvent,
     AuthClient,
+    InstallClaim,
     Membership,
     OneTimeCode,
     Organization,
@@ -45,6 +46,7 @@ from app.security import (
 )
 
 logger = logging.getLogger("gatekeeper")
+SIGNUP_CLOSED_DETAIL = "Sign up is closed. Ask an administrator to invite you."
 MFA_AMR_VALUES = {"otp", "recovery", "webauthn"}
 TRUSTED_DEVICE_AMR = "trusted_device"
 DEFAULT_ORG_ROLES = [
@@ -472,6 +474,14 @@ async def create_user(
     )
     db.add(user)
     await db.flush()
+    if first_user:
+        # The primary key lets exactly one concurrent signup claim the empty install.
+        db.add(InstallClaim(name="first-owner", user_id=user.id))
+        try:
+            await db.flush()
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(status_code=403, detail=SIGNUP_CLOSED_DETAIL) from None
 
     # New accounts get no organization by default. Only the first owner of an empty install, or the
     # configured bootstrap admin while the bootstrap org has no owner, joins the bootstrap org.

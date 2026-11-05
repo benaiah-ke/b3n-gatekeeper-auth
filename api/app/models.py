@@ -372,6 +372,16 @@ class OneTimeCode(Base, TimestampMixin):
     used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class InstallClaim(Base):
+    """One-time install claims guarded by the primary key, such as the first-owner signup."""
+
+    __tablename__ = "install_claims"
+
+    name: Mapped[str] = mapped_column(String(40), primary_key=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
 
