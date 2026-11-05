@@ -6471,3 +6471,57 @@ async def test_user_api_tokens_follow_the_owners_current_role():
         orgless = await ac.post("/api/v1/tokens/validate", json={"token": orgless_raw})
         assert orgless.json()["scopes"] == ["auth:read"]
 
+
+@pytest.mark.asyncio
+async def test_scim_and_provisioning_cannot_reenable_or_attach_accounts_from_other_orgs():
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        other_id = other.json()["id"]
+        async with async_session_factory() as db:
+            role_ids = {(role.org_id, role.name): role.id for role in (await db.execute(select(Role))).scalars()}
+            users = {}
+            for email, org_ids in (
+                ("elsewhere@example.com", [other_id]),
+                ("both@example.com", [org_id, other_id]),
+                ("local@example.com", [org_id]),
+            ):
+                user = User(email=email, password_hash=None, disabled=True)
+                db.add(user)
+                await db.flush()
+                for member_org in org_ids:
+                    db.add(Membership(org_id=member_org, user_id=user.id, role_id=role_ids[(member_org, "viewer")]))
+                users[email] = user.id
+            await db.commit()
+        viewer_group = role_ids[(org_id, "viewer")]
+
+        attach = await ac.post(
+            f"/scim/v2/Users?org_id={org_id}",
+            headers=admin_headers,
+            json={"userName": "elsewhere@example.com", "active": True, "roles": [{"value": "viewer"}]},
+        )
+        assert attach.status_code == 403
+        provision = await ac.post(
+            "/api/v1/users/provision", headers=admin_headers, json={"email": "elsewhere@example.com", "org_id": org_id}
+        )
+        assert provision.status_code == 403
+        for member in (users["elsewhere@example.com"], users["both@example.com"]):
+            grouped = await ac.patch(
+                f"/scim/v2/Groups/{viewer_group}",
+                headers=admin_headers,
+                json={"Operations": [{"op": "add", "path": "members", "value": [{"value": member}]}]},
+            )
+            assert grouped.status_code == 403
+        reenable = {"Operations": [{"op": "replace", "path": "active", "value": True}]}
+        both = await ac.patch(f"/scim/v2/Users/{users['both@example.com']}", headers=admin_headers, json=reenable)
+        assert both.status_code == 403
+        local = await ac.patch(f"/scim/v2/Users/{users['local@example.com']}", headers=admin_headers, json=reenable)
+        assert local.status_code == 200
+        assert local.json()["active"] is True
+
+    async with async_session_factory() as db:
+        disabled = dict((await db.execute(select(User.email, User.disabled))).all())
+        members = set((await db.execute(select(Membership.user_id).where(Membership.org_id == org_id))).scalars())
+    assert disabled["elsewhere@example.com"] is True
+    assert disabled["both@example.com"] is True
+    assert users["elsewhere@example.com"] not in members

@@ -2498,6 +2498,16 @@ async def ensure_role_assignable(
         raise HTTPException(status_code=403, detail="Role grants more than your own permissions") from exc
 
 
+async def ensure_attach_allowed(db: AsyncSession, *, user_id: str, principal: Principal, org_id: str) -> None:
+    """An existing account that belongs to other orgs joins through an invitation, not provisioning or SCIM."""
+    try:
+        await ensure_account_wide_change_allowed(db, user_id=user_id, principal=principal, visible_org_ids=[org_id])
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=403, detail="User belongs to another organization; send an invitation instead"
+        ) from exc
+
+
 async def resolve_org_role(
     db: AsyncSession,
     *,
@@ -2958,12 +2968,18 @@ async def scim_group_role(db: AsyncSession, *, role_id: str, org_id: str) -> Rol
     return role
 
 
-async def scim_assign_group_member(db: AsyncSession, *, org: Organization, role: Role, user_id: str) -> bool:
+async def scim_assign_group_member(
+    db: AsyncSession, *, org: Organization, role: Role, user_id: str, principal: Principal
+) -> bool:
     user = await db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="SCIM member not found")
     result = await db.execute(select(Membership).where(Membership.user_id == user.id, Membership.org_id == org.id))
     membership = result.scalar_one_or_none()
+    if membership is None:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
+    if user.disabled:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
     current_role = await db.get(Role, membership.role_id) if membership else None
     changed = (
         membership is None
@@ -3025,6 +3041,8 @@ async def scim_apply_user_state(
         select(Membership).where(Membership.user_id == user.id, Membership.org_id == org.id)
     )
     membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org.id)
     current_role = await db.get(Role, membership.role_id) if membership else None
     role = current_role
     if role_name is not SCIM_UNSET or not role:
@@ -3078,7 +3096,8 @@ async def scim_apply_user_state(
                 current_profile[key] = value
         membership.scim_enterprise_profile = current_profile
 
-    if active is not SCIM_UNSET and scim_bool(active):
+    if active is not SCIM_UNSET and scim_bool(active) and user.disabled:
+        await ensure_account_wide_change_allowed(db, user_id=user.id, principal=principal, visible_org_ids=[org.id])
         user.disabled = False
     await db.flush()
     if active is not SCIM_UNSET and not scim_bool(active):
@@ -3426,7 +3445,7 @@ async def scim_create_group(
     await db.flush()
     changed_members = 0
     for member_id in scim_member_ids(body.get("members")):
-        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     await audit(
         db,
@@ -3491,7 +3510,7 @@ async def scim_replace_group(
         if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
             changed_members += 1
     for member_id in sorted(desired_member_ids - current_member_ids):
-        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+        if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
             changed_members += 1
     await audit(
         db,
@@ -3572,7 +3591,7 @@ async def scim_patch_group(
                 if await scim_remove_group_member(db, org=org, role=role, user_id=member_id):
                     changed_members += 1
             for member_id in sorted(desired_member_ids - current_member_ids):
-                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
         elif op_name == "remove":
             if not member_ids:
@@ -3589,7 +3608,7 @@ async def scim_patch_group(
                     changed_members += 1
         else:
             for member_id in member_ids:
-                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id):
+                if await scim_assign_group_member(db, org=org, role=role, user_id=member_id, principal=principal):
                     changed_members += 1
     await audit(
         db,
@@ -3915,6 +3934,8 @@ async def provision_user(
     )
     membership = membership_result.scalar_one_or_none()
     created_membership = membership is None
+    if created_membership and not created_user:
+        await ensure_attach_allowed(db, user_id=user.id, principal=principal, org_id=org_id)
     current_role = await db.get(Role, membership.role_id) if membership else None
     await ensure_role_assignable(db, principal=principal, org_id=org_id, role=role, current_role=current_role)
     if membership and current_role and membership.status == "active" and current_role.name == "owner":
