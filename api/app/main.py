@@ -299,11 +299,6 @@ def oauth_authorize_query(request: Request, *, approve: bool | None = None) -> s
     return urlencode(params)
 
 
-def oauth_authorize_path(request: Request) -> str:
-    query = oauth_authorize_query(request)
-    return f"{request.url.path}?{query}" if query else request.url.path
-
-
 async def resolve_authorize_org(
     db: AsyncSession,
     *,
@@ -5585,6 +5580,7 @@ async def oauth_authorize_get(
         None,
         principal,
         db,
+        oauth_authorize_query(request),
     )
 
 
@@ -5603,7 +5599,10 @@ async def oauth_authorize(
     submitted_nonce: str | None,
     principal: Principal | None,
     db: AsyncSession,
+    authorize_query: str,
 ):
+    """authorize_query is the request without approve or consent_nonce, used to come back here after login."""
+    authorize_path = f"/oauth/authorize?{authorize_query}"
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Unsupported response_type")
     client = await get_client_by_client_id(db, client_id)
@@ -5612,7 +5611,7 @@ async def oauth_authorize(
     scopes = validate_scopes(client, scope)
     principal = hosted_session_principal(principal)
     if not principal:
-        login_url = f"{settings.ui_url.rstrip('/')}/login?{urlencode({'redirect': oauth_authorize_path(request)})}"
+        login_url = f"{settings.ui_url.rstrip('/')}/login?{urlencode({'redirect': authorize_path})}"
         return RedirectResponse(login_url, status_code=302)
     if not principal.user_id:
         raise HTTPException(status_code=403, detail="User-bound authorization required")
@@ -5635,7 +5634,7 @@ async def oauth_authorize(
         if exc.status_code == 403 and str(exc.detail).startswith("MFA required"):
             login_url = "{ui}/login?{query}".format(
                 ui=settings.ui_url.rstrip("/"),
-                query=urlencode({"redirect": oauth_authorize_path(request), "step_up": "mfa"}),
+                query=urlencode({"redirect": authorize_path, "step_up": "mfa"}),
             )
             return RedirectResponse(login_url, status_code=302)
         raise
@@ -5667,7 +5666,7 @@ async def oauth_authorize(
                 amr=amr,
                 state=state,
             )
-        consent_url = f"{settings.ui_url.rstrip('/')}/authorize?{oauth_authorize_query(request)}"
+        consent_url = f"{settings.ui_url.rstrip('/')}/authorize?{authorize_query}"
         return RedirectResponse(consent_url, status_code=302)
     grant = await remember_oauth_grant(
         db,
@@ -5725,6 +5724,13 @@ async def oauth_authorize_post(
         body.consent_nonce,
         principal,
         db,
+        urlencode(
+            {
+                key: value
+                for key, value in body.model_dump(exclude={"approve", "consent_nonce"}).items()
+                if value not in (None, "")
+            }
+        ),
     )
     # The hosted consent page posts with fetch, so it gets the redirect target as JSON and navigates itself.
     return {"redirect_to": result.headers["location"]}

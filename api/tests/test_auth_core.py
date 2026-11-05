@@ -6983,3 +6983,42 @@ async def test_only_owners_change_org_policy_or_prune_the_audit_log():
         prune = {"org_id": org_id, "dry_run": False}
         assert (await ac.post("/api/v1/audit/prune", headers=admin_headers, json=prune)).status_code == 403
         assert (await ac.post("/api/v1/audit/prune", headers=owner_headers, json=prune)).status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_consent_post_without_a_session_returns_to_the_same_authorize_request():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        app_client = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={
+                "name": "App",
+                "public": True,
+                "redirect_uris": ["https://app.example.com/callback"],
+                "audiences": ["x-api"],
+                "scopes": ["openid"],
+            },
+        )
+        params = {
+            "response_type": "code",
+            "client_id": app_client.json()["client_id"],
+            "redirect_uri": "https://app.example.com/callback",
+            "code_challenge": "abc",
+            "code_challenge_method": "plain",
+            "scope": "openid",
+            "audience": "x-api",
+            "state": "keep-me",
+        }
+        ac.cookies.clear()
+        posted = await ac.post("/oauth/authorize", json={**params, "approve": True, "consent_nonce": "0" * 64})
+        login = urlparse(posted.json()["redirect_to"])
+        assert login.path == "/login"
+        resume = parse_qs(login.query)["redirect"][0]
+        assert "approve" not in resume and "consent_nonce" not in resume
+        resumed = await ac.get(resume, headers=owner_headers)
+        assert resumed.status_code == 302
+        consent = urlparse(resumed.headers["location"])
+        assert consent.path == "/authorize"
+        assert parse_qs(consent.query)["state"] == ["keep-me"]
