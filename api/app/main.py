@@ -4856,8 +4856,15 @@ async def ensure_client_scopes_allowed(
 
 
 def uses_reserved_audience(audiences: list[str] | None, mcp_resource_uri: str | None = None) -> bool:
-    reserved = settings.reserved_audience_set
+    # GateKeeper's own audiences (the issuer included) are always reserved: tokens for them act on GateKeeper.
+    reserved = settings.reserved_audience_set | settings.gatekeeper_audience_set
     return bool(reserved.intersection(audiences or [])) or (mcp_resource_uri or "") in reserved
+
+
+def reserved_token_audience(audiences: list[str] | None) -> bool:
+    # An API token bound to GateKeeper itself is worth no more than an unbound one, so only other first-party
+    # audiences (sentinel-api, knowhere-api, ...) need a platform admin.
+    return bool(settings.reserved_audience_set.intersection(audiences or []) - settings.gatekeeper_audience_set)
 
 
 async def require_install_owner(db: AsyncSession, principal: Principal) -> Organization:
@@ -6851,6 +6858,8 @@ async def delete_client(
         raise HTTPException(status_code=404, detail="Client not found")
     await ensure_client_management_allowed(db, client, principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=client.org_id)
+    if uses_reserved_audience(client.audiences, client.mcp_resource_uri):
+        await require_platform_admin(db, principal)
     if client.client_id == "gatekeeper-cli":
         raise HTTPException(status_code=400, detail="The default CLI client can be disabled but not deleted")
     dependent_queries = [
@@ -7112,6 +7121,8 @@ async def create_token(
         await require_admin_step_up_for_org(db, principal=principal, org_id=org_id)
         user_id = principal.user_id if body.token_type == "admin" else None
         scopes = await ensure_token_scopes_allowed(db, principal=principal, org_id=org_id, scopes=body.scopes)
+    if reserved_token_audience(body.audiences):
+        await require_platform_admin(db, principal)
     token, raw = await create_api_token(
         db,
         name=body.name,
@@ -7187,6 +7198,8 @@ async def rotate_api_token(
     await ensure_token_mutation_allowed(db, token=existing, principal=principal)
     await require_admin_step_up_for_org(db, principal=principal, org_id=existing.org_id)
     await ensure_token_scopes_allowed(db, principal=principal, org_id=existing.org_id, scopes=existing.scopes or [])
+    if reserved_token_audience(existing.audiences):
+        await require_platform_admin(db, principal)
     existing.revoked_at = now_utc()
     token, raw = await create_api_token(
         db,

@@ -6186,3 +6186,57 @@ async def test_switch_org_is_limited_to_hosted_sessions_and_never_widens_a_token
         assert claims["aud"] == settings.issuer
         assert claims.get("azp") is None
         assert claims["scope"] == "*"
+
+
+async def bootstrap_owner_and_admin(ac: AsyncClient, password: str = "correct horse battery"):
+    """Owner (platform admin) plus an org admin of the bootstrap org who is not a platform admin."""
+    owner = await register(ac, json={"email": "owner@example.com", "password": password})
+    owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+    org_id = owner.json()["orgs"][0]["id"]
+    admin = await register(ac, json={"email": "admin@corp.example.com", "password": password})
+    promoted = await ac.put(
+        f"/api/v1/users/{admin.json()['user']['id']}/membership",
+        headers=owner_headers,
+        json={"org_id": org_id, "role": "admin", "status": "active"},
+    )
+    assert promoted.status_code == 200
+    login = await ac.post("/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": password})
+    admin_headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    return owner_headers, admin_headers, org_id, admin.json()["user"]["id"]
+
+
+@pytest.mark.asyncio
+async def test_gatekeeper_audiences_including_the_issuer_are_reserved():
+    body = {"name": "Product", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, _org_id, _admin_id = await bootstrap_owner_and_admin(ac)
+        for audiences in ([settings.issuer], ["gatekeeper-api"]):
+            denied = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "audiences": audiences})
+            assert denied.status_code == 403
+        for audiences, expected in (([settings.issuer], 200), (["gatekeeper-api"], 200), (["sentinel-api"], 403)):
+            token = await ac.post(
+                "/api/v1/tokens",
+                headers=admin_headers,
+                json={"name": "bound", "token_type": "personal", "audiences": audiences},
+            )
+            assert token.status_code == expected
+        owned = await ac.post("/api/v1/clients", headers=admin_headers, json={**body, "audiences": ["my-api"]})
+        assert owned.status_code == 200
+        retarget = await ac.patch(
+            f"/api/v1/clients/{owned.json()['id']}", headers=admin_headers, json={"audiences": [settings.issuer]}
+        )
+        assert retarget.status_code == 403
+
+        first_party = await ac.post(
+            "/api/v1/clients", headers=owner_headers, json={**body, "audiences": [settings.issuer]}
+        )
+        assert first_party.status_code == 200
+        removed = await ac.delete(f"/api/v1/clients/{first_party.json()['id']}", headers=admin_headers)
+        assert removed.status_code == 403
+        assert (await ac.delete(f"/api/v1/clients/{owned.json()['id']}", headers=admin_headers)).status_code == 200
+        owner_token = await ac.post(
+            "/api/v1/tokens",
+            headers=owner_headers,
+            json={"name": "bound", "token_type": "personal", "audiences": ["sentinel-api"]},
+        )
+        assert owner_token.status_code == 200
