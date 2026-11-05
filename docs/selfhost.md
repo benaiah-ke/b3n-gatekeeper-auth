@@ -210,6 +210,22 @@ docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
   python -m app.ops overscoped-tokens --revoke
 ```
 
+Narrow a revoke run with `--id <token id>` (repeatable) or keep a person's
+tokens with `--exclude-user <email or user id>` (repeatable). The filters apply
+to the listing too.
+
+After an incident, list what accounts created since a date can reach. The
+command only reads: accounts and their memberships, orgs they own, clients in
+those orgs or with reserved audiences, `*`, `admin:*`, `token:*` or a verified
+badge, their API tokens, pending invitations, OAuth grants, non-default roles,
+and live sessions with their live refresh token counts. It prints ids, hints
+and emails, never secrets or hashes:
+
+```bash
+docker compose -f deploy/docker-compose.selfhost.yml exec gatekeeper-api \
+  python -m app.ops incident-sweep --since 2026-11-03
+```
+
 ## Setup Checklist
 
 - `/account` shows an owner role for the bootstrap org.

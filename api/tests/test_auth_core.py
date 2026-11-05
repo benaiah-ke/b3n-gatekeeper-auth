@@ -6637,3 +6637,96 @@ async def test_signup_is_rate_limited_per_ip_and_refusal_alerts_are_deduplicated
         await asyncio.gather(*alerts._pending)
     assert statuses == [403, 403, 403, 403, 429, 429]
     assert sent.count("[GateKeeper] Signup refused") == 1
+
+
+@pytest.mark.asyncio
+async def test_incident_sweep_lists_what_new_accounts_touched_and_revoke_takes_filters():
+    client_body = {"name": "Flagged", "public": True, "redirect_uris": ["https://app.example.com/callback"]}
+    async with await client() as ac:
+        owner_headers, admin_headers, org_id, admin_id = await bootstrap_owner_and_admin(ac)
+        owner_id = (await ac.get("/api/v1/auth/me", headers=owner_headers)).json()["user"]["id"]
+        evil = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Evil", "slug": "evil"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": evil.json()["id"]}
+        )
+        await ac.put(
+            f"/api/v1/users/{admin_id}/membership",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"org_id": evil.json()["id"], "role": "owner", "status": "active"},
+        )
+        admin_login = await ac.post(
+            "/api/v1/auth/login", json={"email": "admin@corp.example.com", "password": "correct horse battery"}
+        )
+        admin_headers = {"Authorization": f"Bearer {admin_login.json()['access_token']}"}
+        flagged = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "audiences": ["x-api"], "scopes": ["openid", "admin:*"]},
+        )
+        quiet = await ac.post(
+            "/api/v1/clients",
+            headers=owner_headers,
+            json={**client_body, "audiences": ["y-api"], "scopes": ["openid"]},
+        )
+        token = await ac.post("/api/v1/tokens", headers=admin_headers, json={"name": "mine", "token_type": "personal"})
+        role = await ac.post(
+            "/api/v1/roles", headers=owner_headers, json={"org_id": org_id, "name": "support", "permissions": []}
+        )
+        invite = await ac.post(
+            "/api/v1/invitations", headers=owner_headers, json={"email": "pending@example.com", "org_id": org_id}
+        )
+        for created in (flagged, quiet, token, role, invite):
+            assert created.status_code == 200
+        await approve_consent(
+            ac,
+            admin_headers,
+            {
+                "response_type": "code",
+                "client_id": flagged.json()["client_id"],
+                "redirect_uri": "https://app.example.com/callback",
+                "code_challenge": "abc",
+                "code_challenge_method": "plain",
+                "scope": "openid",
+                "audience": "x-api",
+            },
+        )
+
+    async with async_session_factory() as db:
+        owner = await db.get(User, owner_id)
+        owner.created_at = services.now_utc() - timedelta(days=30)
+        await db.commit()
+    sweep = await ops.incident_sweep(services.now_utc() - timedelta(days=1))
+    assert [row["email"] for row in sweep["accounts"]] == ["admin@corp.example.com"]
+    assert {(row["org"], row["role"]) for row in sweep["memberships"]} == {("example", "admin"), ("evil", "owner")}
+    assert [row["slug"] for row in sweep["owned_orgs"]] == ["evil"]
+    listed_clients = {row["client_id"] for row in sweep["clients"]}
+    assert flagged.json()["client_id"] in listed_clients
+    assert quiet.json()["client_id"] not in listed_clients
+    assert token.json()["id"] in {row["id"] for row in sweep["api_tokens"]}
+    assert [row["email"] for row in sweep["invitations"]] == ["pending@example.com"]
+    assert [row["client_id"] for row in sweep["oauth_grants"]] == [flagged.json()["client_id"]]
+    assert [row["name"] for row in sweep["roles"]] == ["support"]
+    assert "admin@corp.example.com" in {row["user"] for row in sweep["sessions"]}
+    assert all("token_hash" not in row and "secret" not in str(row) for rows in sweep.values() for row in rows)
+
+    async with async_session_factory() as db:
+        overscoped, _raw = await services.create_api_token(
+            db,
+            name="overscoped",
+            token_type_value="personal",
+            org_id=org_id,
+            user_id=admin_id,
+            project_id=None,
+            client_id=None,
+            scopes=["*"],
+            audiences=[],
+            expires_at=None,
+        )
+        await db.commit()
+    assert [item["id"] for item in await ops.overscoped_tokens()] == [overscoped.id]
+    assert await ops.overscoped_tokens(revoke=True, ids=["no-such-token"]) == []
+    assert await ops.overscoped_tokens(revoke=True, exclude_users=["admin@corp.example.com"]) == []
+    assert [item["id"] for item in await ops.overscoped_tokens()] == [overscoped.id]
+    revoked = await ops.overscoped_tokens(revoke=True, ids=[overscoped.id])
+    assert [item["id"] for item in revoked] == [overscoped.id]
+    assert await ops.overscoped_tokens() == []
