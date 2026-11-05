@@ -7425,6 +7425,13 @@ async def rotate_api_token(
     await ensure_token_scopes_allowed(db, principal=principal, org_id=existing.org_id, scopes=existing.scopes or [])
     if reserved_token_audience(existing.audiences):
         await require_platform_admin(db, principal)
+    await ensure_token_bindings_allowed(
+        db,
+        org_id=existing.org_id,
+        project_id=existing.project_id,
+        client_id=existing.client_id,
+        audiences=existing.audiences or [],
+    )
     existing.revoked_at = now_utc()
     token, raw = await create_api_token(
         db,

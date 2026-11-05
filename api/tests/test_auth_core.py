@@ -7096,3 +7096,37 @@ async def test_incident_sweep_lists_new_and_audience_less_clients_and_recent_cha
     actions = {row["action"] for row in sweep["audit_events"]}
     assert {"client.create", "role.create", "user.membership.update"} <= actions
     assert "auth.login" not in actions
+
+
+@pytest.mark.asyncio
+async def test_rotating_an_api_token_rechecks_its_bindings():
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        owner_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        org_id = owner.json()["orgs"][0]["id"]
+        other = await ac.post("/api/v1/orgs", headers=owner_headers, json={"name": "Other", "slug": "other"})
+        switched = await ac.post(
+            "/api/v1/auth/session/switch-org", headers=owner_headers, json={"org_id": other.json()["id"]}
+        )
+        project = await ac.post(
+            "/api/v1/projects",
+            headers={"Authorization": f"Bearer {switched.json()['access_token']}"},
+            json={"org_id": other.json()["id"], "name": "Theirs", "slug": "theirs", "audience": "their-api"},
+        )
+        assert project.status_code == 200
+        async with async_session_factory() as db:
+            legacy, _raw = await services.create_api_token(
+                db,
+                name="legacy",
+                token_type_value="service",
+                org_id=org_id,
+                user_id=None,
+                project_id=project.json()["id"],
+                client_id=None,
+                scopes=["auth:read"],
+                audiences=["their-api"],
+                expires_at=None,
+            )
+            await db.commit()
+        rotated = await ac.post(f"/api/v1/tokens/{legacy.id}/rotate", headers=owner_headers)
+        assert rotated.status_code == 403
