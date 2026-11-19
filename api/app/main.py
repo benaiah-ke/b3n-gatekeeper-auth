@@ -187,15 +187,17 @@ from app.services import (
     create_user,
     derive_membership_scopes,
     effective_api_token_scopes,
+    email_delivery_available,
     enforce_rate_limit,
     enforce_session_idle_timeout,
     ensure_bootstrap,
     get_client_by_client_id,
     org_has_owner,
     org_roles,
+    queue_one_time_code,
+    require_email_delivery,
     rotate_refresh_token,
     send_invitation_email,
-    send_one_time_code,
     user_has_mfa,
     user_read,
     validate_audience,
@@ -1519,6 +1521,7 @@ async def request_email_change(
     if await user_by_email(db, new_email):
         raise HTTPException(status_code=409, detail="Email already exists")
 
+    require_email_delivery()
     await enforce_rate_limit(
         db,
         key=f"email-change:{user.id}:{new_email}",
@@ -1531,7 +1534,6 @@ async def request_email_change(
         purpose="email_change",
         user_id=user.id,
     )
-    send_one_time_code(email=new_email, code=code, purpose="email_change")
     await audit(
         db,
         "auth.email_change.request",
@@ -1542,6 +1544,7 @@ async def request_email_change(
         request=request,
     )
     await db.commit()
+    queue_one_time_code(email=new_email, code=code, purpose="email_change")
     return {"status": "sent"}
 
 
@@ -2306,7 +2309,8 @@ async def setup_status(principal: Principal = Depends(current_principal), db: As
         can_manage_projects=has_capability(permissions, "admin:*"),
         can_manage_roles=has_capability(permissions, "admin:*"),
         access_expires_at=access_expires_at,
-        smtp_configured=bool(settings.smtp_host),
+        smtp_configured=bool(settings.email_delivery),
+        email_delivery=settings.email_delivery,
         email_dev_mode=settings.email_dev_mode,
         dynamic_client_registration_enabled=settings.enable_dynamic_client_registration,
     )
@@ -4427,7 +4431,15 @@ async def create_invitation(
     )
     db.add(invitation)
     await db.flush()
-    send_invitation_email(email=email, token=raw_token, org_name=org.name, role_name=role.name)
+    try:
+        await send_invitation_email(email=email, token=raw_token, org_name=org.name, role_name=role.name)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Roll back so a failed send neither revokes the earlier invitations nor leaves an unsent one behind.
+        await db.rollback()
+        logger.warning("Invitation email failed: %s", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Invitation email could not be sent") from exc
     await audit(
         db,
         "invitation.create",
@@ -4588,6 +4600,15 @@ async def accept_invitation(
     )
 
 
+@app.get("/api/v1/auth/options")
+async def auth_options():
+    available = email_delivery_available()
+    return {
+        "email_code_login": settings.email_code_login_enabled and available,
+        "password_reset": available,
+    }
+
+
 def require_email_code_login() -> None:
     if not settings.email_code_login_enabled:
         raise HTTPException(status_code=403, detail="Email code sign-in is disabled")
@@ -4596,6 +4617,7 @@ def require_email_code_login() -> None:
 @app.post("/api/v1/auth/email-code/request")
 async def request_email_code(body: EmailCodeRequest, request: Request, db: AsyncSession = Depends(get_db)):
     require_email_code_login()
+    require_email_delivery()
     await enforce_rate_limit(
         db,
         key=f"email-code:{str(body.email).lower()}:{body.purpose}",
@@ -4616,8 +4638,8 @@ async def request_email_code(body: EmailCodeRequest, request: Request, db: Async
         purpose=body.purpose,
         user_id=user.id,
     )
-    send_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
     await db.commit()
+    queue_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
     return {"status": "sent"}
 
 
@@ -4634,6 +4656,12 @@ async def verify_email_code(
         key=f"email-code-verify:{str(body.email).lower()}:{client_ip(request) or 'unknown'}",
         limit=10,
         window_seconds=300,
+    )
+    await enforce_rate_limit(
+        db,
+        key=f"email-code-verify-email:{str(body.email).lower()}",
+        limit=20,
+        window_seconds=900,
     )
     await verify_one_time_code(db, email=str(body.email), purpose=body.purpose, code=body.code)
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
@@ -4660,6 +4688,7 @@ async def verify_email_code(
 
 @app.post("/api/v1/auth/password/reset/request")
 async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+    require_email_delivery()
     await enforce_rate_limit(
         db,
         key=f"password-reset:{str(body.email).lower()}",
@@ -4675,8 +4704,8 @@ async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depe
             purpose="reset_password",
             user_id=user.id,
         )
-        send_one_time_code(email=str(body.email), code=code, purpose="reset_password")
         await db.commit()
+        queue_one_time_code(email=str(body.email), code=code, purpose="reset_password")
     return {"status": "sent"}
 
 
@@ -4686,6 +4715,12 @@ async def confirm_password_reset(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    await enforce_rate_limit(
+        db,
+        key=f"password-reset-confirm:{str(body.email).lower()}",
+        limit=10,
+        window_seconds=900,
+    )
     await verify_one_time_code(
         db,
         email=str(body.email),

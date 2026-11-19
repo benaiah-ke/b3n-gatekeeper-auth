@@ -316,6 +316,7 @@ class SetupStatusRead(BaseModel):
     can_manage_roles: bool
     access_expires_at: datetime | None = None
     smtp_configured: bool
+    email_delivery: str = ""
     email_dev_mode: bool
     dynamic_client_registration_enabled: bool
 

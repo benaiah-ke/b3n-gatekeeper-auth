@@ -88,11 +88,13 @@ class Settings(BaseSettings):
     smtp_from: str = "GateKeeper <auth@example.com>"
     smtp_use_tls: bool = True
     email_dev_mode: bool = True
+    # From address for user emails (codes, invitations). Empty falls back to smtp_from.
+    email_from: str = ""
 
     # Security alert emails through Sendy. Alerts are off until both the key and the recipient are set.
     sendy_api_key: str = ""
     sendy_api_url: str = "https://usesendy.com"
-    alert_email_from: str = "B3n Alerts <alerts@notification.b3n.in>"
+    alert_email_from: str = "B3n Alerts <alerts@notifications.b3n.in>"
     alert_email_to: str = ""
 
     google_client_id: str = ""
@@ -124,6 +126,17 @@ class Settings(BaseSettings):
     def trusted_proxy_networks(self) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
         items = [item.strip() for item in self.trusted_proxy_cidrs.split(",") if item.strip()]
         return [ipaddress.ip_network(item, strict=False) for item in items]
+
+    @property
+    def email_from_address(self) -> str:
+        return self.email_from or self.smtp_from
+
+    @property
+    def email_delivery(self) -> str:
+        """Which user email delivery is configured: "sendy" wins over "smtp"; "" means none."""
+        if self.sendy_api_key and self.email_from_address:
+            return "sendy"
+        return "smtp" if self.smtp_host else ""
 
     @property
     def issuer(self) -> str:

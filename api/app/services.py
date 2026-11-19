@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
+import json
 import logging
 import secrets
 import smtplib
@@ -9,6 +11,7 @@ from datetime import timedelta
 from email.message import EmailMessage
 from typing import Any
 
+import httpx
 from fastapi import HTTPException, Request
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
@@ -320,21 +323,41 @@ async def enforce_rate_limit(
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
-def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
-    if not settings.smtp_host:
-        if settings.email_dev_mode:
-            return
-        raise HTTPException(status_code=503, detail="SMTP is not configured")
+# Tests swap in httpx.MockTransport; production uses the default network transport.
+_transport: httpx.AsyncBaseTransport | None = None
+_pending: set[asyncio.Task] = set()
 
+ONE_TIME_CODE_SUBJECTS = {
+    "login": "Your GateKeeper sign-in code",
+    "verify_email": "Confirm your GateKeeper email",
+    "reset_password": "Reset your GateKeeper password",
+    "email_change": "Confirm your new GateKeeper email",
+}
+
+
+class EmailDeliveryError(Exception):
+    """Sendy did not accept the email. Carries only the status code, never the body, code or key."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"Sendy rejected the email (status {status_code})")
+        self.status_code = status_code
+
+
+def email_delivery_available() -> bool:
+    return bool(settings.email_delivery) or settings.email_dev_mode
+
+
+def require_email_delivery() -> None:
+    if not email_delivery_available():
+        raise HTTPException(status_code=503, detail="Email delivery is not configured")
+
+
+def _send_smtp(*, to: str, subject: str, text: str) -> None:
     message = EmailMessage()
-    message["From"] = settings.smtp_from
-    message["To"] = email
-    message["Subject"] = f"GateKeeper {purpose.replace('_', ' ')}"
-    message.set_content(
-        "Use this GateKeeper code to continue. "
-        "The code expires soon and should not be shared.\n\n"
-        f"{code}\n"
-    )
+    message["From"] = settings.email_from_address
+    message["To"] = to
+    message["Subject"] = subject
+    message.set_content(text)
     context = ssl.create_default_context()
     with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
         if settings.smtp_use_tls:
@@ -344,30 +367,84 @@ def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
         smtp.send_message(message)
 
 
-def send_invitation_email(*, email: str, token: str, org_name: str, role_name: str) -> None:
-    if not settings.smtp_host:
-        if settings.email_dev_mode:
-            return
-        raise HTTPException(status_code=503, detail="SMTP is not configured")
+async def deliver_email(*, to: str, subject: str, text: str) -> None:
+    delivery = settings.email_delivery
+    if delivery == "sendy":
+        async with httpx.AsyncClient(transport=_transport, timeout=10.0) as client:
+            response = await client.post(
+                f"{settings.sendy_api_url.rstrip('/')}/api/v1/emails",
+                headers={
+                    "Authorization": f"Bearer {settings.sendy_api_key}",
+                    "Content-Type": "application/vnd.api+json",
+                    "Accept": "application/vnd.api+json",
+                    "Idempotency-Key": secrets.token_urlsafe(24),
+                },
+                content=json.dumps(
+                    {
+                        "data": {
+                            "type": "emails",
+                            "attributes": {
+                                "from": settings.email_from_address,
+                                "to": to,
+                                "subject": subject,
+                                "text": text,
+                            },
+                        }
+                    }
+                ),
+            )
+        if not 200 <= response.status_code < 300:
+            raise EmailDeliveryError(response.status_code)
+    elif delivery == "smtp":
+        await asyncio.to_thread(_send_smtp, to=to, subject=subject, text=text)
+    elif not settings.email_dev_mode:
+        raise HTTPException(status_code=503, detail="Email delivery is not configured")
 
+
+def one_time_code_email(*, code: str, purpose: str) -> tuple[str, str]:
+    subject = ONE_TIME_CODE_SUBJECTS.get(purpose, "Your GateKeeper code")
+    minutes = max(settings.email_code_ttl_seconds // 60, 1)
+    text = (
+        f"Your code is {code}\n\n"
+        f"It expires in {minutes} minutes. Do not share it.\n\n"
+        "If you did not ask for this, you can ignore this email.\n"
+    )
+    return subject, text
+
+
+async def send_one_time_code(*, email: str, code: str, purpose: str) -> None:
+    subject, text = one_time_code_email(code=code, purpose=purpose)
+    await deliver_email(to=email, subject=subject, text=text)
+
+
+async def _send_one_time_code_quietly(*, email: str, code: str, purpose: str) -> None:
+    try:
+        await send_one_time_code(email=email, code=code, purpose=purpose)
+    except Exception as exc:  # the caller already answered; never log the address or code
+        logger.warning("One-time code email failed (purpose %s): %s", purpose, type(exc).__name__)
+
+
+def queue_one_time_code(*, email: str, code: str, purpose: str) -> None:
+    """Send a code in the background so the response does not depend on the account or the send."""
+    task = asyncio.get_running_loop().create_task(
+        _send_one_time_code_quietly(email=email, code=code, purpose=purpose)
+    )
+    _pending.add(task)
+    task.add_done_callback(_pending.discard)
+
+
+async def send_invitation_email(*, email: str, token: str, org_name: str, role_name: str) -> None:
     accept_url = f"{settings.ui_url.rstrip('/')}/accept-invite?token={token}"
-    message = EmailMessage()
-    message["From"] = settings.smtp_from
-    message["To"] = email
-    message["Subject"] = f"GateKeeper invitation to {org_name}"
-    message.set_content(
-        f"You have been invited to {org_name} as {role_name}.\n\n"
-        f"Accept the invitation:\n{accept_url}\n\n"
-        "If your product owns the auth UI, paste this invitation token into that flow:\n"
-        f"{token}\n"
+    await deliver_email(
+        to=email,
+        subject=f"GateKeeper invitation to {org_name}",
+        text=(
+            f"You have been invited to {org_name} as {role_name}.\n\n"
+            f"Accept the invitation:\n{accept_url}\n\n"
+            "If your product owns the auth UI, paste this invitation token into that flow:\n"
+            f"{token}\n"
+        ),
     )
-    context = ssl.create_default_context()
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=10) as smtp:
-        if settings.smtp_use_tls:
-            smtp.starttls(context=context)
-        if settings.smtp_username:
-            smtp.login(settings.smtp_username, settings.smtp_password)
-        smtp.send_message(message)
 
 
 async def ensure_bootstrap(db: AsyncSession) -> Organization:

@@ -7626,3 +7626,254 @@ async def test_star_scope_cannot_revoke_sessions_in_other_orgs():
         assert revoked.status_code in (403, 404)
         member_headers = {"Authorization": f"Bearer {member.json()['access_token']}"}
         assert (await ac.get("/api/v1/auth/me", headers=member_headers)).status_code == 200
+
+
+class SendyMock:
+    """Captures Sendy requests made by services.deliver_email."""
+
+    def __init__(self, monkeypatch, status: int = 202):
+        self.requests: list[httpx.Request] = []
+        self.status = status
+        monkeypatch.setattr(services, "_transport", httpx.MockTransport(self._handle))
+        monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+        monkeypatch.setattr(settings, "email_from", "GateKeeper <auth@notifications.b3n.in>")
+        monkeypatch.setattr(settings, "email_dev_mode", False)
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(self.status, json={"data": {"id": "email-1"}})
+
+    async def flush(self) -> list[dict]:
+        await asyncio.gather(*services._pending)
+        return [json.loads(request.content)["data"]["attributes"] for request in self.requests]
+
+
+async def ip_client(ip: str):
+    return AsyncClient(transport=ASGITransport(app=app, client=(ip, 4000)), base_url="http://testserver")
+
+
+@pytest.mark.asyncio
+async def test_sendy_email_request_shape(monkeypatch):
+    sendy = SendyMock(monkeypatch)
+    await services.deliver_email(to="user@example.com", subject="Hello", text="Your code is ABC12345")
+    await services.deliver_email(to="user@example.com", subject="Hello", text="Again")
+    first, second = sendy.requests
+    assert first.method == "POST"
+    assert str(first.url) == "https://usesendy.com/api/v1/emails"
+    assert first.headers["authorization"] == "Bearer test-sendy-key"
+    assert first.headers["idempotency-key"] != second.headers["idempotency-key"]
+    attributes = json.loads(first.content)["data"]["attributes"]
+    assert attributes == {
+        "from": "GateKeeper <auth@notifications.b3n.in>",
+        "to": "user@example.com",
+        "subject": "Hello",
+        "text": "Your code is ABC12345",
+    }
+    assert settings.alert_email_from.endswith("@notifications.b3n.in>")
+
+
+@pytest.mark.asyncio
+async def test_sendy_failure_raises_status_only(monkeypatch):
+    SendyMock(monkeypatch, status=422)
+    with pytest.raises(services.EmailDeliveryError) as raised:
+        await services.deliver_email(to="user@example.com", subject="Hello", text="secret body")
+    assert raised.value.status_code == 422
+    assert "secret" not in str(raised.value) and "user@example.com" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_email_code_request_sends_through_sendy_only_for_known_accounts(monkeypatch):
+    sendy = SendyMock(monkeypatch)
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        unknown = await ac.post("/api/v1/auth/email-code/request", json={"email": "stranger@example.com"})
+        assert await sendy.flush() == []
+        known = await ac.post("/api/v1/auth/email-code/request", json={"email": "owner@example.com"})
+        sent = await sendy.flush()
+    assert unknown.status_code == known.status_code == 200
+    assert unknown.json() == known.json() == {"status": "sent"}
+    assert len(sent) == 1
+    assert sent[0]["to"] == "owner@example.com"
+    assert sent[0]["subject"] == "Your GateKeeper sign-in code"
+    assert "expires in 15 minutes" in sent[0]["text"]
+    assert "If you did not ask for this, you can ignore this email." in sent[0]["text"]
+    async with async_session_factory() as db:
+        code = sent[0]["text"].split("Your code is ")[1].split()[0]
+        assert (await services.verify_one_time_code(db, email="owner@example.com", purpose="login", code=code)).id
+
+
+@pytest.mark.asyncio
+async def test_sendy_failure_does_not_change_the_request_responses(monkeypatch):
+    sendy = SendyMock(monkeypatch, status=500)
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    async with await client() as ac:
+        await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        code_request = await ac.post("/api/v1/auth/email-code/request", json={"email": "owner@example.com"})
+        reset_request = await ac.post("/api/v1/auth/password/reset/request", json={"email": "owner@example.com"})
+        await sendy.flush()
+    assert code_request.status_code == reset_request.status_code == 200
+    assert code_request.json() == reset_request.json() == {"status": "sent"}
+    assert len(sendy.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_unknown_email_on_password_reset_request_sends_nothing(monkeypatch):
+    sendy = SendyMock(monkeypatch)
+    async with await client() as ac:
+        unknown = await ac.post("/api/v1/auth/password/reset/request", json={"email": "stranger@example.com"})
+        await sendy.flush()
+    assert unknown.status_code == 200
+    assert unknown.json() == {"status": "sent"}
+    assert sendy.requests == []
+
+
+@pytest.mark.asyncio
+async def test_request_endpoints_return_503_without_delivery(monkeypatch):
+    monkeypatch.setattr(settings, "email_dev_mode", False)
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    async with await client() as ac:
+        for path in ("/api/v1/auth/email-code/request", "/api/v1/auth/password/reset/request"):
+            response = await ac.post(path, json={"email": "owner@example.com"})
+            assert response.status_code == 503
+            assert response.json()["detail"] == "Email delivery is not configured"
+    async with async_session_factory() as db:
+        assert (await db.execute(select(OneTimeCode.id))).first() is None
+
+
+@pytest.mark.asyncio
+async def test_smtp_is_used_when_only_smtp_is_configured(monkeypatch):
+    monkeypatch.setattr(settings, "email_dev_mode", False)
+    monkeypatch.setattr(settings, "smtp_host", "smtp.example.com")
+    monkeypatch.setattr(settings, "smtp_use_tls", False)
+    sent = []
+
+    class FakeSMTP:
+        def __init__(self, host, port, timeout=None):
+            sent.append(("connect", host, port))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def send_message(self, message):
+            sent.append(("message", message["To"], message["Subject"], message["From"]))
+
+    monkeypatch.setattr(services.smtplib, "SMTP", FakeSMTP)
+    assert settings.email_delivery == "smtp"
+    await services.deliver_email(to="user@example.com", subject="Hello", text="Body")
+    assert sent == [
+        ("connect", "smtp.example.com", 587),
+        ("message", "user@example.com", "Hello", settings.smtp_from),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_password_reset_by_email_code_end_to_end(monkeypatch):
+    sendy = SendyMock(monkeypatch)
+    old, new = "correct horse battery", "a brand new passphrase"
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": old})
+        headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        requested = await ac.post("/api/v1/auth/password/reset/request", json={"email": "owner@example.com"})
+        assert requested.json() == {"status": "sent"}
+        (sent,) = await sendy.flush()
+        assert sent["subject"] == "Reset your GateKeeper password"
+        code = sent["text"].split("Your code is ")[1].split()[0]
+        confirmed = await ac.post(
+            "/api/v1/auth/password/reset/confirm",
+            json={"email": "owner@example.com", "code": code, "new_password": new},
+        )
+        assert confirmed.status_code == 200
+        ac.cookies.clear()
+        assert (await ac.get("/api/v1/auth/me", headers=headers)).status_code == 401
+        good = await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": new})
+        assert good.status_code == 200
+        bad = await ac.post("/api/v1/auth/login", json={"email": "owner@example.com", "password": old})
+        assert bad.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_password_reset_confirm_is_rate_limited():
+    async with await client() as ac:
+        statuses = []
+        for _ in range(11):
+            response = await ac.post(
+                "/api/v1/auth/password/reset/confirm",
+                json={"email": "owner@example.com", "code": "WRONGCODE", "new_password": "a brand new passphrase"},
+            )
+            statuses.append(response.status_code)
+    assert statuses == [401] * 10 + [429]
+
+
+@pytest.mark.asyncio
+async def test_email_code_verify_has_a_per_email_limit_across_ips(monkeypatch):
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    statuses = []
+    for index in range(21):
+        async with await ip_client(f"203.0.113.{index + 1}") as ac:
+            response = await ac.post(
+                "/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": "WRONGCODE"}
+            )
+        statuses.append(response.status_code)
+    assert statuses == [401] * 20 + [429]
+
+
+@pytest.mark.asyncio
+async def test_auth_options_reflect_delivery_and_email_code_setting(monkeypatch):
+    async def options() -> dict:
+        async with await client() as ac:
+            response = await ac.get("/api/v1/auth/options")
+        assert response.status_code == 200
+        return response.json()
+
+    monkeypatch.setattr(settings, "email_dev_mode", False)
+    assert await options() == {"email_code_login": False, "password_reset": False}
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    assert await options() == {"email_code_login": False, "password_reset": False}
+    monkeypatch.setattr(settings, "sendy_api_key", "test-sendy-key")
+    assert await options() == {"email_code_login": True, "password_reset": True}
+    monkeypatch.setattr(settings, "email_code_login_enabled", False)
+    assert await options() == {"email_code_login": False, "password_reset": True}
+
+
+@pytest.mark.asyncio
+async def test_invitation_send_failure_returns_502_and_keeps_earlier_invitation(monkeypatch):
+    sendy = SendyMock(monkeypatch, status=500)
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        sendy.status = 202
+        invite = {"email": "new@example.com", "role": "owner", "org_id": owner.json()["orgs"][0]["id"]}
+        first = await ac.post("/api/v1/invitations", headers=headers, json=invite)
+        assert first.status_code == 200
+        sendy.status = 500
+        failed = await ac.post("/api/v1/invitations", headers=headers, json=invite)
+        assert failed.status_code == 502
+        assert failed.json()["detail"] == "Invitation email could not be sent"
+        listed = await ac.get("/api/v1/invitations", headers=headers)
+    assert [item["id"] for item in listed.json()] == [first.json()["id"]]
+
+
+@pytest.mark.asyncio
+async def test_email_code_login_with_totp_still_needs_the_totp_code(monkeypatch):
+    sendy = SendyMock(monkeypatch)
+    monkeypatch.setattr(settings, "email_code_login_enabled", True)
+    async with await client() as ac:
+        owner = await register(ac, json={"email": "owner@example.com", "password": "correct horse battery"})
+        headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        secret = (await ac.post("/api/v1/auth/mfa/totp/setup", headers=headers)).json()["secret"]
+        await ac.post("/api/v1/auth/mfa/totp/enable", headers=headers, json={"code": totp_code(secret)})
+        await ac.post("/api/v1/auth/email-code/request", json={"email": "owner@example.com"})
+        (sent,) = await sendy.flush()
+        code = sent["text"].split("Your code is ")[1].split()[0]
+        without = await ac.post("/api/v1/auth/email-code/verify", json={"email": "owner@example.com", "code": code})
+        assert without.status_code == 401
+        assert without.json()["detail"] == "TOTP code required"
+        with_totp = await ac.post(
+            "/api/v1/auth/email-code/verify",
+            json={"email": "owner@example.com", "code": code, "totp_code": totp_code(secret)},
+        )
+        assert with_totp.status_code == 200
