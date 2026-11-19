@@ -207,7 +207,7 @@ onMounted(() => {
         <p class="mono-label">GateKeeper</p>
         <h1 class="mt-3 text-2xl font-semibold leading-tight">{{ codeMode ? 'Sign In With A Code' : isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
         <p class="mt-3 text-sm leading-6 text-muted">
-          {{ isStepUp ? 'Use a passkey or your password and authenticator to verify this sign in.' : 'Use a passkey, or sign in with your password.' }}
+          {{ isStepUp ? 'Use a passkey or your password and authenticator to verify this sign in.' : codeMode ? 'We will email you a code to sign in.' : 'Use a passkey, or sign in with your password.' }}
         </p>
 
         <button
@@ -247,7 +247,8 @@ onMounted(() => {
             <input
               v-model="emailCode"
               class="input font-mono"
-              inputmode="numeric"
+              autocapitalize="characters"
+              spellcheck="false"
               autocomplete="one-time-code"
               placeholder="Code from your email"
               required

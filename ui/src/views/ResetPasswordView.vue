@@ -104,7 +104,7 @@ function sendNewCode() {
           <p v-if="message" class="text-sm text-green" role="status">{{ message }}</p>
           <label class="auth-field">
             Reset code
-            <input v-model="code" class="input font-mono" inputmode="numeric" autocomplete="one-time-code" required />
+            <input v-model="code" class="input font-mono" autocapitalize="characters" spellcheck="false" autocomplete="one-time-code" required />
           </label>
           <label class="auth-field">
             New password
