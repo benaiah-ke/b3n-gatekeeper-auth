@@ -316,6 +316,7 @@ class SetupStatusRead(BaseModel):
     can_manage_roles: bool
     access_expires_at: datetime | None = None
     smtp_configured: bool
+    email_delivery: str = ""
     email_dev_mode: bool
     dynamic_client_registration_enabled: bool
 
@@ -360,13 +361,17 @@ class OrgSwitchRequest(BaseModel):
 
 class EmailCodeRequest(BaseModel):
     email: EmailStr
-    purpose: Literal["login", "verify_email", "reset_password"] = "login"
+    purpose: Literal["login", "verify_email"] = "login"
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
 
 
 class EmailCodeVerify(BaseModel):
     email: EmailStr
     code: str
-    purpose: Literal["login", "verify_email", "reset_password"] = "login"
+    purpose: Literal["login", "verify_email"] = "login"
     client_id: str | None = None
     scope: str | None = None
     audience: str | None = None
