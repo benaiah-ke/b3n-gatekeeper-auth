@@ -86,6 +86,7 @@ from app.schemas import (
     EmailChangeResponse,
     EmailCodeRequest,
     EmailCodeVerify,
+    PasswordResetRequest,
     IdentityRead,
     InvitationAcceptRequest,
     InvitationCreate,
@@ -2399,6 +2400,9 @@ async def revoke_user_credentials(db: AsyncSession, *, user_id: str, keep_sessio
     tokens = await db.execute(
         update(ApiToken).where(ApiToken.user_id == user_id, ApiToken.revoked_at.is_(None)).values(revoked_at=now)
     )
+    await db.execute(
+        update(OneTimeCode).where(OneTimeCode.user_id == user_id, OneTimeCode.used_at.is_(None)).values(used_at=now)
+    )
     codes = await db.execute(
         update(OAuthAuthorizationCode)
         .where(OAuthAuthorizationCode.user_id == user_id, OAuthAuthorizationCode.used_at.is_(None))
@@ -4609,6 +4613,12 @@ async def auth_options():
     }
 
 
+async def enforce_email_send_ip_limit(db: AsyncSession, request: Request) -> None:
+    await enforce_rate_limit(
+        db, key=f"email-send-ip:{client_ip(request) or 'unknown'}", limit=20, window_seconds=3600
+    )
+
+
 def require_email_code_login() -> None:
     if not settings.email_code_login_enabled:
         raise HTTPException(status_code=403, detail="Email code sign-in is disabled")
@@ -4618,6 +4628,7 @@ def require_email_code_login() -> None:
 async def request_email_code(body: EmailCodeRequest, request: Request, db: AsyncSession = Depends(get_db)):
     require_email_code_login()
     require_email_delivery()
+    await enforce_email_send_ip_limit(db, request)
     await enforce_rate_limit(
         db,
         key=f"email-code:{str(body.email).lower()}:{body.purpose}",
@@ -4626,20 +4637,11 @@ async def request_email_code(body: EmailCodeRequest, request: Request, db: Async
     )
     user_result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = user_result.scalar_one_or_none()
-    if not user:
-        # Same response as a sent code so the endpoint cannot be used to discover accounts.
-        await refuse_registration(
-            db, "auth.email_code.refused", email=str(body.email), request=request, details={"purpose": body.purpose}
-        )
-        return {"status": "sent"}
-    code = await create_one_time_code(
-        db,
-        email=str(body.email),
-        purpose=body.purpose,
-        user_id=user.id,
-    )
-    await db.commit()
-    queue_one_time_code(email=str(body.email), code=code, purpose=body.purpose)
+    # Same response whether or not the account exists or is usable, so the endpoint cannot be used to discover accounts.
+    if user and not user.disabled:
+        code = await create_one_time_code(db, email=user.email, purpose=body.purpose, user_id=user.id)
+        await db.commit()
+        queue_one_time_code(email=user.email, code=code, purpose=body.purpose)
     return {"status": "sent"}
 
 
@@ -4687,8 +4689,9 @@ async def verify_email_code(
 
 
 @app.post("/api/v1/auth/password/reset/request")
-async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depends(get_db)):
+async def request_password_reset(body: PasswordResetRequest, request: Request, db: AsyncSession = Depends(get_db)):
     require_email_delivery()
+    await enforce_email_send_ip_limit(db, request)
     await enforce_rate_limit(
         db,
         key=f"password-reset:{str(body.email).lower()}",
@@ -4697,15 +4700,10 @@ async def request_password_reset(body: EmailCodeRequest, db: AsyncSession = Depe
     )
     result = await db.execute(select(User).where(User.email == str(body.email).lower()))
     user = result.scalar_one_or_none()
-    if user:
-        code = await create_one_time_code(
-            db,
-            email=str(body.email),
-            purpose="reset_password",
-            user_id=user.id,
-        )
+    if user and not user.disabled:
+        code = await create_one_time_code(db, email=user.email, purpose="reset_password", user_id=user.id)
         await db.commit()
-        queue_one_time_code(email=str(body.email), code=code, purpose="reset_password")
+        queue_one_time_code(email=user.email, code=code, purpose="reset_password")
     return {"status": "sent"}
 
 
@@ -4731,6 +4729,8 @@ async def confirm_password_reset(
     user = result.scalar_one_or_none()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if user.disabled:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     user.password_hash = hash_password(body.new_password)
     # A reset means the old password may be known to someone else, so everything it opened is closed.
     revoked = await revoke_user_credentials(db, user_id=user.id)

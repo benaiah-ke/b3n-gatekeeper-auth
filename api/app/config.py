@@ -134,7 +134,7 @@ class Settings(BaseSettings):
     @property
     def email_delivery(self) -> str:
         """Which user email delivery is configured: "sendy" wins over "smtp"; "" means none."""
-        if self.sendy_api_key and self.email_from_address:
+        if self.sendy_api_key and self.email_from:
             return "sendy"
         return "smtp" if self.smtp_host else ""
 

@@ -78,6 +78,8 @@ SECURITY_ALERT_SUBJECTS = {
     "auth.email_code.refused": "Email code refused",
     "auth.invitation.refused": "Invitation signup refused",
     "auth.oauth.signup.refused": "Federated signup refused",
+    "auth.password.reset": "Password reset by email code",
+    "auth.email_change.confirm": "Account email changed",
     "auth.login.new_ip": "Privileged login from a new IP",
     "org.owner.missing": "Bootstrap organization has no owner",
     "org.owner.bootstrap": "Bootstrap owner set by an operator",
@@ -992,5 +994,12 @@ async def verify_one_time_code(db: AsyncSession, *, email: str, purpose: str, co
     record = result.scalar_one_or_none()
     if not record or record.used_at or record.expires_at <= now_utc():
         raise HTTPException(status_code=401, detail="Invalid or expired code")
-    record.used_at = now_utc()
+    # Conditional update so two parallel requests cannot both consume the same code.
+    claimed = await db.execute(
+        update(OneTimeCode)
+        .where(OneTimeCode.id == record.id, OneTimeCode.used_at.is_(None))
+        .values(used_at=now_utc())
+    )
+    if claimed.rowcount != 1:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
     return record

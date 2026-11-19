@@ -73,7 +73,7 @@ function sendNewCode() {
       <p class="mono-label">Account</p>
       <h1 class="mt-3 text-2xl font-semibold leading-tight">Password Changed</h1>
       <p class="mt-4 text-sm leading-6 text-muted" role="status">
-        Your password is changed. Every other session was signed out.
+        Your password is changed and every session was signed out.
       </p>
       <RouterLink to="/login" class="btn-primary mt-6 block text-center">Go to sign in</RouterLink>
     </div>
