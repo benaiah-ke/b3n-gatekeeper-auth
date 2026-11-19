@@ -7910,7 +7910,7 @@ async def test_reset_code_cannot_sign_in_or_be_requested_through_email_code(monk
 
 @pytest.mark.asyncio
 async def test_send_endpoints_share_a_per_ip_limit(monkeypatch):
-    sendy = SendyMock(monkeypatch)
+    SendyMock(monkeypatch)
     monkeypatch.setattr(settings, "email_code_login_enabled", True)
     statuses = []
     async with await ip_client("203.0.113.9") as ac:
@@ -7920,7 +7920,8 @@ async def test_send_endpoints_share_a_per_ip_limit(monkeypatch):
             statuses.append(response.status_code)
     assert statuses == [200] * 20 + [429]
     async with await ip_client("203.0.113.10") as ac:
-        assert (await ac.post("/api/v1/auth/password/reset/request", json={"email": "a@example.com"})).status_code == 200
+        response = await ac.post("/api/v1/auth/password/reset/request", json={"email": "a@example.com"})
+        assert response.status_code == 200
 
 
 @pytest.mark.asyncio
