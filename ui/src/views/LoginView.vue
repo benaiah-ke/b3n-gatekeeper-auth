@@ -18,6 +18,11 @@ const error = ref('')
 const loading = ref(false)
 const passkeyLoading = ref(false)
 const providerLoading = ref('')
+const emailCodeEnabled = ref(false)
+const codeMode = ref(false)
+const codeSent = ref(false)
+const emailCode = ref('')
+const notice = ref('')
 const passkeysSupported = ref(false)
 
 const redirectTarget = computed(() => {
@@ -52,6 +57,37 @@ const signupRoute = computed(() =>
   redirectTarget.value ? { path: '/signup', query: { redirect: redirectTarget.value } } : '/signup',
 )
 const configuredProviders = computed(() => providers.value.filter((provider) => provider.configured))
+
+async function loadOptions() {
+  try {
+    emailCodeEnabled.value = (await api.authOptions()).email_code_login
+  } catch {
+    emailCodeEnabled.value = false
+  }
+}
+
+function setCodeMode(on: boolean) {
+  codeMode.value = on
+  codeSent.value = false
+  emailCode.value = ''
+  error.value = ''
+  notice.value = ''
+}
+
+async function sendLoginCode() {
+  error.value = ''
+  notice.value = ''
+  loading.value = true
+  try {
+    await api.requestCode(email.value, 'login')
+    codeSent.value = true
+    notice.value = 'If an account uses that email, we sent a sign-in code. It expires in 15 minutes.'
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : 'Could not send a sign-in code'
+  } finally {
+    loading.value = false
+  }
+}
 
 async function loadProviders() {
   try {
@@ -98,10 +134,20 @@ async function signInWithPasskey() {
 }
 
 async function submit() {
+  if (codeMode.value && !codeSent.value) {
+    await sendLoginCode()
+    return
+  }
   error.value = ''
+  notice.value = ''
   loading.value = true
   try {
-    await api.login(email.value, password.value, totpCode.value, recoveryCode.value, await hostedLoginContext())
+    const context = await hostedLoginContext()
+    if (codeMode.value) {
+      await api.verifyCode(email.value, emailCode.value, 'login', totpCode.value, recoveryCode.value, context)
+    } else {
+      await api.login(email.value, password.value, totpCode.value, recoveryCode.value, context)
+    }
     await finishSignIn()
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Sign in failed'
@@ -122,6 +168,7 @@ async function submit() {
 onMounted(() => {
   passkeysSupported.value = browserSupportsWebAuthn()
   loadProviders()
+  loadOptions()
 })
 </script>
 
@@ -158,7 +205,7 @@ onMounted(() => {
 
       <form class="auth-card" @submit.prevent="submit">
         <p class="mono-label">GateKeeper</p>
-        <h1 class="mt-3 text-2xl font-semibold leading-tight">{{ isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
+        <h1 class="mt-3 text-2xl font-semibold leading-tight">{{ codeMode ? 'Sign In With A Code' : isStepUp ? 'Verify sign in' : 'Sign in' }}</h1>
         <p class="mt-3 text-sm leading-6 text-muted">
           {{ isStepUp ? 'Use a passkey or your password and authenticator to verify this sign in.' : 'Use a passkey, or sign in with your password.' }}
         </p>
@@ -191,10 +238,23 @@ onMounted(() => {
             Email
             <input v-model="email" class="input" type="email" placeholder="you@example.com" autocomplete="email" required />
           </label>
-          <label class="auth-field">
+          <label v-if="!codeMode" class="auth-field">
             Password
             <input v-model="password" class="input" type="password" autocomplete="current-password" required />
           </label>
+          <label v-if="codeMode && codeSent" class="auth-field">
+            Sign-in code
+            <input
+              v-model="emailCode"
+              class="input font-mono"
+              inputmode="numeric"
+              autocomplete="one-time-code"
+              placeholder="Code from your email"
+              required
+            />
+          </label>
+          <p v-if="notice" class="text-sm text-green" role="status">{{ notice }}</p>
+          <template v-if="!codeMode || codeSent">
           <div class="rounded-md border border-border bg-surface p-3">
             <p class="text-sm font-semibold text-fg">Two-factor verification</p>
             <p class="mt-1 text-xs leading-5 text-muted">
@@ -220,8 +280,17 @@ onMounted(() => {
               placeholder="Optional backup code"
             />
           </label>
+          </template>
           <p v-if="error" class="auth-alert" role="alert">{{ error }}</p>
-          <button class="btn-primary w-full" :disabled="loading">{{ loading ? 'Signing in' : 'Sign in' }}</button>
+          <button class="btn-primary w-full" :disabled="loading">
+            {{ codeMode && !codeSent ? (loading ? 'Sending' : 'Send sign-in code') : loading ? 'Signing in' : 'Sign in' }}
+          </button>
+          <button v-if="emailCodeEnabled && !codeMode" type="button" class="btn-secondary w-full text-sm" :disabled="loading" @click="setCodeMode(true)">
+            Email me a sign-in code
+          </button>
+          <button v-if="codeMode" type="button" class="btn-secondary w-full text-sm" :disabled="loading" @click="setCodeMode(false)">
+            Use my password instead
+          </button>
         </div>
 
         <div class="mt-5 flex flex-wrap justify-between gap-3 text-sm text-muted">

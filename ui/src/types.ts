@@ -424,3 +424,8 @@ export interface AuditPruneResult {
   pruned_count: number
   dry_run: boolean
 }
+
+export interface AuthOptions {
+  email_code_login: boolean
+  password_reset: boolean
+}

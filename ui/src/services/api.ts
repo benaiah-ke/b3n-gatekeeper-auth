@@ -29,6 +29,7 @@ import type {
   Role,
   Session,
   SetupStatus,
+  AuthOptions,
   TokenResponse,
   TotpEnable,
   TotpSetup,
@@ -631,14 +632,45 @@ export const api = {
       body: JSON.stringify({ email, purpose }),
     })
   },
-  verifyCode(email: string, code: string, purpose = 'login') {
+  verifyCode(
+    email: string,
+    code: string,
+    purpose = 'login',
+    totpCode?: string,
+    recoveryCode?: string,
+    context: { clientId?: string | null; scope?: string | null; audience?: string | null } = {},
+  ) {
     return request<TokenResponse>('/api/v1/auth/email-code/verify', {
       method: 'POST',
-      body: JSON.stringify({ email, code, purpose }),
+      body: JSON.stringify({
+        email,
+        code,
+        purpose,
+        client_id: context.clientId || null,
+        scope: context.scope || null,
+        audience: context.audience || null,
+        totp_code: totpCode || null,
+        recovery_code: recoveryCode || null,
+      }),
     }).then((result) => {
       saveTokens(result)
       return result
     })
+  },
+  requestPasswordReset(email: string) {
+    return request<{ status: string }>('/api/v1/auth/password/reset/request', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    })
+  },
+  confirmPasswordReset(email: string, code: string, newPassword: string) {
+    return request<{ status: string }>('/api/v1/auth/password/reset/confirm', {
+      method: 'POST',
+      body: JSON.stringify({ email, code, new_password: newPassword }),
+    })
+  },
+  authOptions() {
+    return request<AuthOptions>('/api/v1/auth/options')
   },
   approveDevice(userCode: string, approve = true, orgId?: string, totpCode?: string, recoveryCode?: string) {
     return request<{ status: string }>('/api/v1/auth/device/approve', {
