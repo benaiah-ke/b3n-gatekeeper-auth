@@ -1336,15 +1336,19 @@ async def require_session_user(principal: Principal, db: AsyncSession) -> User:
     return user
 
 
+async def require_recent_session(principal: Principal, db: AsyncSession, *, detail: str) -> User:
+    user = await require_session_user(principal, db)
+    session = await db.get(Session, principal.session_id)
+    if not session or not session.created_at or session.created_at < now_utc() - timedelta(minutes=15):
+        raise HTTPException(status_code=401, detail=detail)
+    return user
+
+
 async def require_recent_passkey_management_session(
     principal: Principal,
     db: AsyncSession,
 ) -> User:
-    user = await require_session_user(principal, db)
-    session = await db.get(Session, principal.session_id)
-    if not session or not session.created_at or session.created_at < now_utc() - timedelta(minutes=15):
-        raise HTTPException(status_code=401, detail="Sign in again before changing passkeys")
-    return user
+    return await require_recent_session(principal, db, detail="Sign in again before changing passkeys")
 
 
 async def revoke_other_user_sessions(db: AsyncSession, *, user_id: str, current_session_id: str) -> int:
@@ -1517,8 +1521,12 @@ async def request_email_change(
     new_email = str(body.new_email).strip().lower()
     if new_email == user.email:
         raise HTTPException(status_code=400, detail="New email must differ from the current email")
-    if user.password_hash and not verify_password(body.current_password or "", user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid current password")
+    if user.password_hash:
+        if not verify_password(body.current_password or "", user.password_hash):
+            raise HTTPException(status_code=401, detail="Invalid current password")
+    else:
+        # No password to re-enter, so only a fresh sign-in may move the account to a new address.
+        await require_recent_session(principal, db, detail="Sign in again before changing your email")
     if await user_by_email(db, new_email):
         raise HTTPException(status_code=409, detail="Email already exists")
 
