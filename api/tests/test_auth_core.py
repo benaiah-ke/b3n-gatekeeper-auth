@@ -8047,3 +8047,41 @@ async def test_password_reset_raises_a_security_alert(monkeypatch):
         )
         await asyncio.gather(*alerts._pending)
     assert "[GateKeeper] Password reset by email code" in [item["subject"] for item in alerts_sent]
+
+
+@pytest.mark.asyncio
+async def test_passwordless_email_change_requires_a_recent_session():
+    async with await client() as ac:
+        async with async_session_factory() as db:
+            user = User(email="passwordless@example.com", password_hash=None, email_verified=True)
+            db.add(user)
+            await db.flush()
+            db.add(Identity(user_id=user.id, provider="google", provider_subject="g-passwordless"))
+            stale_access, *_ = await services.create_session_tokens(
+                db, user, bind_default_org=False, amr=["federated"]
+            )
+            stale_session = await db.get(Session, decode_access_token(stale_access)["session_id"])
+            stale_session.created_at = security.now_utc() - timedelta(minutes=16)
+            fresh_access, *_ = await services.create_session_tokens(
+                db, user, bind_default_org=False, amr=["federated"]
+            )
+            await db.commit()
+
+        stale = await ac.post(
+            "/api/v1/auth/email/change/request",
+            headers={"Authorization": f"Bearer {stale_access}"},
+            json={"new_email": "taken-over@example.com"},
+        )
+        assert stale.status_code == 401
+        assert stale.json()["detail"] == "Sign in again before changing your email"
+        async with async_session_factory() as db:
+            pending = await db.execute(select(OneTimeCode).where(OneTimeCode.email == "taken-over@example.com"))
+            assert pending.scalars().first() is None
+
+        fresh = await ac.post(
+            "/api/v1/auth/email/change/request",
+            headers={"Authorization": f"Bearer {fresh_access}"},
+            json={"new_email": "moved@example.com"},
+        )
+        assert fresh.status_code == 200
+        assert fresh.json()["status"] == "sent"
